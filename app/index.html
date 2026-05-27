@@ -26,6 +26,7 @@
             <div class="brand-text">
               <h1>Plywood Estimator</h1>
               <p class="hint">Drop a STEP. Pick bodies. Get optimized cut sheets.</p>
+              <p class="version" id="versionLine">build · author</p>
             </div>
           </div>
         </header>
@@ -75,10 +76,11 @@
                 <option value="4">4</option>
                 <option value="8">8</option>
                 <option value="16">16</option>
-                <option value="32" selected>32 (default)</option>
+                <option value="32">32</option>
                 <option value="64">64</option>
-                <option value="128">128 (slower)</option>
-                <option value="256">256 (slowest)</option>
+                <option value="128">128</option>
+                <option value="256" selected>256 (default)</option>
+                <option value="1024">1024 (slowest)</option>
               </select>
             </label>
             <label style="grid-column: 1 / -1">Cut strategy
@@ -128,7 +130,8 @@
             </label>
             <label>PDF paper
               <select id="pdfPaper">
-                <option value="letter-landscape" selected>Letter landscape</option>
+                <option value="widescreen-16-9" selected>16:9 widescreen</option>
+                <option value="letter-landscape">Letter landscape</option>
                 <option value="letter-portrait">Letter portrait</option>
                 <option value="legal-landscape">Legal landscape</option>
                 <option value="legal-portrait">Legal portrait</option>

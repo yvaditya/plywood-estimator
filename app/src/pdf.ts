@@ -15,6 +15,7 @@ import { fmtDim, fmtArea, type Units } from './units';
 import { assignPartLabels, allCutSteps, type PartLabel } from './instructions';
 
 export type PdfPaper =
+  | 'widescreen-16-9'
   | 'letter-landscape' | 'letter-portrait'
   | 'legal-landscape'  | 'legal-portrait'
   | 'tabloid-landscape'
@@ -41,19 +42,26 @@ export interface InventoryCheck {
   label: string;
 }
 
-// pt-based page sizes (1 pt = 1/72 in)
-const PAPER_DIMS: Record<PdfPaper, { w: number; h: number; format: string; orient: 'landscape' | 'portrait' }> = {
-  'letter-landscape':  { w: 792,  h: 612,  format: 'letter', orient: 'landscape' },
-  'letter-portrait':   { w: 612,  h: 792,  format: 'letter', orient: 'portrait'  },
-  'legal-landscape':   { w: 1008, h: 612,  format: 'legal',  orient: 'landscape' },
-  'legal-portrait':    { w: 612,  h: 1008, format: 'legal',  orient: 'portrait'  },
-  'tabloid-landscape': { w: 1224, h: 792,  format: 'tabloid', orient: 'landscape' },
-  'a4-landscape':      { w: 842,  h: 595,  format: 'a4',     orient: 'landscape' },
+// pt-based page sizes (1 pt = 1/72 in).
+// jsPDF accepts either a named format ('letter', 'a4', etc.) or an explicit
+// [w, h] tuple for custom sizes — the widescreen size is custom.
+const PAPER_DIMS: Record<
+  PdfPaper,
+  { w: number; h: number; format: string | [number, number]; orient: 'landscape' | 'portrait' }
+> = {
+  // PowerPoint widescreen 16:9 — 13.33" × 7.5" → 960 × 540 pt
+  'widescreen-16-9':   { w: 960,  h: 540,  format: [960, 540], orient: 'landscape' },
+  'letter-landscape':  { w: 792,  h: 612,  format: 'letter',   orient: 'landscape' },
+  'letter-portrait':   { w: 612,  h: 792,  format: 'letter',   orient: 'portrait'  },
+  'legal-landscape':   { w: 1008, h: 612,  format: 'legal',    orient: 'landscape' },
+  'legal-portrait':    { w: 612,  h: 1008, format: 'legal',    orient: 'portrait'  },
+  'tabloid-landscape': { w: 1224, h: 792,  format: 'tabloid',  orient: 'landscape' },
+  'a4-landscape':      { w: 842,  h: 595,  format: 'a4',       orient: 'landscape' },
 };
 const PAGE_PAD = 36; // 0.5"
 
 export function buildPdf(result: NestResult, opt: PdfOptions): jsPDF {
-  const paper = opt.paper ?? 'letter-landscape';
+  const paper = opt.paper ?? 'widescreen-16-9';
   const dims = PAPER_DIMS[paper];
   const doc = new jsPDF({ orientation: dims.orient, unit: 'pt', format: dims.format });
 
@@ -299,9 +307,13 @@ function drawPart(
     drawPolygon(doc, hole, p.x, p.y, ox, oy, scale, 'S');
   }
 
-  const cx = ox + (p.x + p.w / 2) * scale;
-  const cy = oy + (p.y + p.h / 2) * scale;
-  const partPt = Math.min(p.w, p.h) * scale;
+  const px = ox + p.x * scale;
+  const py = oy + p.y * scale;
+  const pwPt = p.w * scale;
+  const phPt = p.h * scale;
+  const cx = px + pwPt / 2;
+  const cy = py + phPt / 2;
+  const partPt = Math.min(pwPt, phPt);
   doc.setTextColor(20);
 
   // Letter label (huge, bold, centered) — primary identifier
@@ -312,17 +324,78 @@ function drawPart(
     doc.text(letter, cx, cy + big * 0.18, { align: 'center' });
   }
 
-  // Dimensions subtitle below the letter
+  // Smart dimensions:
+  //   - LARGE parts (≥110pt in shorter dim): draw external dimension
+  //     ticks along the part's bottom and left edges, with the value
+  //     inset from the edge. Reads like a real shop drawing.
+  //   - SMALL parts: fall back to a centered subtitle so it still fits.
+  const big = Math.max(10, Math.min(36, partPt * 0.36));
+  if (partPt >= 110) {
+    drawPartDims(doc, px, py, pwPt, phPt, p.w, p.h, opt);
+  } else {
+    doc.setFont('helvetica', 'normal');
+    const subSize = Math.max(4, Math.min(11, partPt * 0.10));
+    doc.setFontSize(subSize);
+    doc.setTextColor(60);
+    doc.text(
+      `${fmtDim(p.w, opt.units)} × ${fmtDim(p.h, opt.units)}`,
+      cx,
+      cy + (letter ? big * 0.55 + subSize : 0),
+      { align: 'center' },
+    );
+  }
+}
+
+/**
+ * Draw width + height dimension marks on the bottom and left edges of a
+ * part rectangle. Lives INSIDE the part bounds so it never bleeds into
+ * adjacent panels. Tick lines + value text only — no extension lines, to
+ * keep it clean and Notion-like.
+ */
+function drawPartDims(
+  doc: jsPDF,
+  px: number,
+  py: number,
+  pwPt: number,
+  phPt: number,
+  realW: number,
+  realH: number,
+  opt: PdfOptions,
+) {
+  const inset = 6;
+  const tickLen = 4;
+  const textSize = 8.5;
+  doc.setDrawColor(60);
+  doc.setLineWidth(0.5);
   doc.setFont('helvetica', 'normal');
-  const subSize = Math.max(4, Math.min(11, partPt * 0.10));
-  doc.setFontSize(subSize);
+  doc.setFontSize(textSize);
   doc.setTextColor(60);
-  doc.text(
-    `${fmtDim(p.w, opt.units)} × ${fmtDim(p.h, opt.units)}`,
-    cx,
-    cy + (letter ? Math.max(10, Math.min(36, partPt * 0.36)) * 0.55 + subSize : 0),
-    { align: 'center' },
-  );
+
+  // BOTTOM (width) — horizontal dim line just above the part's bottom edge
+  const by = py + phPt - inset;
+  doc.line(px + inset, by, px + pwPt - inset, by);
+  doc.line(px + inset, by - tickLen / 2, px + inset, by + tickLen / 2);
+  doc.line(px + pwPt - inset, by - tickLen / 2, px + pwPt - inset, by + tickLen / 2);
+  // Background nub behind text to keep it readable on top of the fill
+  doc.setFillColor(255, 255, 255);
+  const wText = fmtDim(realW, opt.units);
+  const wWidth = doc.getTextWidth(wText) + 6;
+  doc.rect(px + pwPt / 2 - wWidth / 2, by - textSize * 0.95, wWidth, textSize + 4, 'F');
+  doc.text(wText, px + pwPt / 2, by - 2, { align: 'center' });
+
+  // LEFT (height) — vertical dim line just inside the part's left edge
+  const lx = px + inset;
+  doc.line(lx, py + inset, lx, py + phPt - inset);
+  doc.line(lx - tickLen / 2, py + inset, lx + tickLen / 2, py + inset);
+  doc.line(lx - tickLen / 2, py + phPt - inset, lx + tickLen / 2, py + phPt - inset);
+  const hText = fmtDim(realH, opt.units);
+  const hWidth = doc.getTextWidth(hText) + 6;
+  // Rotated text — paint a background rect rotated to match
+  doc.setFillColor(255, 255, 255);
+  const ty = py + phPt / 2;
+  doc.rect(lx + 2, ty - hWidth / 2, textSize + 4, hWidth, 'F');
+  doc.text(hText, lx + 4 + textSize, ty, { align: 'center', angle: 90 });
+  doc.setTextColor(0);
 }
 
 function drawPolygon(
@@ -514,7 +587,16 @@ function drawCutInstructions(
 ) {
   const PAGE_W = dims.w;
   const PAGE_H = dims.h;
+  // Pair each SheetCuts with its source NestSheet so the cut cards can
+  // overlay the placed parts (color-tinted under the cut lines).
+  const pairs: { sc: ReturnType<typeof allCutSteps>[number]; parts: NestSheet['parts'] }[] = [];
   const cuts = allCutSteps(result);
+  let pi = 0;
+  for (const g of result.groups) {
+    for (const s of g.sheets) {
+      pairs.push({ sc: cuts[pi++], parts: s.parts });
+    }
+  }
 
   const totalCuts = cuts.reduce((a, sc) => a + sc.steps.length, 0);
 
@@ -545,8 +627,8 @@ function drawCutInstructions(
   const innerW = PAGE_W - 2 * PAGE_PAD;
   const cardW = (innerW - cardGutter * (cols - 1)) / cols;
 
-  for (let sIdx = 0; sIdx < cuts.length; sIdx++) {
-    const sc = cuts[sIdx];
+  for (let sIdx = 0; sIdx < pairs.length; sIdx++) {
+    const { sc, parts } = pairs[sIdx];
 
     // Sheet header — break to a new page if there isn't room for at least
     // one row of cards underneath it.
@@ -588,7 +670,7 @@ function drawCutInstructions(
         col = 0;
       }
       const x = PAGE_PAD + col * (cardW + cardGutter);
-      drawCutCard(doc, sc, i, x, y, cardW, cardDiagH, opt);
+      drawCutCard(doc, sc, parts, i, x, y, cardW, cardDiagH, opt);
       col++;
       if (col >= cols) {
         col = 0;
@@ -599,12 +681,14 @@ function drawCutInstructions(
 }
 
 /**
- * Draw one cut-step card: caption above, sheet diagram below with prior
- * cuts in thin gray and the current cut highlighted in red.
+ * Draw one cut-step card: caption above, sheet diagram below with
+ * placed parts overlaid in their colors (heavily transparent), prior
+ * cuts in thin white, and the current cut highlighted in red.
  */
 function drawCutCard(
   doc: jsPDF,
   sc: ReturnType<typeof allCutSteps>[number],
+  parts: NestSheet['parts'],
   cutIdx: number,
   x: number,
   y: number,
@@ -627,7 +711,7 @@ function drawCutCard(
   doc.text(`${label}  ${fmtDim(cur.distance, opt.units)}  ${edgeRef}`, x, y + 20);
   doc.setTextColor(0);
 
-  // Diagram: sheet rectangle + cuts
+  // Diagram: sheet rectangle + parts + cuts
   const diagY = y + 24;
   const scale = Math.min(cardW / sc.sheetW, diagH / sc.sheetL);
   const dW = sc.sheetW * scale;
@@ -641,7 +725,21 @@ function drawCutCard(
   doc.setLineWidth(0.7);
   doc.rect(ox, oy, dW, dH, 'FD');
 
-  // Prior cuts as thin gray lines
+  // Part overlays — full color, 80% transparent (20% opaque), no stroke.
+  // jsPDF GState applies the alpha to fills.
+  const gs = (doc as any).GState ? new (doc as any).GState({ opacity: 0.20 }) : null;
+  if (gs) (doc as any).setGState(gs);
+  for (const p of parts) {
+    const [r, g, b] = hexToRgb(p.color);
+    doc.setFillColor(r, g, b);
+    doc.rect(ox + p.x * scale, oy + p.y * scale, p.w * scale, p.h * scale, 'F');
+  }
+  if (gs) {
+    const gsOpaque = new (doc as any).GState({ opacity: 1 });
+    (doc as any).setGState(gsOpaque);
+  }
+
+  // Prior cuts as thin white lines
   doc.setLineWidth(0.4);
   doc.setDrawColor(255, 255, 255);
   for (let i = 0; i < cutIdx; i++) {

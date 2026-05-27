@@ -296,10 +296,36 @@ export class Viewer {
 
     this.renderer.domElement.addEventListener('pointermove', this.handlePointerMove);
     this.renderer.domElement.addEventListener('click', this.handleClick);
+    // Trackpad two-finger pan (Mac Safari + Chrome on macOS).
+    //   - ctrlKey set     → pinch-to-zoom (browser convention) → OrbitControls
+    //   - deltaMode !== 0 → mouse wheel scroll → OrbitControls (zoom)
+    //   - deltaMode === 0, no ctrlKey → two-finger trackpad pan → custom
+    this.renderer.domElement.addEventListener('wheel', this.handleWheelPan, { passive: false, capture: true });
     new ResizeObserver(() => this.resize(container)).observe(container);
 
     this.tick();
   }
+
+  private handleWheelPan = (ev: WheelEvent) => {
+    if (ev.ctrlKey) return;            // pinch-zoom — defer to OrbitControls
+    if (ev.deltaMode !== 0) return;     // mouse wheel — defer to OrbitControls
+    ev.preventDefault();
+    ev.stopPropagation();
+    // Pan camera + target by trackpad delta, scaled to world units at the
+    // current target distance (same formula OrbitControls uses internally).
+    const offset = new THREE.Vector3().copy(this.camera.position).sub(this.controls.target);
+    const targetDist = offset.length();
+    const fov = (this.camera.fov * Math.PI) / 180;
+    const h = this.renderer.domElement.clientHeight || 1;
+    const panX = (2 * ev.deltaX * targetDist * Math.tan(fov / 2)) / h;
+    const panY = (2 * ev.deltaY * targetDist * Math.tan(fov / 2)) / h;
+    const right = new THREE.Vector3();
+    const up = new THREE.Vector3();
+    this.camera.matrix.extractBasis(right, up, new THREE.Vector3());
+    const pan = right.multiplyScalar(-panX).add(up.multiplyScalar(panY));
+    this.camera.position.add(pan);
+    this.controls.target.add(pan);
+  };
 
   setSelectionListener(cb: () => void) { this.onSelectionChange = cb; }
   setGrainCycleListener(cb: (bodyId: number) => void) { this.onGrainCycle = cb; }

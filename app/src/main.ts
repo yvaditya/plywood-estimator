@@ -8,6 +8,12 @@
  */
 
 import './style.css';
+
+// Build-time-injected git info (see vite.config.ts `define`).
+declare const __GIT_SHA__: string;
+declare const __GIT_AUTHOR__: string;
+declare const __GIT_DATE__: string;
+
 import { parseStep, type OcctResult } from './stepLoader';
 import { Viewer, bodyColor } from './viewer';
 import { analyzeBody, type BodyAnalysis } from './geometry';
@@ -88,6 +94,12 @@ const pickFileBtn = $('pickFileBtn');
 const loadStatus = $('loadStatus');
 const bodyList = $('bodyList');
 const bodyCount = $('bodyCount');
+const versionLine = $('versionLine');
+// Inject git build info from vite define. Keep it terse: "0123abc · author · 2026-05-27"
+if (versionLine) {
+  const parts = [__GIT_SHA__, __GIT_AUTHOR__, __GIT_DATE__].filter(Boolean);
+  versionLine.textContent = parts.join(' · ');
+}
 const nestBtn = $<HTMLButtonElement>('nestBtn');
 const selectAllBtn = $('selectAllBtn');
 const clearAllBtn = $('clearAllBtn');

@@ -144,6 +144,14 @@ body {
   letter-spacing: -0.005em;
   line-height: 1.4;
 }
+.version {
+  margin: 6px 0 0;
+  font-size: 10.5px;
+  color: var(--faint);
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  letter-spacing: -0.005em;
+}
 
 /* ===========================================================================
    Panels — Notion-style: no borders, just spacing + hairline rules
