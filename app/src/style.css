@@ -1,0 +1,1122 @@
+/* ===========================================================================
+   Plywood Estimator — UI theme
+   Notion-style light. Warm off-white canvas, hairline dividers, type-driven
+   hierarchy. Dark surfaces are reserved for *content stages*: the 3D viewer
+   (so the model reads) and the cut-sheet preview workspace (so the tan
+   plywood sheet pops). Everything else is bright + restrained.
+   =========================================================================== */
+
+:root {
+  /* Surfaces (Notion exact-ish) */
+  --bg:           #FFFFFF;      /* main canvas */
+  --bg-sidebar:   #F7F6F3;      /* Notion sidebar gray */
+  --bg-subtle:    #F1F1EF;      /* hover wash for sidebar items */
+  --bg-input:     #FFFFFF;      /* input background */
+  --bg-input-2:   #F7F6F3;      /* secondary input bg / pills */
+
+  /* Workspace stages (kept dark on purpose) */
+  --stage:        #191918;      /* viewer + cut-sheet workspace */
+  --stage-2:      #0F0F0E;
+
+  /* Text */
+  --text:         #37352F;      /* Notion primary */
+  --text-2:       #5A5852;      /* secondary */
+  --muted:        #787774;      /* Notion muted */
+  --faint:        #9B9A97;      /* Notion faint */
+  --text-on-stage:#E7E7E5;
+  --muted-on-stage:#9B9A97;
+
+  /* Lines / borders */
+  --line:         #E9E9E7;      /* Notion hairline */
+  --line-soft:    #EFEFED;
+  --line-bright:  #D6D5D2;
+
+  /* Accents — used sparingly */
+  --accent:       #2383E2;      /* Notion blue (state only) */
+  --accent-soft:  rgba(35, 131, 226, 0.10);
+  --accent-ring:  rgba(35, 131, 226, 0.30);
+  --good:         #0F7B6C;
+  --good-soft:    rgba(15, 123, 108, 0.08);
+  --bad:          #E03E3E;
+  --bad-soft:     rgba(224, 62, 62, 0.07);
+  --warn:         #D9730D;
+
+  /* Surfaces for buttons */
+  --cta-fill:     #37352F;
+  --cta-fill-hover: #2C2A26;
+  --hover-wash:   rgba(55, 53, 47, 0.06);
+  --hover-wash-strong: rgba(55, 53, 47, 0.09);
+
+  /* Shadows — very subtle, Notion uses almost none */
+  --shadow-sm: 0 1px 2px rgba(15, 15, 15, 0.04);
+  --shadow-md: 0 2px 6px rgba(15, 15, 15, 0.06), 0 1px 2px rgba(15, 15, 15, 0.04);
+  --shadow-lg: 0 8px 24px rgba(15, 15, 15, 0.10), 0 2px 4px rgba(15, 15, 15, 0.05);
+  --ring:      0 0 0 2px var(--accent-ring);
+
+  /* Typography */
+  --font-sans: "Inter", ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+
+  font-family: var(--font-sans);
+  color-scheme: light;
+
+  font-feature-settings: "cv11", "ss01", "ss03";
+  font-synthesis: none;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  text-rendering: optimizeLegibility;
+}
+
+* { box-sizing: border-box; }
+html, body, #app { height: 100%; margin: 0; }
+
+/* Ensure [hidden] always wins over any display: flex/grid rules below. */
+[hidden] { display: none !important; }
+
+body {
+  background: var(--bg);
+  color: var(--text);
+  overflow: hidden;
+  font-size: 14px;
+  line-height: 1.5;
+}
+
+/* Selection */
+::selection { background: rgba(35, 131, 226, 0.20); color: var(--text); }
+
+/* Scrollbars (WebKit) — barely-there */
+*::-webkit-scrollbar { width: 10px; height: 10px; }
+*::-webkit-scrollbar-track { background: transparent; }
+*::-webkit-scrollbar-thumb {
+  background: rgba(55, 53, 47, 0.18);
+  border: 2px solid transparent;
+  background-clip: padding-box;
+  border-radius: 6px;
+}
+*::-webkit-scrollbar-thumb:hover { background: rgba(55, 53, 47, 0.32); background-clip: padding-box; }
+* { scrollbar-color: rgba(55, 53, 47, 0.22) transparent; scrollbar-width: thin; }
+
+/* ===========================================================================
+   Layout
+   =========================================================================== */
+#app {
+  display: grid;
+  grid-template-columns: 380px 1fr;
+  height: 100vh;
+}
+
+#sidebar {
+  border-right: 1px solid var(--line);
+  overflow-y: auto;
+  padding: 14px 12px 0;
+  background: var(--bg-sidebar);
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+/* App header */
+.app-header { padding: 4px 6px 10px; }
+.brand { display: flex; gap: 10px; align-items: flex-start; }
+.brand-mark {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px; height: 28px;
+  border-radius: 6px;
+  background: var(--cta-fill);
+  color: #FFFFFF;
+  border: none;
+  flex-shrink: 0;
+}
+.brand-text { min-width: 0; }
+.app-header h1 {
+  margin: 0;
+  font-size: 15px;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  color: var(--text);
+}
+.hint {
+  color: var(--muted);
+  margin: 2px 0 0;
+  font-size: 12.5px;
+  letter-spacing: -0.005em;
+  line-height: 1.4;
+}
+
+/* ===========================================================================
+   Panels — Notion-style: no borders, just spacing + hairline rules
+   =========================================================================== */
+.panel {
+  background: transparent;
+  border: none;
+  border-radius: 0;
+  padding: 14px 6px 6px;
+  box-shadow: none;
+  margin: 0;
+  position: relative;
+}
+.panel + .panel {
+  border-top: 1px solid var(--line);
+  margin-top: 4px;
+}
+
+.panel h2 {
+  margin: 0 0 10px;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--muted);
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+}
+
+/* The "panel dot" was a glowing accent in dark mode. In a light Notion look
+   it reads as visual noise — collapse it. We keep the element for backwards
+   compat but hide it; the section label alone is enough hierarchy. */
+.panel-dot {
+  display: none;
+}
+
+.count-pill {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 18px;
+  height: 17px;
+  background: var(--bg-input-2);
+  color: var(--muted);
+  padding: 0 6px;
+  border: none;
+  border-radius: 4px;
+  font-size: 11px;
+  letter-spacing: 0;
+  text-transform: none;
+  font-weight: 600;
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+}
+
+.row-between {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 10px;
+}
+.row-between h2 { margin-bottom: 0; }
+.row-gap { display: flex; gap: 2px; align-items: center; }
+
+/* ===========================================================================
+   Form grid
+   =========================================================================== */
+.grid2 {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 10px 10px;
+}
+.grid2 label {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  font-size: 11px;
+  font-weight: 500;
+  letter-spacing: 0.02em;
+  color: var(--muted);
+  text-transform: uppercase;
+}
+
+input[type="number"],
+input[type="text"],
+select {
+  background: var(--bg-input);
+  border: 1px solid var(--line);
+  color: var(--text);
+  padding: 7px 9px;
+  border-radius: 5px;
+  font-size: 13px;
+  font-family: var(--font-sans);
+  width: 100%;
+  font-variant-numeric: tabular-nums;
+  transition: border-color .12s ease, box-shadow .12s ease, background-color .12s ease;
+  font-weight: 500;
+  letter-spacing: -0.005em;
+  box-shadow: inset 0 1px 1px rgba(15, 15, 15, 0.02);
+}
+input[type="number"],
+input[type="text"] { font-family: var(--font-mono); font-weight: 500; }
+
+input::placeholder { color: var(--faint); }
+input:hover, select:hover { border-color: var(--line-bright); }
+input:focus, select:focus {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 2px var(--accent-ring);
+  background: var(--bg-input);
+}
+
+select {
+  appearance: none;
+  -webkit-appearance: none;
+  background-image: url("data:image/svg+xml;charset=utf-8,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='10' viewBox='0 0 10 10'%3E%3Cpath d='M2 4l3 3 3-3' stroke='%23787774' stroke-width='1.4' fill='none' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 9px center;
+  padding-right: 26px;
+  cursor: pointer;
+}
+
+/* Remove number-input spinners */
+input[type="number"]::-webkit-outer-spin-button,
+input[type="number"]::-webkit-inner-spin-button { -webkit-appearance: none; margin: 0; }
+input[type="number"] { -moz-appearance: textfield; }
+
+/* ===========================================================================
+   Buttons — three tiers
+     • Default (.primary)       → Tier 1 CTA (#nestBtn)
+     • .ghost / .btn-text       → Tier 2 (Copy, CSV, All, None, Choose file…)
+     • .pane-max                → Tier 3 (bare icon)
+   The base `button` rule below is the *secondary text style* (Notion-like
+   inline button: no border, gray-wash on hover). Specialized variants
+   override.
+   =========================================================================== */
+button {
+  background: transparent;
+  color: var(--text-2);
+  border: none;
+  padding: 4px 8px;
+  border-radius: 4px;
+  font-size: 13px;
+  font-family: var(--font-sans);
+  cursor: pointer;
+  font-weight: 500;
+  letter-spacing: -0.005em;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  transition: background-color .08s ease, color .08s ease, box-shadow .08s ease;
+  box-shadow: none;
+  white-space: nowrap;
+  min-height: 26px;
+}
+button:hover:not(:disabled) {
+  background: var(--hover-wash);
+  color: var(--text);
+}
+button:active:not(:disabled) { background: var(--hover-wash-strong); }
+button:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 2px var(--accent-ring);
+}
+button:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+  background: transparent;
+  color: var(--faint);
+}
+
+/* Tier 2 — .ghost / .btn-text — gray-wash hover, no borders */
+button.ghost,
+button.btn-text {
+  background: transparent;
+  border: none;
+  color: var(--text-2);
+  box-shadow: none;
+  padding: 4px 8px;
+  font-size: 12.5px;
+  font-weight: 500;
+}
+button.ghost:hover:not(:disabled),
+button.btn-text:hover:not(:disabled) {
+  background: var(--hover-wash);
+  color: var(--text);
+}
+button.ghost:disabled,
+button.btn-text:disabled {
+  background: transparent;
+  color: var(--faint);
+}
+
+/* Tier 1 — primary CTA */
+button.primary {
+  background: var(--cta-fill);
+  border: 1px solid var(--cta-fill);
+  color: #FFFFFF;
+  width: 100%;
+  padding: 10px 14px;
+  font-weight: 600;
+  font-size: 14px;
+  letter-spacing: -0.01em;
+  border-radius: 6px;
+  box-shadow: 0 1px 2px rgba(15, 15, 15, 0.08);
+  min-height: 38px;
+}
+button.primary:hover:not(:disabled) {
+  background: var(--cta-fill-hover);
+  border-color: var(--cta-fill-hover);
+  color: #FFFFFF;
+  box-shadow: 0 2px 6px rgba(15, 15, 15, 0.12);
+}
+button.primary:active:not(:disabled) {
+  background: var(--cta-fill-hover);
+  box-shadow: 0 1px 2px rgba(15, 15, 15, 0.10);
+}
+button.primary:disabled {
+  background: var(--bg-input-2);
+  border-color: var(--line);
+  color: var(--faint);
+  box-shadow: none;
+}
+
+/* Sticky CTA panel — isolated, gets a divider above it */
+.panel--cta {
+  position: sticky;
+  bottom: 0;
+  z-index: 5;
+  margin-top: auto;
+  padding: 14px 6px 16px;
+  background: linear-gradient(180deg, rgba(247, 246, 243, 0) 0%, var(--bg-sidebar) 28%);
+  border-top: 1px solid var(--line);
+}
+/* Override the .panel + .panel divider rule so the sticky CTA doesn't get
+   a double border. The gradient + manual border-top above is the divider. */
+.panel.panel--cta { margin-top: auto; }
+
+/* ===========================================================================
+   Dropzone — soft, low-contrast, Notion-card-feel
+   =========================================================================== */
+.panel--dropzone { padding: 6px 6px 14px; }
+#dropzone .drop-inner {
+  border: 1.5px dashed var(--line-bright);
+  border-radius: 8px;
+  padding: 18px 14px 16px;
+  text-align: center;
+  transition: border-color .15s ease, background-color .15s ease;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+  background: var(--bg);
+  position: relative;
+}
+#dropzone .drop-inner::before,
+#dropzone .drop-inner::after { content: none; }
+#dropzone .drop-icon {
+  display: inline-flex;
+  width: 36px; height: 36px;
+  align-items: center;
+  justify-content: center;
+  border-radius: 8px;
+  background: var(--bg-input-2);
+  color: var(--muted);
+  border: none;
+  margin-bottom: 2px;
+}
+#dropzone strong {
+  font-size: 13.5px;
+  font-weight: 600;
+  color: var(--text);
+  letter-spacing: -0.005em;
+}
+#dropzone .drop-or {
+  color: var(--faint);
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  font-weight: 500;
+}
+#dropzone #pickFileBtn {
+  background: var(--bg-input-2);
+  color: var(--text);
+  padding: 5px 12px;
+  font-weight: 500;
+  font-size: 12.5px;
+  border-radius: 5px;
+}
+#dropzone #pickFileBtn:hover:not(:disabled) {
+  background: var(--hover-wash-strong);
+  color: var(--text);
+}
+#dropzone.drag .drop-inner {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+}
+
+.status {
+  color: var(--muted);
+  font-size: 12px;
+  margin-top: 8px;
+  min-height: 14px;
+  text-align: center;
+  font-variant-numeric: tabular-nums;
+}
+.status.error { color: var(--bad); }
+.status.ok { color: var(--good); }
+
+/* ===========================================================================
+   Empty states (shared)
+   =========================================================================== */
+.empty {
+  color: var(--muted);
+  font-size: 12.5px;
+  text-align: center;
+  padding: 18px 12px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+}
+.empty-glyph {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 36px; height: 36px;
+  border-radius: 8px;
+  background: var(--bg-input-2);
+  color: var(--faint);
+  border: none;
+  margin-bottom: 4px;
+}
+.empty-glyph--lg {
+  width: 44px; height: 44px;
+  border-radius: 10px;
+}
+.empty-title {
+  color: var(--text);
+  font-weight: 600;
+  font-size: 13px;
+  letter-spacing: -0.005em;
+}
+.empty-sub {
+  color: var(--muted);
+  font-size: 12.5px;
+  max-width: 280px;
+  line-height: 1.5;
+}
+
+/* ===========================================================================
+   Body list — Notion-row feel: hover wash, no border, hairline between rows
+   =========================================================================== */
+.body-list {
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+  max-height: 420px;
+  overflow-y: auto;
+  margin: -2px;
+  padding: 2px;
+}
+.body-row {
+  display: grid;
+  grid-template-columns: 16px 14px 1fr auto;
+  align-items: center;
+  gap: 9px;
+  padding: 8px 8px;
+  border: 1px solid transparent;
+  border-radius: 5px;
+  background: transparent;
+  font-size: 13px;
+  transition: background-color .08s, border-color .08s;
+  cursor: default;
+}
+.body-row + .body-row { margin-top: 1px; }
+.body-row:hover {
+  background: var(--hover-wash);
+  border-color: transparent;
+}
+.body-row.selected {
+  background: var(--accent-soft);
+  border-color: rgba(35, 131, 226, 0.20);
+}
+.body-row .body-name {
+  font-weight: 500;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text);
+  letter-spacing: -0.005em;
+  font-size: 13px;
+}
+.body-row .body-meta {
+  color: var(--muted);
+  font-size: 11.5px;
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  margin-top: 2px;
+}
+.body-row .body-meta strong { color: var(--text-2); font-weight: 600; }
+.body-row .body-extra {
+  grid-column: 1 / -1;
+  display: grid;
+  grid-template-columns: 60px 1fr 1fr;
+  gap: 8px;
+  margin-top: 8px;
+  padding-top: 9px;
+  border-top: 1px solid var(--line);
+}
+.body-row .body-extra label {
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--muted);
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-weight: 600;
+}
+.body-row .body-extra input,
+.body-row .body-extra select { padding: 5px 7px; font-size: 12px; }
+
+.swatch {
+  width: 12px;
+  height: 12px;
+  border-radius: 3px;
+  border: 1px solid rgba(0, 0, 0, 0.12);
+  box-shadow: none;
+}
+
+/* Checkboxes */
+input[type="checkbox"] {
+  appearance: none;
+  -webkit-appearance: none;
+  width: 14px; height: 14px;
+  background: var(--bg-input);
+  border: 1px solid var(--line-bright);
+  border-radius: 3px;
+  cursor: pointer;
+  position: relative;
+  transition: background-color .1s, border-color .1s;
+  margin: 0;
+  flex-shrink: 0;
+}
+input[type="checkbox"]:hover { border-color: var(--muted); }
+input[type="checkbox"]:checked {
+  background: var(--accent);
+  border-color: var(--accent);
+}
+input[type="checkbox"]:checked::after {
+  content: "";
+  position: absolute;
+  left: 3px; top: 0px;
+  width: 5px; height: 9px;
+  border-right: 1.6px solid #FFFFFF;
+  border-bottom: 1.6px solid #FFFFFF;
+  transform: rotate(45deg);
+}
+input[type="checkbox"]:focus-visible { box-shadow: 0 0 0 2px var(--accent-ring); }
+
+/* ===========================================================================
+   Shopping list
+   =========================================================================== */
+.shopping-list {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  max-height: 280px;
+  overflow-y: auto;
+  margin: 0;
+  padding: 0;
+}
+.shop-row {
+  display: grid;
+  grid-template-columns: 1fr 42px 42px 42px 64px 70px;
+  gap: 6px;
+  align-items: center;
+  padding: 7px 8px;
+  border: 1px solid transparent;
+  border-radius: 5px;
+  background: transparent;
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  font-family: var(--font-mono);
+  transition: background-color .08s;
+}
+.shop-row:hover { background: var(--hover-wash); }
+.shop-row.short {
+  background: var(--bad-soft);
+  border-color: rgba(224, 62, 62, 0.18);
+}
+.shop-row .label {
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: var(--font-sans);
+  color: var(--text);
+  letter-spacing: -0.005em;
+  font-size: 13px;
+}
+.shop-row .label small {
+  color: var(--muted);
+  font-weight: 400;
+  display: block;
+  font-size: 10.5px;
+  margin-top: 1px;
+  font-family: var(--font-mono);
+}
+.shop-row .num { text-align: right; color: var(--text-2); }
+.shop-row input {
+  padding: 4px 6px;
+  font-size: 11.5px;
+  width: 100%;
+  text-align: right;
+  font-family: var(--font-mono);
+}
+.shop-row .buy { text-align: right; font-weight: 700; font-family: var(--font-mono); }
+.shop-row .buy.short { color: var(--bad); }
+.shop-row .buy.ok { color: var(--good); }
+.shop-row .cost {
+  text-align: right;
+  font-weight: 600;
+  color: var(--text);
+  font-family: var(--font-mono);
+}
+.shop-header {
+  display: grid;
+  grid-template-columns: 1fr 42px 42px 42px 64px 70px;
+  gap: 6px;
+  padding: 4px 8px 6px;
+  font-size: 10px;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  font-weight: 600;
+  border-bottom: 1px solid var(--line);
+  margin-bottom: 2px;
+}
+.shop-header .num { text-align: right; }
+.shop-totals {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  margin-top: 12px;
+  padding: 10px 12px;
+  background: var(--bg-input-2);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  font-variant-numeric: tabular-nums;
+}
+.shop-totals .total-label {
+  color: var(--muted);
+  text-transform: uppercase;
+  font-size: 10.5px;
+  letter-spacing: 0.06em;
+  font-weight: 600;
+}
+.shop-totals .total-val {
+  font-size: 17px;
+  font-weight: 600;
+  color: var(--text);
+  font-family: var(--font-mono);
+  letter-spacing: -0.01em;
+}
+
+/* ===========================================================================
+   Main area: side-by-side 3D / 2D panes with resizable divider + thumb strip
+   =========================================================================== */
+#main {
+  display: grid;
+  grid-template-rows: 1fr auto;
+  height: 100vh;
+  overflow: hidden;
+  background: var(--bg);
+}
+
+#workArea {
+  --pane-split: 1fr;
+  display: grid;
+  grid-template-columns: var(--pane-split) 6px 1fr;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.work-pane {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+  background: var(--bg);
+  overflow: hidden;
+}
+.pane-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 8px 14px;
+  background: var(--bg);
+  border-bottom: 1px solid var(--line);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  color: var(--muted);
+  min-height: 38px;
+}
+.pane-title {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+/* The pane-header dot reads loud in light mode; keep it but as a subtle text-color tick.
+   (We hid .panel-dot globally; that selector also affects .pane-header dots, which is
+   the desired behavior.) */
+
+/* Tier 3 — bare icon buttons */
+.pane-max {
+  background: transparent;
+  border: none;
+  padding: 4px 5px;
+  border-radius: 4px;
+  color: var(--muted);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 24px;
+}
+.pane-max:hover:not(:disabled) {
+  color: var(--text);
+  background: var(--hover-wash);
+}
+
+.pane-divider {
+  background: var(--line);
+  cursor: col-resize;
+  position: relative;
+  transition: background-color 0.12s ease;
+}
+.pane-divider:hover, .pane-divider.dragging {
+  background: var(--accent);
+}
+.pane-divider .divider-grip {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  width: 2px;
+  height: 28px;
+  border-radius: 1px;
+  background: var(--line-bright);
+}
+.pane-divider:hover .divider-grip,
+.pane-divider.dragging .divider-grip {
+  background: rgba(255, 255, 255, 0.7);
+}
+
+#workArea.viewer-max {
+  grid-template-columns: 1fr 0 0;
+}
+#workArea.viewer-max #paneDivider,
+#workArea.viewer-max #layoutPane { display: none; }
+
+#workArea.layout-max {
+  grid-template-columns: 0 0 1fr;
+}
+#workArea.layout-max #paneDivider,
+#workArea.layout-max #viewerPane { display: none; }
+
+/* 3D viewer — light stage. The Three.js scene draws its own canvas-texture
+   background on top of this, so this color shows only in margins / during
+   resize flicker. We keep it warm-off-white to match the rest of the UI. */
+#viewerWrap {
+  position: relative;
+  flex: 1;
+  background: var(--bg-sidebar);
+  min-height: 0;
+}
+#viewer { width: 100%; height: 100%; }
+
+#viewerHud {
+  position: absolute;
+  bottom: 12px;
+  left: 14px;
+  font-size: 12px;
+  color: var(--text);
+  background: rgba(255, 255, 255, 0.85);
+  backdrop-filter: blur(8px);
+  padding: 6px 11px 6px 9px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  pointer-events: none;
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  box-shadow: var(--shadow-sm);
+  font-weight: 500;
+  letter-spacing: -0.005em;
+}
+.hud-dot {
+  display: inline-block;
+  width: 6px; height: 6px;
+  border-radius: 50%;
+  background: var(--accent);
+  box-shadow: 0 0 0 3px rgba(35, 131, 226, 0.18);
+  animation: hudPulse 2.4s ease-in-out infinite;
+}
+@keyframes hudPulse {
+  0%, 100% { opacity: 1; }
+  50%      { opacity: 0.45; }
+}
+
+/* ===========================================================================
+   Detail view
+   =========================================================================== */
+.results-top {
+  padding: 16px 20px 18px;
+  background: var(--bg);
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+}
+.results-empty {
+  color: var(--muted);
+  font-size: 13px;
+  text-align: center;
+  padding: 36px 16px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+}
+.results-empty .empty-title { font-size: 14px; }
+.results-empty .empty-sub { font-size: 12.5px; max-width: 340px; }
+
+.detail-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  margin-bottom: 14px;
+  gap: 12px;
+}
+.detail-header h2 {
+  margin: 0;
+  font-size: 18px;
+  font-weight: 600;
+  letter-spacing: -0.02em;
+  color: var(--text);
+}
+.detail-sub {
+  color: var(--muted);
+  font-size: 12px;
+  margin-top: 4px;
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  letter-spacing: -0.005em;
+}
+
+/* Cut-sheet workspace — light "stage" in a slightly darker warm gray so the
+   even-lighter plywood sheet pops as a distinct object (not a thick black
+   border, just a hairline). */
+.detail-svg {
+  background: #EDECE8;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 20px;
+  box-shadow: inset 0 1px 2px rgba(15, 15, 15, 0.04);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.detail-svg svg {
+  width: 100%;
+  height: auto;
+  display: block;
+  max-height: 360px;
+  /* Darker plywood-stock color so the lighter cut parts (rendered in a
+     single warm wood tone) read as distinct pieces ON the sheet. */
+  background: #6B4F31;
+  border: 1px solid #2E1F0F;
+  border-radius: 3px;
+  box-shadow: 0 1px 2px rgba(15, 15, 15, 0.06);
+}
+
+/* Metric cards — Notion-style flat, no gradients */
+.metrics-row {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(130px, 1fr));
+  gap: 8px;
+  margin-top: 14px;
+}
+.metric {
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 10px 12px 11px;
+  position: relative;
+  overflow: hidden;
+  transition: border-color .12s, box-shadow .12s;
+}
+.metric::before { content: none; }
+.metric:hover { border-color: var(--line-bright); box-shadow: var(--shadow-sm); }
+.metric .k {
+  font-size: 10px;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.07em;
+  font-weight: 600;
+}
+.metric .v {
+  font-size: 18px;
+  font-weight: 600;
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  margin-top: 3px;
+  color: var(--text);
+  letter-spacing: -0.02em;
+}
+.metric.bad {
+  border-color: rgba(224, 62, 62, 0.30);
+  background: var(--bad-soft);
+}
+.metric.bad .v { color: var(--bad); }
+
+/* Inv check (legacy — kept) */
+.inv-check { margin-top: 14px; }
+.inv-check h3 {
+  font-size: 11px;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.07em;
+  margin: 0 0 6px;
+  font-weight: 600;
+}
+.inv-check-row {
+  display: grid;
+  grid-template-columns: 1fr 60px 60px 90px;
+  gap: 6px;
+  padding: 6px 10px;
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  font-size: 12px;
+  background: var(--bg);
+  margin-bottom: 4px;
+  font-variant-numeric: tabular-nums;
+  font-family: var(--font-mono);
+}
+.inv-check-row.short {
+  border-color: rgba(224, 62, 62, 0.30);
+  background: var(--bad-soft);
+}
+.inv-check-row.ok {
+  border-color: rgba(15, 123, 108, 0.30);
+  background: var(--good-soft);
+}
+.inv-check-row .right { text-align: right; }
+.inv-check-row .tag-ok { color: var(--good); font-weight: 600; }
+.inv-check-row .tag-short { color: var(--bad); font-weight: 600; }
+
+.unplaced {
+  margin-top: 12px;
+  color: var(--bad);
+  font-size: 12.5px;
+  padding: 8px 12px;
+  background: var(--bad-soft);
+  border: 1px solid rgba(224, 62, 62, 0.25);
+  border-radius: 6px;
+}
+.unplaced:empty { display: none; }
+
+/* ===========================================================================
+   Thumbnail strip
+   =========================================================================== */
+.thumb-strip {
+  display: flex;
+  gap: 8px;
+  padding: 10px 16px;
+  background: var(--bg-sidebar);
+  border-top: 1px solid var(--line);
+  overflow-x: auto;
+  min-height: 116px;
+  max-height: 140px;
+  align-items: stretch;
+}
+.thumb {
+  flex: 0 0 auto;
+  width: 92px;
+  height: 100px;
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 6px;
+  cursor: pointer;
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  transition: border-color .12s, box-shadow .12s, transform .12s;
+  box-shadow: var(--shadow-sm);
+  position: relative;
+  overflow: hidden;
+}
+.thumb .thumb-svg-wrap {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.thumb::before { content: none; }
+.thumb:hover {
+  border-color: var(--line-bright);
+  box-shadow: var(--shadow-md);
+  transform: translateY(-1px);
+}
+.thumb.active {
+  border-color: var(--accent);
+  background: var(--bg);
+  box-shadow: 0 0 0 1px var(--accent), var(--shadow-sm);
+}
+.thumb .thumb-svg {
+  /* Letterbox onto a slightly darker warm-gray stage so the lighter sheet pops */
+  background: #EDECE8;
+  border: 1px solid var(--line);
+  border-radius: 3px;
+  padding: 3px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 100%;
+  min-height: 56px;
+}
+.thumb .thumb-svg svg {
+  background: #6B4F31;
+  border: 1px solid #2E1F0F;
+  border-radius: 2px;
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  max-height: 100%;
+}
+.thumb .thumb-label {
+  font-size: 10px;
+  color: var(--muted);
+  text-align: center;
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  letter-spacing: -0.005em;
+  font-weight: 500;
+}
+.thumb.active .thumb-label { color: var(--text); font-weight: 600; }
+
+/* ===========================================================================
+   SVG entities — light-sheet palette. Thin hairline border, dark labels.
+   =========================================================================== */
+.sheet-border { fill: none; stroke: #B5B3AE; stroke-width: 1; }
+.margin-rect { fill: none; stroke: rgba(55, 53, 47, 0.22); stroke-dasharray: 4 4; stroke-width: 0.7; }
+.grain-arrow { stroke: #37352F; stroke-width: 1.2; fill: none; }
+.part-label { fill: #37352F; font-size: 10px; font-weight: 600; text-anchor: middle; pointer-events: none; }
+.dim-line { stroke: #C03A36; stroke-width: 0.8; fill: none; }
+.dim-text { fill: #C03A36; font-size: 9px; font-weight: 600; text-anchor: middle; }
+
+/* ===========================================================================
+   Responsive guardrails
+   =========================================================================== */
+@media (max-width: 1100px) {
+  #app { grid-template-columns: 340px 1fr; }
+}
+@media (max-width: 880px) {
+  #app { grid-template-columns: 300px 1fr; }
+  .metrics-row { grid-template-columns: repeat(auto-fit, minmax(110px, 1fr)); }
+}

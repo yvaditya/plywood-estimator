@@ -1,0 +1,16 @@
+app/node_modules
+app/dist
+app/.vite
+app/_screenshots
+.vite
+.claude/
+.DS_Store
+*.log
+*.local
+*.tsbuildinfo
+.env
+.env.*
+!.env.example
+.idea
+.vscode/*
+!.vscode/extensions.json

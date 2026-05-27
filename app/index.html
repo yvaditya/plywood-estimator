@@ -1,0 +1,270 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Plywood Estimator</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap"
+      rel="stylesheet"
+    />
+  </head>
+  <body>
+    <div id="app">
+      <!-- LEFT: controls -->
+      <aside id="sidebar">
+        <header class="app-header">
+          <div class="brand">
+            <span class="brand-mark" aria-hidden="true">
+              <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
+                <rect x="3" y="3" width="18" height="18" rx="2.5" />
+                <path d="M3 9h18M3 15h18M9 3v18M15 3v18" opacity=".55" />
+              </svg>
+            </span>
+            <div class="brand-text">
+              <h1>Plywood Estimator</h1>
+              <p class="hint">Drop a STEP. Pick bodies. Get optimized cut sheets.</p>
+            </div>
+          </div>
+        </header>
+
+        <section class="panel panel--dropzone" id="dropzone">
+          <div class="drop-inner">
+            <span class="drop-icon" aria-hidden="true">
+              <svg viewBox="0 0 24 24" width="28" height="28" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M12 3v12" />
+                <path d="m7 8 5-5 5 5" />
+                <path d="M5 15v3a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2v-3" />
+              </svg>
+            </span>
+            <strong>Drop .step / .stp</strong>
+            <span class="drop-or">or</span>
+            <button id="pickFileBtn" class="btn-text">Choose file(s)…</button>
+            <input id="fileInput" type="file" accept=".step,.stp,.STEP,.STP" multiple hidden />
+          </div>
+          <div id="loadStatus" class="status"></div>
+        </section>
+
+        <section class="panel">
+          <h2><span class="panel-dot" aria-hidden="true"></span>Sheet</h2>
+          <div class="grid2">
+            <label>Width <input id="sheetW" type="number" value="48" step="0.25" /></label>
+            <label>Length <input id="sheetL" type="number" value="96" step="0.25" /></label>
+            <label>Edge margin <input id="margin" type="number" value="0.25" step="0.0625" /></label>
+            <label>Kerf / spacing <input id="kerf" type="number" value="0.125" step="0.0156" /></label>
+            <label>Units
+              <select id="units">
+                <option value="in" selected>inches</option>
+                <option value="mm">mm</option>
+              </select>
+            </label>
+            <label>Preset
+              <select id="preset">
+                <option value="">— preset —</option>
+                <option value="1220x2440">4×8 ft</option>
+                <option value="1525x1525">5×5 ft (Baltic birch)</option>
+                <option value="1525x3050">5×10 ft</option>
+                <option value="2440x1220">8×4 (rotated)</option>
+              </select>
+            </label>
+            <label>Optimize tries
+              <select id="restarts">
+                <option value="1">1 (fastest)</option>
+                <option value="4">4</option>
+                <option value="8">8</option>
+                <option value="16">16</option>
+                <option value="32" selected>32 (default)</option>
+                <option value="64">64</option>
+                <option value="128">128 (slower)</option>
+                <option value="256">256 (slowest)</option>
+              </select>
+            </label>
+            <label style="grid-column: 1 / -1">Cut strategy
+              <select id="cutStrategy">
+                <option value="free" selected>Max yield (any cuts)</option>
+                <option value="guillotine">Min cuts (track saw / panel saw)</option>
+              </select>
+            </label>
+          </div>
+        </section>
+
+        <section class="panel">
+          <div class="row-between">
+            <h2><span class="panel-dot" aria-hidden="true"></span>Bodies <span id="bodyCount" class="count-pill">0</span></h2>
+            <div class="row-gap">
+              <button id="selectAllBtn" class="ghost">All</button>
+              <button id="selectNoneBtn" class="ghost">None</button>
+              <button id="clearAllBtn" class="ghost">Clear</button>
+            </div>
+          </div>
+          <div id="bodyList" class="body-list">
+            <div class="empty">
+              <span class="empty-glyph" aria-hidden="true">
+                <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round">
+                  <path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z" />
+                  <path d="m3.27 6.96 8.73 5.05 8.73-5.05M12 22.08V12" />
+                </svg>
+              </span>
+              <div class="empty-title">No file loaded</div>
+              <div class="empty-sub">Drop a STEP file above to list solid bodies.</div>
+            </div>
+          </div>
+        </section>
+
+        <section class="panel">
+          <h2><span class="panel-dot" aria-hidden="true"></span>Job</h2>
+          <div class="grid2">
+            <label style="grid-column: 1 / -1">Name <input id="jobName" type="text" placeholder="Kitchen — dishwasher base" /></label>
+            <label>Currency
+              <select id="currency">
+                <option value="USD" selected>USD</option>
+                <option value="CAD">CAD</option>
+                <option value="EUR">EUR</option>
+                <option value="GBP">GBP</option>
+                <option value="AUD">AUD</option>
+              </select>
+            </label>
+            <label>PDF paper
+              <select id="pdfPaper">
+                <option value="letter-landscape" selected>Letter landscape</option>
+                <option value="letter-portrait">Letter portrait</option>
+                <option value="legal-landscape">Legal landscape</option>
+                <option value="legal-portrait">Legal portrait</option>
+                <option value="tabloid-landscape">Tabloid (11×17)</option>
+                <option value="a4-landscape">A4 landscape</option>
+              </select>
+            </label>
+          </div>
+        </section>
+
+        <section class="panel" id="shoppingPanel">
+          <div class="row-between">
+            <h2><span class="panel-dot" aria-hidden="true"></span>Shopping list <span id="shopCount" class="count-pill">0</span></h2>
+            <div class="row-gap">
+              <button id="shopCopyBtn" class="ghost" disabled>Copy</button>
+              <button id="shopCsvBtn" class="ghost" disabled>CSV</button>
+            </div>
+          </div>
+          <div id="shoppingList" class="shopping-list">
+            <div class="empty">
+              <span class="empty-glyph" aria-hidden="true">
+                <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round">
+                  <circle cx="9" cy="20" r="1.4" />
+                  <circle cx="18" cy="20" r="1.4" />
+                  <path d="M2 3h2.5l2.7 12.2a2 2 0 0 0 2 1.6h8.3a2 2 0 0 0 2-1.6L21 7H6" />
+                </svg>
+              </span>
+              <div class="empty-title">No estimate yet</div>
+              <div class="empty-sub">Run an estimate to see sheets needed and total cost.</div>
+            </div>
+          </div>
+          <div id="shopTotals" class="shop-totals" hidden></div>
+        </section>
+
+        <section class="panel panel--cta">
+          <button id="nestBtn" class="primary" disabled>
+            <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="M3 3h7v7H3zM14 3h7v7h-7zM3 14h7v7H3zM14 14h7v7h-7z" />
+            </svg>
+            <span>Estimate cut sheets</span>
+          </button>
+        </section>
+      </aside>
+
+      <!-- RIGHT: 3D | 2D side-by-side, with thumbnails strip below -->
+      <main id="main">
+        <div id="workArea">
+          <!-- 3D pane -->
+          <div class="work-pane" id="viewerPane">
+            <header class="pane-header">
+              <span class="pane-title">
+                <span class="panel-dot" aria-hidden="true"></span>
+                3D model
+              </span>
+              <button id="viewerMaxBtn" class="pane-max" title="Maximize / restore">
+                <svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                  <path d="M4 10V4h6M20 14v6h-6M14 4h6v6M10 20H4v-6" />
+                </svg>
+              </button>
+            </header>
+            <div id="viewerWrap">
+              <div id="viewer"></div>
+              <div id="viewerHud">
+                <span class="hud-dot" aria-hidden="true"></span>
+                <span id="hudHint">Click a body · drag to orbit · scroll to zoom</span>
+              </div>
+            </div>
+          </div>
+
+          <!-- Drag handle between panes -->
+          <div id="paneDivider" class="pane-divider" title="Drag to resize" aria-label="Resize panes">
+            <span class="divider-grip" aria-hidden="true"></span>
+          </div>
+
+          <!-- 2D pane -->
+          <div class="work-pane" id="layoutPane">
+            <header class="pane-header">
+              <span class="pane-title">
+                <span class="panel-dot" aria-hidden="true"></span>
+                Cut layout
+              </span>
+              <div class="row-gap">
+                <button id="downloadDxfBtn" class="ghost" disabled>
+                  <svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                    <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
+                    <path d="m7 10 5 5 5-5" />
+                    <path d="M12 15V3" />
+                  </svg>
+                  DXF
+                </button>
+                <button id="downloadPdfBtn" class="ghost" disabled>
+                  <svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                    <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
+                    <path d="m7 10 5 5 5-5" />
+                    <path d="M12 15V3" />
+                  </svg>
+                  PDF
+                </button>
+                <button id="layoutMaxBtn" class="pane-max" title="Maximize / restore">
+                  <svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                    <path d="M4 10V4h6M20 14v6h-6M14 4h6v6M10 20H4v-6" />
+                  </svg>
+                </button>
+              </div>
+            </header>
+            <section id="resultsTop" class="results-top">
+              <div class="results-empty" id="resultsEmpty">
+                <span class="empty-glyph empty-glyph--lg" aria-hidden="true">
+                  <svg viewBox="0 0 24 24" width="32" height="32" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round">
+                    <rect x="3" y="3" width="18" height="18" rx="2" />
+                    <path d="M3 9h18M9 3v18" opacity=".5" />
+                    <path d="M14 14h4M14 17h4" />
+                  </svg>
+                </span>
+                <div class="empty-title">No layouts yet</div>
+                <div class="empty-sub">Select bodies, then run an estimate to see optimized cut sheets here.</div>
+              </div>
+              <div class="results-detail" id="resultsDetail" hidden>
+                <header class="detail-header">
+                  <div>
+                    <h2 id="detailTitle">Sheet 1</h2>
+                    <div class="detail-sub" id="detailSub"></div>
+                  </div>
+                </header>
+                <div class="detail-svg" id="detailSvg"></div>
+                <div class="metrics-row" id="detailMetrics"></div>
+                <div class="inv-check" id="inventoryCheck"></div>
+                <div class="unplaced" id="unplacedList"></div>
+              </div>
+            </section>
+          </div>
+        </div>
+
+        <section id="thumbStrip" class="thumb-strip" hidden></section>
+      </main>
+    </div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>
