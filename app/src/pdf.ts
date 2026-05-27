@@ -70,29 +70,51 @@ export function buildPdf(result: NestResult, opt: PdfOptions): jsPDF {
 
   const labels = assignPartLabels(result);
 
+  // Track which "section" each page belongs to so the post-pass can draw
+  // headers like "Cut sheet (2 of 4)" using the section's local page count.
+  const sectionPerPage: string[] = [];
+  const tagSection = (name: string) => sectionPerPage.push(name);
+  const addPage = (section: string) => {
+    doc.addPage(dims.format, dims.orient);
+    tagSection(section);
+  };
+
+  // 1. COVER — summary page
+  tagSection('Cover');
   drawSummary(doc, result, opt, dims);
 
-  // Parts overview (IKEA-style) immediately after the summary
-  doc.addPage(dims.format, dims.orient);
-  drawPartsOverview(doc, labels, opt, dims);
+  // 2. SHOPPING LIST — what to buy
+  addPage('Shopping list');
+  drawShoppingListPage(doc, opt, dims);
 
-  // Assembly guide (3D viewer snapshots) — only if both PNGs were provided
+  // 3. CUT LIST — text-mode rip-then-crosscut checklist per sheet
+  addPage('Cut list');
+  drawCutListSummary(doc, result, opt, dims, tagSection);
+
+  // 4. PARTS OVERVIEW (IKEA-style) — full per-part dimensions live here
+  addPage('Parts');
+  drawPartsOverview(doc, labels, opt, dims, tagSection);
+
+  // 5. SHEETS STEP-BY-STEP — visual cut sequence per sheet
+  addPage('Cut sheet');
+  drawCutInstructions(doc, result, opt, dims, labels, tagSection);
+
+  // 6. ASSEMBLY — exploded snapshots, per step file
   if (opt.assembledPng && opt.explodedPng) {
-    doc.addPage(dims.format, dims.orient);
+    addPage('Assembly');
     drawAssemblyGuide(doc, opt, dims);
   }
 
-  // One page per cut sheet, with letter labels overlaid on parts
+  // Per-sheet detail layout pages — one per sheet
   for (const group of result.groups) {
     for (const sheet of group.sheets) {
-      doc.addPage(dims.format, dims.orient);
+      addPage('Sheet detail');
       drawSheet(doc, sheet, opt, dims, labels);
     }
   }
 
-  // Cut instructions at the end so they're easy to print as a checklist
-  doc.addPage(dims.format, dims.orient);
-  drawCutInstructions(doc, result, opt, dims, labels);
+  // Post-pass: add header/footer to every page except the cover.
+  paginateAndDecorate(doc, dims, opt, sectionPerPage);
 
   return doc;
 }
@@ -369,7 +391,7 @@ function drawSheet(doc: jsPDF, sheet: NestSheet, opt: PdfOptions, dims: { w: num
 
   // Parts
   for (const p of sheet.parts) {
-    drawPart(doc, p, ox, oy, scale, opt, labels?.get(p.partId)?.letter);
+    drawPart(doc, p, ox, oy, scale, opt, `${sheet.globalIndex}${p.panelLabel}`);
   }
 
   // Overall sheet dimensions outside the sheet
@@ -412,33 +434,27 @@ function drawPart(
   const partPt = Math.min(pwPt, phPt);
   doc.setTextColor(20);
 
-  // Letter label (huge, bold, centered) — primary identifier
+  // Per-sheet panel id ("1a", "2c") + tiny dim subtitle. ANSI policy:
+  // per-part dimensions live in the Parts overview cards, not stamped on
+  // every panel in the layout (which got noisy fast). The layout shows
+  // the id; the user looks up sizes in the Parts overview.
   if (letter) {
     const big = Math.max(10, Math.min(36, partPt * 0.36));
     doc.setFont('helvetica', 'bold');
     doc.setFontSize(big);
     doc.text(letter, cx, cy + big * 0.18, { align: 'center' });
-  }
 
-  // Smart dimensions:
-  //   - LARGE parts (≥110pt in shorter dim): draw external dimension
-  //     ticks along the part's bottom and left edges, with the value
-  //     inset from the edge. Reads like a real shop drawing.
-  //   - SMALL parts: fall back to a centered subtitle so it still fits.
-  const big = Math.max(10, Math.min(36, partPt * 0.36));
-  if (partPt >= 110) {
-    drawPartDims(doc, px, py, pwPt, phPt, p.w, p.h, opt);
-  } else {
+    const subSize = Math.max(4, Math.min(10, partPt * 0.085));
     doc.setFont('helvetica', 'normal');
-    const subSize = Math.max(4, Math.min(11, partPt * 0.10));
     doc.setFontSize(subSize);
-    doc.setTextColor(60);
+    doc.setTextColor(80);
     doc.text(
       `${fmtDim(p.w, opt.units)} × ${fmtDim(p.h, opt.units)}`,
       cx,
-      cy + (letter ? big * 0.55 + subSize : 0),
+      cy + big * 0.55 + subSize,
       { align: 'center' },
     );
+    doc.setTextColor(0);
   }
 }
 
@@ -522,29 +538,82 @@ function drawPolygon(
 // ---------------------------------------------------------------------------
 // Dimension primitives
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// ANSI dimension helpers — consistent everywhere.
+// Convention:
+//   - Witness lines extend from the object edge across the dim line, with
+//     a 1pt gap from the edge.
+//   - Dim line spans between witness lines with filled triangular
+//     arrowheads pointing inward.
+//   - Text is HORIZONTAL (unidirectional), centered above the dim line
+//     (or beside it for vertical dims), in a fixed font size for the whole
+//     drawing — readers can scan the values consistently.
+// ---------------------------------------------------------------------------
+const DIM_COLOR: [number, number, number] = [110, 110, 110];
+const DIM_LINE_W = 0.5;
+const DIM_ARROW_LEN = 5;
+const DIM_ARROW_W = 1.8;
+const DIM_TEXT_PT = 8;
+const DIM_WITNESS_OVER = 5;
+const DIM_WITNESS_GAP = 1.5;
+
 function drawDimH(doc: jsPDF, x1: number, x2: number, y: number, label: string) {
-  doc.setDrawColor(180, 60, 60);
-  doc.setLineWidth(0.4);
+  doc.setDrawColor(...DIM_COLOR);
+  doc.setLineWidth(DIM_LINE_W);
+  // Witness lines from the object edge across the dim line
+  doc.line(x1, y - DIM_WITNESS_OVER - 2, x1, y + DIM_WITNESS_GAP);
+  doc.line(x2, y - DIM_WITNESS_OVER - 2, x2, y + DIM_WITNESS_GAP);
+  // Dim line
   doc.line(x1, y, x2, y);
-  // extension lines / arrows
-  doc.line(x1, y - 4, x1, y + 4);
-  doc.line(x2, y - 4, x2, y + 4);
-  doc.setTextColor(180, 60, 60);
-  doc.setFontSize(9);
-  doc.text(label, (x1 + x2) / 2, y + 11, { align: 'center' });
+  // Inward-pointing triangular arrowheads
+  doc.setFillColor(...DIM_COLOR);
+  drawDimTri(doc, x1, y, +1, 0);
+  drawDimTri(doc, x2, y, -1, 0);
+  // Horizontal label centered above the dim line
+  doc.setTextColor(...DIM_COLOR);
+  doc.setFont('helvetica', 'normal');
+  doc.setFontSize(DIM_TEXT_PT);
+  doc.text(label, (x1 + x2) / 2, y - 3, { align: 'center' });
   doc.setTextColor(0);
 }
 
 function drawDimV(doc: jsPDF, y1: number, y2: number, x: number, label: string) {
-  doc.setDrawColor(180, 60, 60);
-  doc.setLineWidth(0.4);
+  doc.setDrawColor(...DIM_COLOR);
+  doc.setLineWidth(DIM_LINE_W);
+  // Witness lines
+  doc.line(x - DIM_WITNESS_GAP, y1, x + DIM_WITNESS_OVER + 2, y1);
+  doc.line(x - DIM_WITNESS_GAP, y2, x + DIM_WITNESS_OVER + 2, y2);
   doc.line(x, y1, x, y2);
-  doc.line(x - 4, y1, x + 4, y1);
-  doc.line(x - 4, y2, x + 4, y2);
-  doc.setTextColor(180, 60, 60);
-  doc.setFontSize(9);
-  doc.text(label, x - 4, (y1 + y2) / 2, { align: 'right', angle: 90 });
+  doc.setFillColor(...DIM_COLOR);
+  drawDimTri(doc, x, y1, 0, +1);
+  drawDimTri(doc, x, y2, 0, -1);
+  // Vertical text: rotated 90° beside the dim line
+  doc.setTextColor(...DIM_COLOR);
+  doc.setFont('helvetica', 'normal');
+  doc.setFontSize(DIM_TEXT_PT);
+  doc.text(label, x - 4, (y1 + y2) / 2, { align: 'center', angle: 90 });
   doc.setTextColor(0);
+}
+
+/** Small filled triangle at (x, y) pointing in (dx, dy). */
+function drawDimTri(doc: jsPDF, x: number, y: number, dx: number, dy: number) {
+  let p1: [number, number], p2: [number, number], p3: [number, number];
+  if (dx !== 0) {
+    p1 = [x, y];
+    p2 = [x + dx * DIM_ARROW_LEN, y - DIM_ARROW_W];
+    p3 = [x + dx * DIM_ARROW_LEN, y + DIM_ARROW_W];
+  } else {
+    p1 = [x, y];
+    p2 = [x - DIM_ARROW_W, y + dy * DIM_ARROW_LEN];
+    p3 = [x + DIM_ARROW_W, y + dy * DIM_ARROW_LEN];
+  }
+  // jsPDF.lines uses relative coords + close=true
+  const lines: [number, number][] = [
+    [p2[0] - p1[0], p2[1] - p1[1]],
+    [p3[0] - p2[0], p3[1] - p2[1]],
+    [p1[0] - p3[0], p1[1] - p3[1]],
+  ];
+  doc.lines(lines, p1[0], p1[1], [1, 1], 'F', true);
 }
 
 // ---------------------------------------------------------------------------
@@ -562,6 +631,236 @@ export function downloadPdf(filename: string, doc: jsPDF) {
 }
 
 // ---------------------------------------------------------------------------
+// Shopping list page — same data the sidebar Shopping list shows.
+// We don't have direct access to the ShoppingRow[] here, so the page renders
+// the `inventoryCheck` array the caller already populates. Header + table.
+// ---------------------------------------------------------------------------
+function drawShoppingListPage(doc: jsPDF, opt: PdfOptions, dims: { w: number; h: number }) {
+  const PAGE_W = dims.w;
+  const items = opt.inventoryCheck ?? [];
+  doc.setFont('helvetica', 'bold');
+  doc.setFontSize(20);
+  doc.text('Shopping list', PAGE_PAD, PAGE_PAD + 6);
+  doc.setFont('helvetica', 'normal');
+  doc.setFontSize(10);
+  doc.setTextColor(120);
+  doc.text(
+    items.length > 0
+      ? `${items.reduce((a, x) => a + Math.max(0, x.needed - x.available), 0)} sheets to buy.`
+      : 'No materials needed (empty job).',
+    PAGE_W - PAGE_PAD, PAGE_PAD + 6, { align: 'right' },
+  );
+  doc.setTextColor(0);
+
+  let y = PAGE_PAD + 38;
+  const lineH = 18;
+  // Table header — hairline under
+  doc.setFont('helvetica', 'bold');
+  doc.setFontSize(10);
+  doc.setTextColor(110);
+  const cols = [
+    { key: 'Material',  x: PAGE_PAD,           w: PAGE_W - PAGE_PAD - 380, align: 'left'  as const },
+    { key: 'Need',      x: PAGE_W - PAGE_PAD - 360, w: 70,  align: 'right' as const },
+    { key: 'Have',      x: PAGE_W - PAGE_PAD - 280, w: 70,  align: 'right' as const },
+    { key: 'Buy',       x: PAGE_W - PAGE_PAD - 200, w: 70,  align: 'right' as const },
+    { key: 'Status',    x: PAGE_W - PAGE_PAD - 120, w: 120, align: 'right' as const },
+  ];
+  for (const c of cols) doc.text(c.key.toUpperCase(), c.x + (c.align === 'right' ? c.w : 0), y, { align: c.align });
+  y += 6;
+  doc.setDrawColor(220);
+  doc.setLineWidth(0.5);
+  doc.line(PAGE_PAD, y, PAGE_W - PAGE_PAD, y);
+  y += 14;
+
+  doc.setFont('helvetica', 'normal');
+  doc.setFontSize(11);
+  doc.setTextColor(40);
+  for (const r of items) {
+    const short = Math.max(0, r.needed - r.available);
+    const status = short > 0 ? `Buy ${short}` : 'OK';
+    doc.text(r.label, cols[0].x, y);
+    doc.text(String(r.needed), cols[1].x + cols[1].w, y, { align: 'right' });
+    doc.text(String(r.available), cols[2].x + cols[2].w, y, { align: 'right' });
+    doc.text(String(short), cols[3].x + cols[3].w, y, { align: 'right' });
+    if (short > 0) doc.setTextColor(192, 58, 54);
+    else            doc.setTextColor(80, 132, 110);
+    doc.text(status, cols[4].x + cols[4].w, y, { align: 'right' });
+    doc.setTextColor(40);
+    y += lineH;
+  }
+
+  // Total
+  y += 4;
+  doc.setLineWidth(0.4);
+  doc.setDrawColor(220);
+  doc.line(PAGE_PAD, y, PAGE_W - PAGE_PAD, y);
+  y += 18;
+  doc.setFont('helvetica', 'bold');
+  doc.setFontSize(12);
+  doc.setTextColor(40);
+  doc.text('JOB COST', cols[0].x, y);
+  if (opt.jobCost && opt.jobCost > 0 && opt.currency) {
+    try {
+      doc.text(
+        new Intl.NumberFormat(undefined, { style: 'currency', currency: opt.currency }).format(opt.jobCost),
+        PAGE_W - PAGE_PAD, y, { align: 'right' },
+      );
+    } catch { /* unknown currency */ }
+  } else {
+    doc.text('—', PAGE_W - PAGE_PAD, y, { align: 'right' });
+  }
+  doc.setTextColor(0);
+}
+
+// ---------------------------------------------------------------------------
+// Cut list summary — text-mode rip-then-crosscut steps per sheet.
+// (Visual versions are on the "Cut sheet" pages.)
+// ---------------------------------------------------------------------------
+function drawCutListSummary(
+  doc: jsPDF,
+  result: NestResult,
+  opt: PdfOptions,
+  dims: { w: number; h: number },
+  tagSection?: (s: string) => void,
+) {
+  const PAGE_W = dims.w;
+  const PAGE_H = dims.h;
+  const cuts = allCutSteps(result);
+  const total = cuts.reduce((a, sc) => a + sc.steps.length, 0);
+
+  doc.setFont('helvetica', 'bold');
+  doc.setFontSize(20);
+  doc.text('Cut list', PAGE_PAD, PAGE_PAD + 6);
+  doc.setFont('helvetica', 'normal');
+  doc.setFontSize(10);
+  doc.setTextColor(120);
+  doc.text(
+    `${total} cuts across ${cuts.length} sheets. Larger cuts first; then cut to length.`,
+    PAGE_PAD, PAGE_PAD + 24, { maxWidth: PAGE_W - 2 * PAGE_PAD },
+  );
+  doc.setTextColor(0);
+
+  let y = PAGE_PAD + 46;
+  const lineH = 13;
+  const bottom = PAGE_H - PAGE_PAD;
+
+  for (const sc of cuts) {
+    if (y > bottom - 40) { doc.addPage(); tagSection?.('Cut list'); y = PAGE_PAD + 6; }
+    doc.setFont('helvetica', 'bold');
+    doc.setFontSize(11);
+    doc.setTextColor(20);
+    doc.text(
+      `Sheet ${sc.globalIndex}  ·  ${fmtDim(sc.thickness, opt.units)} thick  ·  ${sc.steps.length} cuts`,
+      PAGE_PAD, y,
+    );
+    y += 14;
+
+    if (sc.steps.length === 0) {
+      doc.setFont('helvetica', 'italic');
+      doc.setFontSize(10);
+      doc.setTextColor(120);
+      doc.text('No interior cuts.', PAGE_PAD + 14, y);
+      doc.setTextColor(0);
+      y += lineH + 4;
+      continue;
+    }
+
+    doc.setFont('helvetica', 'normal');
+    doc.setFontSize(10);
+    doc.setTextColor(40);
+    for (const st of sc.steps) {
+      if (y > bottom - lineH) { doc.addPage(); tagSection?.('Cut list'); y = PAGE_PAD + 6; }
+      const edgeRef = st.axis === 'rip' ? 'from L of parent' : 'from B of parent';
+      const label   = st.axis === 'rip' ? 'Rip' : 'Crosscut';
+      doc.text(
+        `${String(st.index).padStart(2, ' ')}.  ${label}  at  ${fmtDim(st.distance, opt.units)}  ${edgeRef}`,
+        PAGE_PAD + 14, y,
+      );
+      y += lineH;
+    }
+    y += 6;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Header + footer pass.
+// Skips the cover (page 1). On every other page:
+//   Header (top):   left = job name           right = section · N of M
+//   Footer (bot):   left = doc id (sha)       center = Page X of Y   right = date
+//
+// Section labels come from `sectionPerPage[i]` (1 entry per page in order).
+// "N of M" within section: precomputed from sectionPerPage.
+// ---------------------------------------------------------------------------
+function paginateAndDecorate(
+  doc: jsPDF,
+  dims: { w: number; h: number },
+  opt: PdfOptions,
+  sectionPerPage: string[],
+) {
+  const PAGE_W = dims.w;
+  const PAGE_H = dims.h;
+  const total = doc.getNumberOfPages();
+  const now = new Date();
+  const dateStr = now.toISOString().slice(0, 10) + ' ' + now.toTimeString().slice(0, 5);
+  const jobName = opt.jobName || 'Plywood cut estimate';
+
+  // Per-section running counts
+  const sectionTotals = new Map<string, number>();
+  for (const s of sectionPerPage) sectionTotals.set(s, (sectionTotals.get(s) ?? 0) + 1);
+  const sectionSoFar = new Map<string, number>();
+
+  for (let i = 1; i <= total; i++) {
+    if (i === 1) continue; // cover stays clean
+    doc.setPage(i);
+    const section = sectionPerPage[i - 1] ?? '';
+    const idx = (sectionSoFar.get(section) ?? 0) + 1;
+    sectionSoFar.set(section, idx);
+    const sectionTotal = sectionTotals.get(section) ?? 1;
+    drawHeaderFooter(
+      doc, dims, jobName, section, idx, sectionTotal, i, total, dateStr,
+    );
+  }
+}
+
+function drawHeaderFooter(
+  doc: jsPDF,
+  dims: { w: number; h: number },
+  jobName: string,
+  section: string,
+  sectionIdx: number,
+  sectionTotal: number,
+  pageNum: number,
+  pageTotal: number,
+  dateStr: string,
+) {
+  const PAGE_W = dims.w;
+  const PAGE_H = dims.h;
+  doc.setFont('helvetica', 'normal');
+  doc.setFontSize(8.5);
+  doc.setTextColor(140);
+
+  // HEADER — top of page, with a hairline under it
+  doc.text(jobName, PAGE_PAD, 18);
+  const sectionLabel = sectionTotal > 1
+    ? `${section} (${sectionIdx} of ${sectionTotal})`
+    : section;
+  doc.text(sectionLabel, PAGE_W - PAGE_PAD, 18, { align: 'right' });
+  doc.setDrawColor(225);
+  doc.setLineWidth(0.4);
+  doc.line(PAGE_PAD, 22, PAGE_W - PAGE_PAD, 22);
+
+  // FOOTER — page X of Y · date
+  const fy = PAGE_H - 14;
+  doc.setDrawColor(225);
+  doc.line(PAGE_PAD, fy - 8, PAGE_W - PAGE_PAD, fy - 8);
+  doc.setTextColor(140);
+  doc.text('plywood-estimator', PAGE_PAD, fy);
+  doc.text(`Page ${pageNum} of ${pageTotal}`, PAGE_W / 2, fy, { align: 'center' });
+  doc.text(dateStr, PAGE_W - PAGE_PAD, fy, { align: 'right' });
+  doc.setTextColor(0);
+}
+
+// ---------------------------------------------------------------------------
 // Parts overview (IKEA-style)
 //   - Header: "Parts" + total piece count
 //   - Grid of cards, each: big letter • silhouette • name • dimensions • qty
@@ -572,6 +871,7 @@ function drawPartsOverview(
   labels: Map<string, PartLabel>,
   opt: PdfOptions,
   dims: { w: number; h: number },
+  tagSection?: (s: string) => void,
 ) {
   const PAGE_W = dims.w;
   const PAGE_H = dims.h;
@@ -606,6 +906,7 @@ function drawPartsOverview(
     const onPage = i % perPage;
     if (i > 0 && onPage === 0) {
       doc.addPage(dims === PAPER_DIMS['letter-portrait'] ? 'letter' : undefined as any);
+      tagSection?.('Parts');
     }
     const col = onPage % cols;
     const row = Math.floor(onPage / cols);
@@ -680,6 +981,7 @@ function drawCutInstructions(
   opt: PdfOptions,
   dims: { w: number; h: number },
   _labels: Map<string, PartLabel>,
+  tagSection?: (s: string) => void,
 ) {
   const PAGE_W = dims.w;
   const PAGE_H = dims.h;
@@ -736,13 +1038,14 @@ function drawCutInstructions(
     let y = sIdx === 0 ? TOP0 : TOP_NEW;
     if (sIdx > 0) {
       doc.addPage();
+      tagSection?.('Cut sheet');
       y = TOP_NEW;
     }
     doc.setFont('helvetica', 'bold');
     doc.setFontSize(13);
     doc.setTextColor(20);
     doc.text(
-      `Sheet ${sc.groupIndex}.${sc.sheetIndex}  ·  ${fmtDim(sc.thickness, opt.units)} thick  ·  ${fmtDim(sc.sheetW, opt.units)} × ${fmtDim(sc.sheetL, opt.units)}  ·  ${sc.steps.length} cuts`,
+      `Sheet ${sc.globalIndex}  ·  ${fmtDim(sc.thickness, opt.units)} thick  ·  ${fmtDim(sc.sheetW, opt.units)} × ${fmtDim(sc.sheetL, opt.units)}  ·  ${sc.steps.length} cuts`,
       PAGE_PAD, y,
     );
     y += headerH;
@@ -762,6 +1065,7 @@ function drawCutInstructions(
       // page when we'd run off the bottom.
       if (y + cardH > PAGE_H - BOTTOM_PAD) {
         doc.addPage();
+        tagSection?.('Cut sheet');
         y = TOP_NEW;
         col = 0;
       }
@@ -834,27 +1138,23 @@ function drawCutCard(
   }
   if (gs) (doc as any).setGState(new (doc as any).GState({ opacity: 1 }));
 
-  // Per-part letter labels — centered inside each part rectangle.
-  // Skipped when the cell is too small for the text to read.
-  if (labels) {
-    doc.setFont('helvetica', 'bold');
-    doc.setTextColor(50);
-    for (const p of parts) {
-      const letter = labels.get(p.partId)?.letter;
-      if (!letter) continue;
-      const cellW = p.w * scale;
-      const cellH = p.h * scale;
-      const minPx = Math.min(cellW, cellH);
-      if (minPx < 10) continue;
-      const fs = Math.max(6, Math.min(14, minPx * 0.35));
-      doc.setFontSize(fs);
-      doc.text(
-        letter,
-        ox + (p.x + p.w / 2) * scale,
-        oy + (p.y + p.h / 2) * scale + fs * 0.32,
-        { align: 'center' },
-      );
-    }
+  // Per-panel labels ("3a", "3b" — sheet global index + panel letter).
+  doc.setFont('helvetica', 'bold');
+  doc.setTextColor(50);
+  for (const p of parts) {
+    const id = `${sc.globalIndex}${p.panelLabel}`;
+    const cellW = p.w * scale;
+    const cellH = p.h * scale;
+    const minPx = Math.min(cellW, cellH);
+    if (minPx < 10) continue;
+    const fs = Math.max(6, Math.min(14, minPx * 0.32));
+    doc.setFontSize(fs);
+    doc.text(
+      id,
+      ox + (p.x + p.w / 2) * scale,
+      oy + (p.y + p.h / 2) * scale + fs * 0.32,
+      { align: 'center' },
+    );
   }
 
   const lengthIsY = sc.sheetL >= sc.sheetW;

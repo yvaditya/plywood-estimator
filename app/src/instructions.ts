@@ -41,6 +41,7 @@ export interface CutStep {
 
 export interface SheetCuts {
   sheetIndex: number;   // 1-based within its thickness group
+  globalIndex: number;  // 1-based across the whole job ("Sheet 3")
   groupIndex: number;   // 1-based
   thickness: number;
   sheetW: number;
@@ -138,7 +139,7 @@ export function cutStepsForSheet(sheet: NestSheet, sheetIndex: number, groupInde
       };
     });
     return {
-      sheetIndex, groupIndex,
+      sheetIndex, globalIndex: sheet.globalIndex || sheetIndex, groupIndex,
       thickness: sheet.thickness, sheetW: W, sheetL: L,
       steps,
       isGuillotineTree: true,
@@ -168,7 +169,7 @@ export function cutStepsForSheet(sheet: NestSheet, sheetIndex: number, groupInde
   for (const d of crossCuts) steps.push({ index: idx++, axis: 'cross', distance: d, ...baseParent });
 
   return {
-    sheetIndex, groupIndex,
+    sheetIndex, globalIndex: sheet.globalIndex || sheetIndex, groupIndex,
     thickness: sheet.thickness, sheetW: W, sheetL: L,
     steps,
     isGuillotineTree: false,

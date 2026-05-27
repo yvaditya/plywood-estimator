@@ -1115,8 +1115,9 @@ input[type="checkbox"]:focus-visible { box-shadow: 0 0 0 2px var(--accent-ring);
 .margin-rect { fill: none; stroke: rgba(55, 53, 47, 0.22); stroke-dasharray: 4 4; stroke-width: 0.7; }
 .grain-arrow { stroke: #37352F; stroke-width: 1.2; fill: none; }
 .part-label { fill: #37352F; font-size: 10px; font-weight: 600; text-anchor: middle; pointer-events: none; }
-.dim-line { stroke: #C03A36; stroke-width: 0.8; fill: none; }
-.dim-text { fill: #C03A36; font-size: 9px; font-weight: 600; text-anchor: middle; }
+.dim-line { stroke: #C03A36; stroke-width: 0.6; fill: none; }
+.dim-arrow { fill: #C03A36; stroke: none; }
+.dim-text { fill: #C03A36; font-size: 8px; font-weight: 600; text-anchor: middle; font-family: var(--font-mono); }
 
 /* ===========================================================================
    Responsive guardrails

@@ -48,6 +48,9 @@ import { fmtDim, fmtArea, fmtLinear, fmtMoney, toMm, fromMm, type Units } from '
 interface BodyState {
   id: number;
   name: string;
+  /** Source STEP file (filename without extension). Used to group bodies
+   *  per file for per-file exploded views in the PDF. */
+  fileTag: string;
   analysis: BodyAnalysis;
   qty: number;
   grain: GrainLock;
@@ -368,6 +371,7 @@ async function handleFiles(files: FileList | File[]) {
           state.bodies.push({
             id,
             name: displayName,
+            fileTag: tag,
             analysis,
             qty: 1,
             grain: 'free',
@@ -385,6 +389,11 @@ async function handleFiles(files: FileList | File[]) {
     }
 
     viewer.finishLoad();
+    // Auto-select all newly-loaded sheet-good bodies so the user can hit
+    // "Estimate" immediately. Non-sheet bodies were already excluded.
+    for (const b of state.bodies) b.selected = true;
+    syncViewerSelectionFromState();
+    pushAllGrainToViewer();
     renderBodyList();
     updateNestBtn();
     const dropped = totalRaw - totalAdded - totalSkippedNotSheet;
@@ -977,13 +986,14 @@ function buildSheetSvg(
 
   // Parts
   for (const p of sheet.parts) {
-    svg.appendChild(buildPartShape(svgNS, p, withDimensions, Math.max(sheetW, sheetL)));
+    svg.appendChild(buildPartShape(svgNS, p, withDimensions, sheet.globalIndex));
   }
 
-  // Overall sheet dimensions
+  // Overall sheet dimensions (ANSI: dim lines OUTSIDE the sheet with
+  // triangular arrowheads + small witness lines from the sheet corners).
   if (withDimensions) {
-    svg.appendChild(buildDim(svgNS, 0, sheetL + 10, sheetW, sheetL + 10, fmtDim(sheetW, state.units)));
-    svg.appendChild(buildDim(svgNS, -10, 0, -10, sheetL, fmtDim(sheetL, state.units), true));
+    svg.appendChild(buildAnsiDimH(svgNS, 0, sheetW, sheetL + 12, fmtDim(sheetW, state.units)));
+    svg.appendChild(buildAnsiDimV(svgNS, 0, sheetL, -12, fmtDim(sheetL, state.units)));
   }
 
   return svg;
@@ -993,7 +1003,7 @@ function buildPartShape(
   svgNS: string,
   p: PlacedPart,
   withLabels: boolean,
-  sheetScale: number,
+  sheetGlobalIndex: number,
 ): SVGElement {
   const g = document.createElementNS(svgNS, 'g') as SVGGElement;
   g.setAttribute('transform', `translate(${p.x}, ${p.y})`);
@@ -1027,26 +1037,26 @@ function buildPartShape(
     arrow.setAttribute('class', 'grain-arrow');
     g.appendChild(arrow);
 
-    // Big letter label (primary identifier — matches PDF Parts overview).
-    const letter = state.partLabels.get(p.partId)?.letter;
+    // Per-sheet panel label: "1a", "2c", etc. Matches the cut list and
+    // PDF references. Dimensions live in the Parts overview table only
+    // (ANSI-clean: don't clutter the layout with per-part dim arrows).
+    const panelId = `${sheetGlobalIndex}${p.panelLabel}`;
     const bigSize = Math.max(10, Math.min(36, Math.min(p.w, p.h) * 0.34));
-    if (letter) {
-      const bigLabel = document.createElementNS(svgNS, 'text');
-      bigLabel.setAttribute('class', 'part-label');
-      bigLabel.setAttribute('x', String(p.w / 2));
-      bigLabel.setAttribute('y', String(p.h / 2 + bigSize * 0.18));
-      bigLabel.setAttribute('font-size', String(bigSize));
-      bigLabel.setAttribute('font-weight', '700');
-      bigLabel.textContent = letter;
-      g.appendChild(bigLabel);
-    }
+    const bigLabel = document.createElementNS(svgNS, 'text');
+    bigLabel.setAttribute('class', 'part-label');
+    bigLabel.setAttribute('x', String(p.w / 2));
+    bigLabel.setAttribute('y', String(p.h / 2 + bigSize * 0.18));
+    bigLabel.setAttribute('font-size', String(bigSize));
+    bigLabel.setAttribute('font-weight', '700');
+    bigLabel.textContent = panelId;
+    g.appendChild(bigLabel);
 
-    // Dimensions sub-label below
-    const labelSize = Math.max(6, Math.min(12, Math.min(p.w, p.h) * 0.10));
+    // Compact dimensions sub-label (just a quick visual reference).
+    const labelSize = Math.max(6, Math.min(11, Math.min(p.w, p.h) * 0.08));
     const dimLabel = document.createElementNS(svgNS, 'text');
     dimLabel.setAttribute('class', 'part-label');
     dimLabel.setAttribute('x', String(p.w / 2));
-    dimLabel.setAttribute('y', String(p.h / 2 + (letter ? bigSize * 0.55 + labelSize : 0)));
+    dimLabel.setAttribute('y', String(p.h / 2 + bigSize * 0.55 + labelSize));
     dimLabel.setAttribute('font-size', String(labelSize));
     dimLabel.setAttribute('font-weight', '400');
     dimLabel.textContent = `${fmtDim(p.w, state.units)} × ${fmtDim(p.h, state.units)}`;
@@ -1056,58 +1066,118 @@ function buildPartShape(
   return g;
 }
 
-function buildDim(
+/**
+ * ANSI-style HORIZONTAL dimension between (x1) and (x2) at vertical
+ * coordinate `y`. Witness lines drop from the sheet edge to the dim
+ * line; triangular arrowheads point INWARD at each end; text is
+ * horizontal, centered ABOVE the dim line.
+ *
+ * Constants tuned for the SVG viewBox in mm (we use ~10-mm-tall text
+ * so it stays readable when the SVG scales down to fit a card).
+ */
+function buildAnsiDimH(
   svgNS: string,
-  x1: number, y1: number, x2: number, y2: number,
+  x1: number, x2: number, y: number,
   label: string,
-  vertical = false,
 ): SVGElement {
   const g = document.createElementNS(svgNS, 'g') as SVGGElement;
+  // Witness lines from sheet edge → dim line (with a small gap from the edge)
+  const witnessOver = 4;
+  const witnessGap = 1.5;
+  const wA = document.createElementNS(svgNS, 'line');
+  wA.setAttribute('class', 'dim-line');
+  wA.setAttribute('x1', String(x1)); wA.setAttribute('x2', String(x1));
+  wA.setAttribute('y1', String(y - witnessOver - 2));
+  wA.setAttribute('y2', String(y + witnessGap));
+  g.appendChild(wA);
+  const wB = document.createElementNS(svgNS, 'line');
+  wB.setAttribute('class', 'dim-line');
+  wB.setAttribute('x1', String(x2)); wB.setAttribute('x2', String(x2));
+  wB.setAttribute('y1', String(y - witnessOver - 2));
+  wB.setAttribute('y2', String(y + witnessGap));
+  g.appendChild(wB);
+  // Dim line
   const line = document.createElementNS(svgNS, 'line');
   line.setAttribute('class', 'dim-line');
-  line.setAttribute('x1', String(x1));
-  line.setAttribute('y1', String(y1));
-  line.setAttribute('x2', String(x2));
-  line.setAttribute('y2', String(y2));
+  line.setAttribute('x1', String(x1)); line.setAttribute('x2', String(x2));
+  line.setAttribute('y1', String(y));  line.setAttribute('y2', String(y));
   g.appendChild(line);
-
-  const tickA = document.createElementNS(svgNS, 'line');
-  tickA.setAttribute('class', 'dim-line');
-  if (vertical) {
-    tickA.setAttribute('x1', String(x1 - 3)); tickA.setAttribute('x2', String(x1 + 3));
-    tickA.setAttribute('y1', String(y1)); tickA.setAttribute('y2', String(y1));
-  } else {
-    tickA.setAttribute('x1', String(x1)); tickA.setAttribute('x2', String(x1));
-    tickA.setAttribute('y1', String(y1 - 3)); tickA.setAttribute('y2', String(y1 + 3));
-  }
-  g.appendChild(tickA);
-
-  const tickB = document.createElementNS(svgNS, 'line');
-  tickB.setAttribute('class', 'dim-line');
-  if (vertical) {
-    tickB.setAttribute('x1', String(x2 - 3)); tickB.setAttribute('x2', String(x2 + 3));
-    tickB.setAttribute('y1', String(y2)); tickB.setAttribute('y2', String(y2));
-  } else {
-    tickB.setAttribute('x1', String(x2)); tickB.setAttribute('x2', String(x2));
-    tickB.setAttribute('y1', String(y2 - 3)); tickB.setAttribute('y2', String(y2 + 3));
-  }
-  g.appendChild(tickB);
-
+  // Arrowheads (pointing inward)
+  g.appendChild(svgArrow(svgNS, x1, y, 1, 0));
+  g.appendChild(svgArrow(svgNS, x2, y, -1, 0));
+  // Text — horizontal, centered above the dim line
   const text = document.createElementNS(svgNS, 'text');
   text.setAttribute('class', 'dim-text');
-  if (vertical) {
-    const tx = x1 - 5;
-    const ty = (y1 + y2) / 2;
-    text.setAttribute('x', String(tx));
-    text.setAttribute('y', String(ty));
-    text.setAttribute('transform', `rotate(-90, ${tx}, ${ty})`);
-  } else {
-    text.setAttribute('x', String((x1 + x2) / 2));
-    text.setAttribute('y', String(y1 - 4));
-  }
+  text.setAttribute('x', String((x1 + x2) / 2));
+  text.setAttribute('y', String(y - 4));
+  text.setAttribute('text-anchor', 'middle');
   text.textContent = label;
   g.appendChild(text);
   return g;
+}
+
+/** ANSI vertical dim — same conventions, rotated. */
+function buildAnsiDimV(
+  svgNS: string,
+  y1: number, y2: number, x: number,
+  label: string,
+): SVGElement {
+  const g = document.createElementNS(svgNS, 'g') as SVGGElement;
+  const witnessOver = 4;
+  const witnessGap = 1.5;
+  const wA = document.createElementNS(svgNS, 'line');
+  wA.setAttribute('class', 'dim-line');
+  wA.setAttribute('x1', String(x - witnessGap)); wA.setAttribute('x2', String(x + witnessOver + 2));
+  wA.setAttribute('y1', String(y1)); wA.setAttribute('y2', String(y1));
+  g.appendChild(wA);
+  const wB = document.createElementNS(svgNS, 'line');
+  wB.setAttribute('class', 'dim-line');
+  wB.setAttribute('x1', String(x - witnessGap)); wB.setAttribute('x2', String(x + witnessOver + 2));
+  wB.setAttribute('y1', String(y2)); wB.setAttribute('y2', String(y2));
+  g.appendChild(wB);
+  const line = document.createElementNS(svgNS, 'line');
+  line.setAttribute('class', 'dim-line');
+  line.setAttribute('x1', String(x)); line.setAttribute('x2', String(x));
+  line.setAttribute('y1', String(y1)); line.setAttribute('y2', String(y2));
+  g.appendChild(line);
+  g.appendChild(svgArrow(svgNS, x, y1, 0, 1));
+  g.appendChild(svgArrow(svgNS, x, y2, 0, -1));
+  // Rotated text, centered along dim line
+  const text = document.createElementNS(svgNS, 'text');
+  text.setAttribute('class', 'dim-text');
+  const tx = x - 4;
+  const ty = (y1 + y2) / 2;
+  text.setAttribute('x', String(tx));
+  text.setAttribute('y', String(ty));
+  text.setAttribute('text-anchor', 'middle');
+  text.setAttribute('transform', `rotate(-90, ${tx}, ${ty})`);
+  text.textContent = label;
+  g.appendChild(text);
+  return g;
+}
+
+/**
+ * Small filled triangle arrowhead in SVG, pointing in (dx, dy) direction.
+ * Used by the ANSI dim helpers.
+ */
+function svgArrow(svgNS: string, x: number, y: number, dx: number, dy: number): SVGElement {
+  const len = 4.5;
+  const w = 1.6;
+  // Build a triangle: tip at (x, y), base perpendicular to (dx, dy)
+  let p1: [number, number], p2: [number, number], p3: [number, number];
+  if (dx !== 0) {
+    p1 = [x, y];
+    p2 = [x - dx * len, y - w];
+    p3 = [x - dx * len, y + w];
+  } else {
+    p1 = [x, y];
+    p2 = [x - w, y - dy * len];
+    p3 = [x + w, y - dy * len];
+  }
+  const poly = document.createElementNS(svgNS, 'polygon') as SVGPolygonElement;
+  poly.setAttribute('class', 'dim-arrow');
+  poly.setAttribute('points', `${p1[0]},${p1[1]} ${p2[0]},${p2[1]} ${p3[0]},${p3[1]}`);
+  return poly;
 }
 
 function ringToPath(ring: [number, number][]): string {

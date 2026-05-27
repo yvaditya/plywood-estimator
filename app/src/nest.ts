@@ -65,10 +65,26 @@ export interface PlacedPart {
   color: string;
   outer: Vec2[];          // polygon ring, rotated + anchored to (0,0)
   holes: Vec2[][];
+  /** Position-based label within the sheet: 'a', 'b', 'c', …
+   *  Combined with the sheet's global number (1, 2, 3…) yields the
+   *  full panel id used in the PDF and SVG: "1a", "2c", etc. */
+  panelLabel: string;
+  /** Index of the last cut that fully separates this panel from the
+   *  surrounding stock (1-based, within the sheet's cuts[]). 0 means
+   *  the panel was already separated by the time of the first cut
+   *  (e.g. for sheets with a single part). For visualization: panels
+   *  with separatedAt ≤ currentCutIndex are rendered as "cut off". */
+  separatedAt: number;
 }
 
 export interface NestSheet {
+  /** 1-based index WITHIN this thickness group. */
   index: number;
+  /** 1-based index across the WHOLE job — sheet labels use this so a
+   *  panel reads as "3c" (3rd sheet job-wide, 3rd panel on it) rather
+   *  than "2.1c" (group 2, sheet 1, panel c). Set by runNest after all
+   *  groups are built. */
+  globalIndex: number;
   thickness: number;
   parts: PlacedPart[];
   usedArea: number;       // sum of placed bbox areas (mm²)
@@ -242,6 +258,7 @@ export function runNest(parts: NestPart[], config: NestConfig): NestResult {
 
     const sheets: NestSheet[] = winner.sheets.map((ps, idx) => ({
       index: idx + 1,
+      globalIndex: 0, // populated after all groups are built
       thickness: t,
       parts: ps.placements.map((pl) => placementToPart(pl, meta, margin)),
       usedArea: ps.usedArea,
@@ -261,6 +278,11 @@ export function runNest(parts: NestPart[], config: NestConfig): NestResult {
       })),
     }));
 
+    // Now that each sheet has both its parts and its cuts, fill in
+    // per-sheet panel labels (a, b, c…) and the cut-step at which each
+    // panel is fully separated from the surrounding stock.
+    for (const sh of sheets) annotatePlacedParts(sh);
+
     const unplaced = winner.unplaced.map((u) => {
       const m = meta.get(u.id)!;
       return { partId: m.part.id, partName: m.part.name, instance: m.instance };
@@ -273,6 +295,12 @@ export function runNest(parts: NestPart[], config: NestConfig): NestResult {
     totalSheets += sheets.length;
 
     groups.push({ thickness: t, sheets, unplaced });
+  }
+
+  // Now that all groups exist, assign continuous global sheet indices.
+  let gIdx = 1;
+  for (const g of groups) {
+    for (const s of g.sheets) s.globalIndex = gIdx++;
   }
 
   return {
@@ -309,7 +337,64 @@ function placementToPart(
     color: m.part.color,
     outer,
     holes,
+    panelLabel: '',          // populated after the sheet is assembled
+    separatedAt: 0,          // populated after cuts are known
   };
+}
+
+/**
+ * After a sheet's parts and cuts are known, fill in:
+ *   - panelLabel: 'a', 'b', 'c', … by top-to-bottom, then left-to-right.
+ *   - separatedAt: index (1-based) of the LAST cut that completes the
+ *     panel's separation from the surrounding stock. A panel is considered
+ *     fully separated when all of its interior edges have been cut.
+ */
+function annotatePlacedParts(sheet: NestSheet) {
+  // Sort by position for stable per-sheet labels.
+  const sorted = sheet.parts.slice().sort((a, b) => {
+    if (Math.abs(a.y - b.y) > 0.5) return a.y - b.y;
+    return a.x - b.x;
+  });
+  sorted.forEach((p, i) => {
+    p.panelLabel = positionToLetter(i);
+  });
+
+  // Map cut → absolute coord (for V cuts this is the X line; for H cuts the Y).
+  const cutLine = (c: typeof sheet.cuts[number]) =>
+    c.axis === 'V' ? c.parentX + c.distance : c.parentY + c.distance;
+
+  for (const p of sheet.parts) {
+    let lastIdx = 0;
+    // For each interior edge of the panel, find a cut whose abs coord matches.
+    const eps = 0.5;
+    const xs: number[] = [];
+    const ys: number[] = [];
+    if (p.x > eps)                xs.push(p.x);
+    if (p.x + p.w < sheet.sheetW - eps) xs.push(p.x + p.w);
+    if (p.y > eps)                ys.push(p.y);
+    if (p.y + p.h < sheet.sheetL - eps) ys.push(p.y + p.h);
+
+    for (let i = 0; i < sheet.cuts.length; i++) {
+      const c = sheet.cuts[i];
+      const v = cutLine(c);
+      const matches = c.axis === 'V'
+        ? xs.some((x) => Math.abs(x - v) < eps)
+        : ys.some((y) => Math.abs(y - v) < eps);
+      if (matches) lastIdx = i + 1;
+    }
+    p.separatedAt = lastIdx;
+  }
+}
+
+/** 0 → 'a', 25 → 'z', 26 → 'aa', etc. */
+function positionToLetter(i: number): string {
+  let n = i;
+  let s = '';
+  do {
+    s = String.fromCharCode(97 + (n % 26)) + s;
+    n = Math.floor(n / 26) - 1;
+  } while (n >= 0);
+  return s;
 }
 
 /**
