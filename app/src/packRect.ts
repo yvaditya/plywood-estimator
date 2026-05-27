@@ -57,7 +57,35 @@ export interface PackResult {
   usedArea: number;
 }
 
-interface FreeRect extends Rect {}
+/**
+ * A single physical cut in a guillotine cut tree.
+ *
+ *   parent{X,Y,W,H} — the rectangle of stock being cut (in sheet coords,
+ *     including kerf inflation).
+ *   axis            — 'H' = horizontal cut (cut line runs along X),
+ *                     'V' = vertical cut (cut line runs along Y).
+ *   distance        — distance from the parent's reference edge:
+ *                     - H cut: measured from parent's BOTTOM edge (parentY).
+ *                     - V cut: measured from parent's LEFT edge (parentX).
+ *   depth           — depth of the parent in the cut tree (0 = original sheet).
+ *                     Used to order cuts "biggest first": all depth-0 cuts
+ *                     (full-sheet rips) come before depth-1 (cuts within
+ *                     strips), etc.
+ */
+export interface Cut {
+  parentX: number;
+  parentY: number;
+  parentW: number;
+  parentH: number;
+  axis: 'H' | 'V';
+  distance: number;
+  depth: number;
+}
+
+interface FreeRect extends Rect {
+  /** Depth in the cut tree — only the GuillotineBin uses this. */
+  depth?: number;
+}
 
 interface ScoredPlacement {
   x: number;
@@ -73,6 +101,8 @@ interface BinPacker {
   binW: number;
   binH: number;
   free: FreeRect[];
+  /** Cuts recorded so far (only populated by GuillotineBin). */
+  cuts: Cut[];
   insert(w: number, h: number, allowRotate: boolean, heur: Heuristic): PackPlacement | null;
 }
 
@@ -80,6 +110,7 @@ class MaxRectsBin implements BinPacker {
   binW: number;
   binH: number;
   free: FreeRect[];
+  cuts: Cut[] = []; // MaxRects doesn't track a guillotine cut tree
 
   constructor(w: number, h: number) {
     this.binW = w;
@@ -145,11 +176,12 @@ class GuillotineBin implements BinPacker {
   binW: number;
   binH: number;
   free: FreeRect[];
+  cuts: Cut[] = [];
 
   constructor(w: number, h: number) {
     this.binW = w;
     this.binH = h;
-    this.free = [{ x: 0, y: 0, w, h }];
+    this.free = [{ x: 0, y: 0, w, h, depth: 0 }];
   }
 
   insert(w: number, h: number, allowRotate: boolean, heur: Heuristic): PackPlacement | null {
@@ -169,13 +201,79 @@ class GuillotineBin implements BinPacker {
     }
     if (!best) return null;
 
-    // Remove that rect, replace with at most two new rects via SAS split.
+    // Remove the chosen free rect, replace with at most two new rects via
+    // SAS split, AND record the 1–2 physical cuts that separate the part
+    // from the leftover.
     const f = this.free[bestIdx];
     this.free.splice(bestIdx, 1);
-    const splits = guillotineSplit(f, best.w, best.h);
+    const parentDepth = f.depth ?? 0;
+    recordCuts(this.cuts, f, best.w, best.h, parentDepth);
+    const splits = guillotineSplit(f, best.w, best.h, parentDepth + 1);
     for (const s of splits) this.free.push(s);
 
     return { id: '', x: best.x, y: best.y, w: best.w, h: best.h, rotated: best.rotated };
+  }
+}
+
+/**
+ * Record the cuts that separate a (w × h) part placed at (f.x, f.y) corner
+ * from the rest of free rect `f`. Follows the SAS (Shorter Axis Split)
+ * order so the FIRST recorded cut produces the wider strip — this is also
+ * the cut a track-saw user would naturally do first.
+ *
+ *   leftoverW < leftoverH → horizontal cut first (across the full width of
+ *                           the parent), then a vertical cut within the
+ *                           bottom strip.
+ *   leftoverW ≥ leftoverH → vertical cut first (across full height), then
+ *                           horizontal within the left strip.
+ *
+ * Depending on whether the part fills one dimension exactly, this may emit
+ * 0, 1, or 2 cuts.
+ */
+function recordCuts(cuts: Cut[], f: FreeRect, w: number, h: number, parentDepth: number) {
+  const leftoverW = f.w - w;
+  const leftoverH = f.h - h;
+  if (leftoverW <= 0 && leftoverH <= 0) return; // perfect fit, no cut needed
+
+  if (leftoverW <= 0) {
+    // Only horizontal cut needed (part fills the full width)
+    cuts.push({
+      parentX: f.x, parentY: f.y, parentW: f.w, parentH: f.h,
+      axis: 'H', distance: h, depth: parentDepth,
+    });
+    return;
+  }
+  if (leftoverH <= 0) {
+    // Only vertical cut needed (part fills the full height)
+    cuts.push({
+      parentX: f.x, parentY: f.y, parentW: f.w, parentH: f.h,
+      axis: 'V', distance: w, depth: parentDepth,
+    });
+    return;
+  }
+
+  if (leftoverW < leftoverH) {
+    // Horizontal cut first across the full parent width
+    cuts.push({
+      parentX: f.x, parentY: f.y, parentW: f.w, parentH: f.h,
+      axis: 'H', distance: h, depth: parentDepth,
+    });
+    // Then vertical cut within the resulting BOTTOM strip (width = f.w, height = h)
+    cuts.push({
+      parentX: f.x, parentY: f.y, parentW: f.w, parentH: h,
+      axis: 'V', distance: w, depth: parentDepth + 1,
+    });
+  } else {
+    // Vertical cut first across the full parent height
+    cuts.push({
+      parentX: f.x, parentY: f.y, parentW: f.w, parentH: f.h,
+      axis: 'V', distance: w, depth: parentDepth,
+    });
+    // Then horizontal cut within the resulting LEFT strip (width = w, height = f.h)
+    cuts.push({
+      parentX: f.x, parentY: f.y, parentW: w, parentH: f.h,
+      axis: 'H', distance: h, depth: parentDepth + 1,
+    });
   }
 }
 
@@ -186,26 +284,27 @@ class GuillotineBin implements BinPacker {
  *
  * The part occupies the (f.x, f.y, w, h) corner. We return up to 2 free
  * rects representing the leftover area, divided by one edge-to-edge cut.
+ * Children inherit `childDepth` so the cut tree stays connected.
  */
-function guillotineSplit(f: FreeRect, w: number, h: number): FreeRect[] {
+function guillotineSplit(f: FreeRect, w: number, h: number, childDepth: number): FreeRect[] {
   const leftoverW = f.w - w; // strip to the right of the part
   const leftoverH = f.h - h; // strip below the part
   const out: FreeRect[] = [];
   if (leftoverW < leftoverH) {
     // Horizontal cut below the part — bottom strip spans the full width.
     if (leftoverW > 0) {
-      out.push({ x: f.x + w, y: f.y, w: leftoverW, h }); // right strip (within the part's row)
+      out.push({ x: f.x + w, y: f.y, w: leftoverW, h, depth: childDepth + 1 });
     }
     if (leftoverH > 0) {
-      out.push({ x: f.x, y: f.y + h, w: f.w, h: leftoverH }); // full-width bottom strip
+      out.push({ x: f.x, y: f.y + h, w: f.w, h: leftoverH, depth: childDepth });
     }
   } else {
     // Vertical cut right of the part — right strip spans the full height.
     if (leftoverH > 0) {
-      out.push({ x: f.x, y: f.y + h, w, h: leftoverH }); // bottom strip (within the part's column)
+      out.push({ x: f.x, y: f.y + h, w, h: leftoverH, depth: childDepth + 1 });
     }
     if (leftoverW > 0) {
-      out.push({ x: f.x + w, y: f.y, w: leftoverW, h: f.h }); // full-height right strip
+      out.push({ x: f.x + w, y: f.y, w: leftoverW, h: f.h, depth: childDepth });
     }
   }
   return out;
@@ -322,6 +421,10 @@ export interface PackedSheet {
   /** Largest remaining free rectangle on this sheet, in mm. Useful as
    *  "what could I cut from the leftover" for the user. */
   largestFree: { w: number; h: number } | null;
+  /** Physical cuts that produced this layout, in dependency order
+   *  (depth-sorted: full-sheet cuts first, then sub-piece cuts).
+   *  Empty for MaxRects packing (which isn't guaranteed guillotine). */
+  cuts: Cut[];
 }
 
 export interface MultiSheetResult {
@@ -370,7 +473,7 @@ export function packOne(job: PackJob, heur: Heuristic, order: PackInput[]): Mult
     const bin: BinPacker = job.cutStrategy === 'guillotine'
       ? new GuillotineBin(job.sheetW, job.sheetH)
       : new MaxRectsBin(job.sheetW, job.sheetH);
-    const cur: PackedSheet = { placements: [], usedArea: 0, largestFree: null };
+    const cur: PackedSheet = { placements: [], usedArea: 0, largestFree: null, cuts: [] };
     const carry: PackInput[] = []; // didn't fit on THIS bin → try next bin
     let anyPlacedThisBin = false;
 
@@ -405,6 +508,15 @@ export function packOne(job: PackJob, heur: Heuristic, order: PackInput[]): Mult
         if (!best || a > best.a) best = { w: f.w, h: f.h, a };
       }
       cur.largestFree = best ? { w: best.w, h: best.h } : null;
+      // Capture cut tree, ordered by depth (big cuts on the full sheet
+      // first → smaller cuts within strips). Stable order within a depth.
+      cur.cuts = bin.cuts.slice().sort((a, b) => {
+        if (a.depth !== b.depth) return a.depth - b.depth;
+        // Tiebreak by position so multiple cuts at the same depth read
+        // left-to-right, top-to-bottom.
+        if (a.parentY !== b.parentY) return a.parentY - b.parentY;
+        return a.parentX - b.parentX;
+      });
       sheets.push(cur);
       totalUsed += cur.usedArea;
     } else {

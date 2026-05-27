@@ -33,6 +33,9 @@ export interface PdfOptions {
   currency?: string;
   jobCost?: number;
   edgeBandingMm?: number;
+  /** PNG data URLs from the 3D viewer for the assembly guide page. */
+  assembledPng?: string;
+  explodedPng?: string;
 }
 
 export interface InventoryCheck {
@@ -73,6 +76,12 @@ export function buildPdf(result: NestResult, opt: PdfOptions): jsPDF {
   doc.addPage(dims.format, dims.orient);
   drawPartsOverview(doc, labels, opt, dims);
 
+  // Assembly guide (3D viewer snapshots) — only if both PNGs were provided
+  if (opt.assembledPng && opt.explodedPng) {
+    doc.addPage(dims.format, dims.orient);
+    drawAssemblyGuide(doc, opt, dims);
+  }
+
   // One page per cut sheet, with letter labels overlaid on parts
   for (const group of result.groups) {
     for (const sheet of group.sheets) {
@@ -86,6 +95,93 @@ export function buildPdf(result: NestResult, opt: PdfOptions): jsPDF {
   drawCutInstructions(doc, result, opt, dims, labels);
 
   return doc;
+}
+
+/**
+ * Assembly guide page: assembled 3D view on the left, exploded view on
+ * the right. Captions tell the user how to read it (colors → Parts
+ * overview letters; exploded arrows = assembly direction).
+ */
+function drawAssemblyGuide(
+  doc: jsPDF,
+  opt: PdfOptions,
+  dims: { w: number; h: number },
+) {
+  const PAGE_W = dims.w;
+  const PAGE_H = dims.h;
+
+  // Header
+  doc.setFont('helvetica', 'bold');
+  doc.setFontSize(20);
+  doc.text('Assembly guide', PAGE_PAD, PAGE_PAD + 6);
+  doc.setFont('helvetica', 'normal');
+  doc.setFontSize(10);
+  doc.setTextColor(120);
+  doc.text(
+    'Each panel keeps its 3D color — find the matching letter on the Parts overview page. The exploded view shows the direction each panel comes from when assembling.',
+    PAGE_PAD, PAGE_PAD + 24, { maxWidth: PAGE_W - 2 * PAGE_PAD },
+  );
+  doc.setTextColor(0);
+
+  // Two image panels side by side
+  const top = PAGE_PAD + 50;
+  const bottom = PAGE_H - PAGE_PAD - 26;
+  const gutter = 18;
+  const innerW = PAGE_W - 2 * PAGE_PAD;
+  const panelW = (innerW - gutter) / 2;
+  const panelH = bottom - top;
+
+  // Caption labels under each image
+  const labelY = bottom + 18;
+
+  if (opt.assembledPng) {
+    drawSnapshotPanel(doc, opt.assembledPng, PAGE_PAD, top, panelW, panelH);
+    doc.setFont('helvetica', 'bold');
+    doc.setFontSize(11);
+    doc.setTextColor(40);
+    doc.text('Assembled', PAGE_PAD, labelY, { align: 'left' });
+  }
+  if (opt.explodedPng) {
+    drawSnapshotPanel(doc, opt.explodedPng, PAGE_PAD + panelW + gutter, top, panelW, panelH);
+    doc.setFont('helvetica', 'bold');
+    doc.setFontSize(11);
+    doc.setTextColor(40);
+    doc.text('Exploded', PAGE_PAD + panelW + gutter, labelY, { align: 'left' });
+  }
+  doc.setTextColor(0);
+}
+
+/**
+ * Draw an image data URL inside (x, y, w, h), centered + aspect-preserved,
+ * with a hairline border and a light background "stage" so transparency
+ * (if any) doesn't blow out against the page.
+ */
+function drawSnapshotPanel(
+  doc: jsPDF,
+  dataUrl: string,
+  x: number, y: number, w: number, h: number,
+) {
+  // Frame
+  doc.setFillColor(247, 246, 243);
+  doc.setDrawColor(220);
+  doc.setLineWidth(0.6);
+  doc.rect(x, y, w, h, 'FD');
+
+  // Aspect-fit the image. jsPDF's addImage needs explicit dims; we don't
+  // know the image's native ratio without decoding, so we fit it to the
+  // panel with a small inset and let the image's own aspect dominate.
+  const inset = 6;
+  try {
+    // addImage with type 'PNG'. jsPDF will scale to fit (w, h).
+    doc.addImage(dataUrl, 'PNG', x + inset, y + inset, w - 2 * inset, h - 2 * inset, undefined, 'FAST');
+  } catch (e) {
+    // If the image fails to embed, draw a placeholder
+    doc.setTextColor(160);
+    doc.setFont('helvetica', 'normal');
+    doc.setFontSize(9);
+    doc.text('Snapshot unavailable', x + w / 2, y + h / 2, { align: 'center' });
+    doc.setTextColor(0);
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -670,7 +766,7 @@ function drawCutInstructions(
         col = 0;
       }
       const x = PAGE_PAD + col * (cardW + cardGutter);
-      drawCutCard(doc, sc, parts, i, x, y, cardW, cardDiagH, opt);
+      drawCutCard(doc, sc, parts, i, x, y, cardW, cardDiagH, opt, _labels);
       col++;
       if (col >= cols) {
         col = 0;
@@ -695,6 +791,7 @@ function drawCutCard(
   cardW: number,
   diagH: number,
   opt: PdfOptions,
+  labels?: Map<string, PartLabel>,
 ) {
   const cur = sc.steps[cutIdx];
 
@@ -725,64 +822,107 @@ function drawCutCard(
   doc.setLineWidth(0.7);
   doc.rect(ox, oy, dW, dH, 'FD');
 
-  // Part overlays — full color, 80% transparent (20% opaque), no stroke.
-  // jsPDF GState applies the alpha to fills.
-  const gs = (doc as any).GState ? new (doc as any).GState({ opacity: 0.20 }) : null;
+  // Part overlays — uniform LIGHT BIRCH (#E8D6B0), translucent. Reads as
+  // "this is wood you're cutting" without competing with the cut lines
+  // or the colored 3D view. (Previously used per-body colors; user asked
+  // for a single light wood tone here.)
+  const gs = (doc as any).GState ? new (doc as any).GState({ opacity: 0.60 }) : null;
   if (gs) (doc as any).setGState(gs);
+  doc.setFillColor(232, 214, 176);
   for (const p of parts) {
-    const [r, g, b] = hexToRgb(p.color);
-    doc.setFillColor(r, g, b);
     doc.rect(ox + p.x * scale, oy + p.y * scale, p.w * scale, p.h * scale, 'F');
   }
-  if (gs) {
-    const gsOpaque = new (doc as any).GState({ opacity: 1 });
-    (doc as any).setGState(gsOpaque);
+  if (gs) (doc as any).setGState(new (doc as any).GState({ opacity: 1 }));
+
+  // Per-part letter labels — centered inside each part rectangle.
+  // Skipped when the cell is too small for the text to read.
+  if (labels) {
+    doc.setFont('helvetica', 'bold');
+    doc.setTextColor(50);
+    for (const p of parts) {
+      const letter = labels.get(p.partId)?.letter;
+      if (!letter) continue;
+      const cellW = p.w * scale;
+      const cellH = p.h * scale;
+      const minPx = Math.min(cellW, cellH);
+      if (minPx < 10) continue;
+      const fs = Math.max(6, Math.min(14, minPx * 0.35));
+      doc.setFontSize(fs);
+      doc.text(
+        letter,
+        ox + (p.x + p.w / 2) * scale,
+        oy + (p.y + p.h / 2) * scale + fs * 0.32,
+        { align: 'center' },
+      );
+    }
   }
 
-  // Prior cuts as thin white lines
+  const lengthIsY = sc.sheetL >= sc.sheetW;
+  // Prior cuts as thin white lines (above the overlay). Each cut is drawn
+  // WITHIN its parent piece, not across the whole sheet — that's how the
+  // real cut actually happens after earlier cuts have split the stock.
   doc.setLineWidth(0.4);
   doc.setDrawColor(255, 255, 255);
   for (let i = 0; i < cutIdx; i++) {
-    drawCutLine(doc, sc.steps[i], sc, ox, oy, dW, dH, scale);
+    drawCutLineInParent(doc, sc.steps[i], lengthIsY, ox, oy, scale);
   }
 
-  // Current cut as bold red line with arrow caps
+  // Highlight the PARENT PIECE of the current cut with a thin red border
+  // so the user sees what piece they're cutting.
+  doc.setDrawColor(224, 62, 62);
+  doc.setLineWidth(0.7);
+  doc.rect(
+    ox + cur.parentX * scale,
+    oy + cur.parentY * scale,
+    cur.parentW * scale,
+    cur.parentH * scale,
+    'S',
+  );
+
+  // Current cut as bold red line with arrow caps, drawn inside the parent.
   doc.setLineWidth(2.0);
   doc.setDrawColor(224, 62, 62);
-  drawCutLine(doc, cur, sc, ox, oy, dW, dH, scale, true);
+  drawCutLineInParent(doc, cur, lengthIsY, ox, oy, scale, true);
 }
 
-function drawCutLine(
+/**
+ * Draw a single cut step's line INSIDE its parent piece's rectangle.
+ * Rip cuts run parallel to the sheet's length axis; crosscuts run across.
+ * `step.distance` is measured from:
+ *   - parent's LEFT edge for vertical cuts
+ *   - parent's BOTTOM edge for horizontal cuts
+ */
+function drawCutLineInParent(
   doc: jsPDF,
-  step: { axis: 'rip' | 'cross'; distance: number },
-  sc: ReturnType<typeof allCutSteps>[number],
+  step: { axis: 'rip' | 'cross'; distance: number; parentX: number; parentY: number; parentW: number; parentH: number },
+  lengthIsY: boolean,
   ox: number,
   oy: number,
-  dW: number,
-  dH: number,
   scale: number,
   withArrows = false,
 ) {
-  // Rip vs crosscut wrt sheet: same convention as cutStepsForSheet.
-  const lengthIsY = sc.sheetL >= sc.sheetW;
-  // Rip cuts run parallel to the length axis.
+  // Convert rip/cross → vertical/horizontal in screen orientation.
   const isVertical = lengthIsY ? step.axis === 'rip' : step.axis === 'cross';
+  const px = ox + step.parentX * scale;
+  const py = oy + step.parentY * scale;
+  const pw = step.parentW * scale;
+  const ph = step.parentH * scale;
+
   if (isVertical) {
-    const dx = ox + step.distance * scale;
-    doc.line(dx, oy, dx, oy + dH);
+    const dx = px + step.distance * scale;
+    doc.line(dx, py, dx, py + ph);
     if (withArrows) {
-      // Small triangle markers at top & bottom
       doc.setFillColor(224, 62, 62);
-      drawTri(doc, dx, oy - 1, 'down');
-      drawTri(doc, dx, oy + dH + 1, 'up');
+      drawTri(doc, dx, py - 1, 'down');
+      drawTri(doc, dx, py + ph + 1, 'up');
     }
   } else {
-    const dy = oy + step.distance * scale;
-    doc.line(ox, dy, ox + dW, dy);
+    const dy = py + step.distance * scale;
+    doc.line(px, dy, px + pw, dy);
     if (withArrows) {
       doc.setFillColor(224, 62, 62);
-      drawTri(doc, ox - 1, dy, 'right');
-      drawTri(doc, ox + dW + 1, dy, 'left');
+      drawTri(doc, px - 1, dy, 'right');
+      drawTri(doc, px + pw + 1, dy, 'left');
     }
   }
 }

@@ -23,9 +23,9 @@
  */
 
 import type { Vec2 } from './geometry';
-import { packMulti, type PackInput, type PackPlacement, type CutStrategy } from './packRect';
+import { packMulti, type PackInput, type PackPlacement, type CutStrategy, type Cut } from './packRect';
 
-export type { CutStrategy };
+export type { CutStrategy, Cut };
 
 export type GrainLock = 'free' | 'length' | 'width';
 export type RotationMode = 'lock' | 'flip90' | 'any';
@@ -78,6 +78,10 @@ export interface NestSheet {
   sheetW: number;
   /** Sheet length used for this sheet (post-auto-orient choice). */
   sheetL: number;
+  /** Physical cuts in dependency order (full-sheet first, then sub-piece
+   *  cuts). Coordinates are in the SAME frame as part placements
+   *  (post-margin offset). Empty for MaxRects packing. */
+  cuts: Cut[];
 }
 
 export interface ThicknessGroup {
@@ -244,6 +248,17 @@ export function runNest(parts: NestPart[], config: NestConfig): NestResult {
       largestFree: ps.largestFree,
       sheetW: winnerSheetW,
       sheetL: winnerSheetL,
+      // Shift cuts by `margin` so they're in the same sheet-coord frame as
+      // the placed parts (which were also shifted by `margin` in placementToPart).
+      cuts: ps.cuts.map((c) => ({
+        parentX: c.parentX + margin,
+        parentY: c.parentY + margin,
+        parentW: c.parentW,
+        parentH: c.parentH,
+        axis: c.axis,
+        distance: c.distance,
+        depth: c.depth,
+      })),
     }));
 
     const unplaced = winner.unplaced.map((u) => {

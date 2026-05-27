@@ -141,7 +141,13 @@ export class Viewer {
     // antialias:true would only AA the final back-buffer, not what the
     // EffectComposer renders into. We get crisp geometry edges from a
     // multisampled render target below, and SMAA cleans up post-pass aliasing.
-    this.renderer = new THREE.WebGLRenderer({ antialias: true, stencil: false });
+    // preserveDrawingBuffer is required for reliable canvas.toDataURL() so
+    // snapshot()/snapshotExploded() can embed the scene in the PDF.
+    this.renderer = new THREE.WebGLRenderer({
+      antialias: true,
+      stencil: false,
+      preserveDrawingBuffer: true,
+    });
     this.renderer.setPixelRatio(window.devicePixelRatio);
     this.renderer.setSize(container.clientWidth, container.clientHeight);
     this.renderer.outputColorSpace = THREE.SRGBColorSpace;
@@ -478,6 +484,63 @@ export class Viewer {
   finishLoad() {
     this.frameAll();
     this.refreshColors();
+  }
+
+  /**
+   * Snapshot the current 3D scene as a base64 PNG data URL.
+   * The composer is rendered immediately, then the back buffer is read
+   * before the next animation frame swaps it. preserveDrawingBuffer isn't
+   * enabled (perf cost on every frame), so this MUST be called and the
+   * data URL captured within the same JS tick.
+   */
+  snapshot(): string {
+    this.composer.render();
+    return this.renderer.domElement.toDataURL('image/png');
+  }
+
+  /**
+   * Snapshot an exploded view: each body is temporarily translated along
+   * its `direction` by `distance` mm (typically the body's outward face
+   * normal × bbox-diagonal × ~0.3). Original positions are restored
+   * before returning so the live view is unaffected.
+   *
+   * Pass `selectionOnly: true` to only explode selected bodies (the rest
+   * stay assembled).
+   */
+  snapshotExploded(
+    directions: Map<number, [number, number, number]>,
+    distance: number,
+    selectionOnly = false,
+  ): string {
+    const backup = new Map<number, THREE.Vector3>();
+    for (const b of this.bodies) {
+      if (selectionOnly && !this.selection.has(b.id)) continue;
+      const dir = directions.get(b.id);
+      if (!dir) continue;
+      backup.set(b.id, b.mesh.position.clone());
+      b.mesh.position.x += dir[0] * distance;
+      b.mesh.position.y += dir[1] * distance;
+      b.mesh.position.z += dir[2] * distance;
+    }
+    this.composer.render();
+    const url = this.renderer.domElement.toDataURL('image/png');
+    // Restore so the live viewer doesn't visibly jump
+    for (const b of this.bodies) {
+      const bk = backup.get(b.id);
+      if (bk) b.mesh.position.copy(bk);
+    }
+    this.composer.render();
+    return url;
+  }
+
+  /** Diagonal length of the AABB enclosing all loaded bodies, in world mm. */
+  modelDiagonal(): number {
+    const box = new THREE.Box3();
+    for (const b of this.bodies) box.expandByObject(b.mesh);
+    if (box.isEmpty()) return 0;
+    const size = new THREE.Vector3();
+    box.getSize(size);
+    return size.length();
   }
 
   private meshFromOcct(m: OcctMesh, idx: number, hex: string): THREE.Mesh {

@@ -1161,6 +1161,26 @@ downloadPdfBtn.addEventListener('click', () => {
       for (const p of s.parts) edgeMm += 2 * (p.w + p.h);
     }
   }
+  // Capture viewer snapshots for the Assembly guide PDF page.
+  // Build a per-body direction map (each body's outward face normal)
+  // so the exploded view pulls every panel along its mating axis —
+  // sides go left/right, top/bottom go up/down, back goes backward.
+  const directions = new Map<number, [number, number, number]>();
+  for (const b of state.bodies) {
+    directions.set(b.id, b.analysis.faceNormal);
+  }
+  const explodeDist = Math.max(20, viewer.modelDiagonal() * 0.28);
+  // Render assembled FIRST so the snapshot reflects the current camera /
+  // selection state; then render exploded (which restores positions).
+  let assembledPng: string | undefined;
+  let explodedPng: string | undefined;
+  try {
+    assembledPng = viewer.snapshot();
+    explodedPng = viewer.snapshotExploded(directions, explodeDist);
+  } catch (err) {
+    console.warn('Snapshot failed; PDF will skip the assembly guide.', err);
+  }
+
   const doc = buildPdf(state.lastNest, {
     sheetW: state.lastSheet.w,
     sheetL: state.lastSheet.l,
@@ -1173,6 +1193,8 @@ downloadPdfBtn.addEventListener('click', () => {
     currency: state.currency,
     jobCost: totalCost(state.shopping),
     edgeBandingMm: edgeMm,
+    assembledPng,
+    explodedPng,
   });
   const safe = (state.jobName || 'plywood_cut_estimate').replace(/[^a-z0-9_-]+/gi, '_').toLowerCase();
   downloadPdf(`${safe}.pdf`, doc);
