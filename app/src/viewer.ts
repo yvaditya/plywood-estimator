@@ -543,6 +543,93 @@ export class Viewer {
     return size.length();
   }
 
+  /**
+   * Snapshot ONLY a subset of bodies (e.g. one cabinet's panels per STEP file).
+   *
+   * Hides everything not in `visibleIds`, refits the camera to the subset,
+   * optionally explodes by `directions × distance`, renders, then restores
+   * visibility AND the camera. Used for per-cabinet assembly pages.
+   */
+  snapshotFiltered(
+    visibleIds: Set<number>,
+    directions: Map<number, [number, number, number]> | null,
+    distance: number,
+  ): string {
+    // 1. Snapshot current visibility + positions
+    const visBackup = new Map<number, boolean>();
+    const posBackup = new Map<number, THREE.Vector3>();
+    for (const b of this.bodies) {
+      visBackup.set(b.id, b.mesh.visible);
+      b.mesh.visible = visibleIds.has(b.id);
+    }
+    // Hide non-sheet bodies and grain arrows during a clean per-cabinet shot
+    const grainBackup: { obj: THREE.Object3D; vis: boolean }[] = [];
+    this.grainGroup.children.forEach((c) => {
+      grainBackup.push({ obj: c, vis: c.visible });
+      c.visible = false;
+    });
+
+    // 2. Refit camera + shadow camera to the visible bodies
+    const cameraBackup = {
+      pos: this.camera.position.clone(),
+      target: this.controls.target.clone(),
+      near: this.camera.near,
+      far: this.camera.far,
+    };
+    const box = new THREE.Box3();
+    for (const b of this.bodies) if (visibleIds.has(b.id)) box.expandByObject(b.mesh);
+    if (!box.isEmpty()) {
+      const size = new THREE.Vector3(); box.getSize(size);
+      const center = new THREE.Vector3(); box.getCenter(center);
+      const maxDim = Math.max(size.x, size.y, size.z) + distance * 2;
+      const fov = (this.camera.fov * Math.PI) / 180;
+      const dist = (maxDim / 2) / Math.tan(fov / 2) * 1.7;
+      this.controls.target.copy(center);
+      this.camera.position.copy(
+        center.clone().add(new THREE.Vector3(1.0, -1.2, 0.9).normalize().multiplyScalar(dist)),
+      );
+      this.camera.near = Math.max(0.1, maxDim / 1000);
+      this.camera.far = maxDim * 100;
+      this.camera.updateProjectionMatrix();
+      this.controls.update();
+    }
+
+    // 3. Optionally explode the visible subset
+    const explodeBackup = new Map<number, THREE.Vector3>();
+    if (directions) {
+      for (const b of this.bodies) {
+        if (!visibleIds.has(b.id)) continue;
+        const dir = directions.get(b.id);
+        if (!dir) continue;
+        explodeBackup.set(b.id, b.mesh.position.clone());
+        b.mesh.position.x += dir[0] * distance;
+        b.mesh.position.y += dir[1] * distance;
+        b.mesh.position.z += dir[2] * distance;
+      }
+    }
+
+    // 4. Render + grab
+    this.composer.render();
+    const url = this.renderer.domElement.toDataURL('image/png');
+
+    // 5. Restore EVERYTHING
+    for (const b of this.bodies) {
+      const v = visBackup.get(b.id);
+      if (v !== undefined) b.mesh.visible = v;
+      const p = explodeBackup.get(b.id);
+      if (p) b.mesh.position.copy(p);
+    }
+    for (const g of grainBackup) g.obj.visible = g.vis;
+    this.camera.position.copy(cameraBackup.pos);
+    this.controls.target.copy(cameraBackup.target);
+    this.camera.near = cameraBackup.near;
+    this.camera.far = cameraBackup.far;
+    this.camera.updateProjectionMatrix();
+    this.controls.update();
+    this.composer.render();
+    return url;
+  }
+
   private meshFromOcct(m: OcctMesh, idx: number, hex: string): THREE.Mesh {
     const geom = new THREE.BufferGeometry();
     const pos = new Float32Array(m.attributes.position.array);

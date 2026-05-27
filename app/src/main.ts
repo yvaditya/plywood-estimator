@@ -1231,25 +1231,64 @@ downloadPdfBtn.addEventListener('click', () => {
       for (const p of s.parts) edgeMm += 2 * (p.w + p.h);
     }
   }
-  // Capture viewer snapshots for the Assembly guide PDF page.
-  // Build a per-body direction map (each body's outward face normal)
-  // so the exploded view pulls every panel along its mating axis —
-  // sides go left/right, top/bottom go up/down, back goes backward.
+  // Capture viewer snapshots — one assembly diagram PER STEP FILE since
+  // each STEP file is treated as a unique cabinet / furniture piece.
+  // Group selected sheet-good bodies by their fileTag, then for each
+  // cabinet generate (1) assembled snapshot of just its bodies and
+  // (2) exploded snapshot pulling each panel along its faceNormal.
   const directions = new Map<number, [number, number, number]>();
   for (const b of state.bodies) {
     directions.set(b.id, b.analysis.faceNormal);
   }
   const explodeDist = Math.max(20, viewer.modelDiagonal() * 0.28);
-  // Render assembled FIRST so the snapshot reflects the current camera /
-  // selection state; then render exploded (which restores positions).
+
+  const byFile = new Map<string, BodyState[]>();
+  for (const b of state.bodies.filter((x) => x.selected)) {
+    const arr = byFile.get(b.fileTag) ?? [];
+    arr.push(b);
+    byFile.set(b.fileTag, arr);
+  }
+
+  // Build per-panel id ("3a") from the lastNest so PDF panel ids match.
+  const idByBodyPartId = new Map<string, string[]>();
+  if (state.lastNest) {
+    for (const g of state.lastNest.groups) {
+      for (const s of g.sheets) {
+        for (const p of s.parts) {
+          const id = `${s.globalIndex}${p.panelLabel}`;
+          const arr = idByBodyPartId.get(p.partId) ?? [];
+          arr.push(id);
+          idByBodyPartId.set(p.partId, arr);
+        }
+      }
+    }
+  }
+
+  const cabinets: { name: string; partIds: string[]; assembledPng: string; explodedPng: string }[] = [];
+  try {
+    for (const [tag, bodies] of byFile) {
+      const visibleIds = new Set(bodies.map((b) => b.id));
+      const assembledPng = viewer.snapshotFiltered(visibleIds, null, 0);
+      const explodedPng = viewer.snapshotFiltered(visibleIds, directions, explodeDist);
+      // Collect this cabinet's panel ids (in the order they were placed).
+      const ids: string[] = [];
+      for (const b of bodies) {
+        const arr = idByBodyPartId.get(String(b.id));
+        if (arr) ids.push(...arr);
+      }
+      cabinets.push({ name: tag, partIds: ids, assembledPng, explodedPng });
+    }
+  } catch (err) {
+    console.warn('Per-cabinet snapshot failed; assembly pages skipped.', err);
+  }
+  // Backwards-compat fallback fields — single combined snapshot if anything
+  // breaks above (or callers haven't been updated).
   let assembledPng: string | undefined;
   let explodedPng: string | undefined;
   try {
     assembledPng = viewer.snapshot();
     explodedPng = viewer.snapshotExploded(directions, explodeDist);
-  } catch (err) {
-    console.warn('Snapshot failed; PDF will skip the assembly guide.', err);
-  }
+  } catch { /* non-fatal */ }
 
   const doc = buildPdf(state.lastNest, {
     sheetW: state.lastSheet.w,
@@ -1265,6 +1304,7 @@ downloadPdfBtn.addEventListener('click', () => {
     edgeBandingMm: edgeMm,
     assembledPng,
     explodedPng,
+    cabinets,
   });
   const safe = (state.jobName || 'plywood_cut_estimate').replace(/[^a-z0-9_-]+/gi, '_').toLowerCase();
   downloadPdf(`${safe}.pdf`, doc);

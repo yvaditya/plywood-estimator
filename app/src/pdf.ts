@@ -33,9 +33,24 @@ export interface PdfOptions {
   currency?: string;
   jobCost?: number;
   edgeBandingMm?: number;
-  /** PNG data URLs from the 3D viewer for the assembly guide page. */
+  /** PNG data URLs from the 3D viewer for the assembly guide page.
+   *  DEPRECATED in favor of `cabinets` — kept for backward-compat. */
   assembledPng?: string;
   explodedPng?: string;
+  /** One entry per unique STEP file (cabinet). Each is rendered as its
+   *  own assembly page so multi-cabinet jobs don't share one snapshot. */
+  cabinets?: CabinetSnapshot[];
+}
+
+export interface CabinetSnapshot {
+  /** Display name (typically the source STEP filename). */
+  name: string;
+  /** Letter IDs (e.g. "1a", "2c") of every panel that belongs to this
+   *  cabinet — drawn as a small inventory list on the assembly page. */
+  partIds: string[];
+  /** Snapshots showing ONLY this cabinet's panels (others hidden). */
+  assembledPng: string;
+  explodedPng: string;
 }
 
 export interface InventoryCheck {
@@ -79,38 +94,44 @@ export function buildPdf(result: NestResult, opt: PdfOptions): jsPDF {
     tagSection(section);
   };
 
-  // 1. COVER — summary page
+  // 1. COVER — job summary (sheets / yield / cost / cabinets list)
   tagSection('Cover');
   drawSummary(doc, result, opt, dims);
 
-  // 2. SHOPPING LIST — what to buy
+  // 2. SHOPPING LIST — what to buy first
   addPage('Shopping list');
   drawShoppingListPage(doc, opt, dims);
 
-  // 3. CUT LIST — text-mode rip-then-crosscut checklist per sheet
-  addPage('Cut list');
-  drawCutListSummary(doc, result, opt, dims, tagSection);
-
-  // 4. PARTS OVERVIEW (IKEA-style) — full per-part dimensions live here
+  // 3. PARTS OVERVIEW — all panels grouped by unique part, dimensions
   addPage('Parts');
   drawPartsOverview(doc, labels, opt, dims, tagSection);
 
-  // 5. SHEETS STEP-BY-STEP — visual cut sequence per sheet
-  addPage('Cut sheet');
-  drawCutInstructions(doc, result, opt, dims, labels, tagSection);
-
-  // 6. ASSEMBLY — exploded snapshots, per step file
-  if (opt.assembledPng && opt.explodedPng) {
-    addPage('Assembly');
-    drawAssemblyGuide(doc, opt, dims);
-  }
-
-  // Per-sheet detail layout pages — one per sheet
+  // 4. PER SHEET — layout page first, then its cut sequence cards.
+  //    Spillover pages within a sheet are tagged "Sheet N" so the
+  //    header reads "Sheet 3 (page 2 of 4)".
   for (const group of result.groups) {
     for (const sheet of group.sheets) {
-      addPage('Sheet detail');
+      const sectionName = `Sheet ${sheet.globalIndex}`;
+      addPage(sectionName);
       drawSheet(doc, sheet, opt, dims, labels);
+      // The sheet's cuts come on the next page(s) — same section so they
+      // share the "Sheet 3 (2 of 3)" pagination header.
+      drawCutsForSingleSheet(doc, sheet, opt, dims,
+        () => { addPage(sectionName); });
     }
+  }
+
+  // 5. ASSEMBLY — one page per cabinet (per source STEP file)
+  if (opt.cabinets && opt.cabinets.length > 0) {
+    for (const cab of opt.cabinets) {
+      const sectionName = `Assembly · ${cab.name}`;
+      addPage(sectionName);
+      drawCabinetAssembly(doc, cab, opt, dims);
+    }
+  } else if (opt.assembledPng && opt.explodedPng) {
+    // Backwards-compat fallback: single all-cabinet assembly page.
+    addPage('Assembly');
+    drawAssemblyGuide(doc, opt, dims);
   }
 
   // Post-pass: add header/footer to every page except the cover.
@@ -369,10 +390,11 @@ function drawSheet(doc: jsPDF, sheet: NestSheet, opt: PdfOptions, dims: { w: num
   const ox = drawX + dimRoom + (innerW - sheetPtW) / 2;
   const oy = drawY + (innerH - sheetPtH) / 2;
 
-  // Sheet border
-  doc.setDrawColor(120, 100, 60);
-  doc.setLineWidth(1.2);
-  doc.rect(ox, oy, sheetPtW, sheetPtH, 'S');
+  // Sheet — cream plywood fill + warm border so colored parts read clearly
+  doc.setFillColor(245, 239, 217);
+  doc.setDrawColor(180, 162, 112);
+  doc.setLineWidth(1.0);
+  doc.rect(ox, oy, sheetPtW, sheetPtH, 'FD');
 
   // Margin
   if (opt.margin > 0) {
@@ -409,12 +431,17 @@ function drawPart(
   letter?: string,
 ) {
   const [r, g, b] = hexToRgb(p.color);
+  const GS = (doc as any).GState;
   doc.setFillColor(r, g, b);
   doc.setDrawColor(Math.floor(r * 0.55), Math.floor(g * 0.55), Math.floor(b * 0.55));
-  doc.setLineWidth(0.6);
+  doc.setLineWidth(0.7);
 
-  // Outer ring as polygon
+  // Outer ring fill at 50% transparency so the cream sheet shows through —
+  // matches the cut-card overlay convention.
+  if (GS) (doc as any).setGState(new GS({ opacity: 0.50 }));
   drawPolygon(doc, p.outer, p.x, p.y, ox, oy, scale, 'F');
+  if (GS) (doc as any).setGState(new GS({ opacity: 1 }));
+  // Stroke (solid darker) sits on top for a crisp panel boundary.
   drawPolygon(doc, p.outer, p.x, p.y, ox, oy, scale, 'S');
 
   // Holes: fill white then stroke
@@ -628,6 +655,141 @@ function hexToRgb(hex: string): [number, number, number] {
 
 export function downloadPdf(filename: string, doc: jsPDF) {
   doc.save(filename);
+}
+
+// ---------------------------------------------------------------------------
+// Cut cards for ONE sheet, starting on the current page (after the layout
+// has been drawn at the top, the cards flow below it). Calls `openNewPage`
+// to spillover so the caller can tag the new page with the right section.
+// ---------------------------------------------------------------------------
+function drawCutsForSingleSheet(
+  doc: jsPDF,
+  sheet: NestSheet,
+  opt: PdfOptions,
+  dims: { w: number; h: number },
+  openNewPage: () => void,
+) {
+  const PAGE_W = dims.w;
+  const PAGE_H = dims.h;
+  // Generate a SheetCuts wrapper (cutStepsForSheet handles guillotine vs
+  // fallback). We need the same shape drawCutCard expects.
+  const sc = (allCutSteps({ groups: [{ thickness: sheet.thickness, sheets: [sheet], unplaced: [] }] } as any))[0];
+  if (!sc || sc.steps.length === 0) return;
+
+  // Start a new page for the cut cards — keeps the sheet layout page clean.
+  openNewPage();
+
+  const cardGutter = 12;
+  const cardCaptionH = 22;
+  const cols = PAGE_W > 1000 ? 6 : PAGE_W > 750 ? 5 : 4;
+  const innerW = PAGE_W - 2 * PAGE_PAD;
+  const cardW = (innerW - cardGutter * (cols - 1)) / cols;
+  const sheetAspect = sc.sheetL / sc.sheetW;
+  const cardDiagH = cardW * sheetAspect;
+  const cardH = cardDiagH + cardCaptionH;
+  const TOP = PAGE_PAD + 28;
+  const BOTTOM = PAGE_H - PAGE_PAD;
+
+  // Header
+  doc.setFont('helvetica', 'bold');
+  doc.setFontSize(13);
+  doc.setTextColor(20);
+  doc.text(
+    `Sheet ${sc.globalIndex} cut sequence  ·  ${sc.steps.length} cuts`,
+    PAGE_PAD, PAGE_PAD + 10,
+  );
+
+  let y = TOP;
+  let col = 0;
+  for (let i = 0; i < sc.steps.length; i++) {
+    if (y + cardH > BOTTOM) {
+      openNewPage();
+      y = TOP;
+      col = 0;
+    }
+    const x = PAGE_PAD + col * (cardW + cardGutter);
+    drawCutCard(doc, sc, sheet.parts, i, x, y, cardW, cardDiagH, opt);
+    col++;
+    if (col >= cols) { col = 0; y += cardH + cardGutter; }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Per-cabinet (per STEP file) assembly page — IKEA-inspired:
+//   - Cabinet name as the page title
+//   - Parts inventory on the left (panel IDs with quantities)
+//   - Big exploded view on the right with the assembled view below
+//   - Caption: match colors / IDs to the per-sheet layouts
+// ---------------------------------------------------------------------------
+function drawCabinetAssembly(
+  doc: jsPDF,
+  cab: CabinetSnapshot,
+  opt: PdfOptions,
+  dims: { w: number; h: number },
+) {
+  const PAGE_W = dims.w;
+  const PAGE_H = dims.h;
+
+  // Header
+  doc.setFont('helvetica', 'bold');
+  doc.setFontSize(18);
+  doc.setTextColor(20);
+  doc.text(cab.name, PAGE_PAD, PAGE_PAD + 4);
+  doc.setFont('helvetica', 'normal');
+  doc.setFontSize(10);
+  doc.setTextColor(120);
+  doc.text(
+    `${cab.partIds.length} panels — match each panel id to the layout pages`,
+    PAGE_PAD, PAGE_PAD + 22,
+  );
+  doc.setTextColor(0);
+
+  // Two-column layout: parts inventory (left, 25%) + diagrams (right, 75%)
+  const top = PAGE_PAD + 42;
+  const bottom = PAGE_H - PAGE_PAD - 8;
+  const gutter = 18;
+  const inventoryW = Math.min(180, (PAGE_W - 2 * PAGE_PAD) * 0.22);
+  const diagramX = PAGE_PAD + inventoryW + gutter;
+  const diagramW = PAGE_W - PAGE_PAD - diagramX;
+  const diagramH = bottom - top;
+
+  // Left: parts inventory list
+  doc.setFont('helvetica', 'bold');
+  doc.setFontSize(9.5);
+  doc.setTextColor(120);
+  doc.text('PANELS', PAGE_PAD, top + 4);
+  doc.setLineWidth(0.4);
+  doc.setDrawColor(225);
+  doc.line(PAGE_PAD, top + 9, PAGE_PAD + inventoryW, top + 9);
+  doc.setFont('helvetica', 'normal');
+  doc.setFontSize(11);
+  doc.setTextColor(40);
+  let iy = top + 26;
+  // Count duplicates so we can show "× 2" instead of two rows
+  const counts = new Map<string, number>();
+  for (const id of cab.partIds) counts.set(id, (counts.get(id) ?? 0) + 1);
+  for (const [id, n] of counts) {
+    if (iy > bottom - 12) break;
+    doc.text(id, PAGE_PAD, iy);
+    if (n > 1) {
+      doc.setTextColor(140);
+      doc.text(`× ${n}`, PAGE_PAD + 40, iy);
+      doc.setTextColor(40);
+    }
+    iy += 14;
+  }
+
+  // Right: exploded above + assembled below, sharing the column.
+  const halfH = (diagramH - gutter) / 2;
+  drawSnapshotPanel(doc, cab.explodedPng, diagramX, top, diagramW, halfH);
+  doc.setFont('helvetica', 'bold');
+  doc.setFontSize(9.5);
+  doc.setTextColor(120);
+  doc.text('EXPLODED', diagramX, top + halfH + 14);
+
+  drawSnapshotPanel(doc, cab.assembledPng, diagramX, top + halfH + 20, diagramW, halfH - 20);
+  doc.text('ASSEMBLED', diagramX, top + halfH + halfH + 14);
+  doc.setTextColor(0);
 }
 
 // ---------------------------------------------------------------------------
@@ -1120,23 +1282,26 @@ function drawCutCard(
   const ox = x + (cardW - dW) / 2;
   const oy = diagY;
 
-  // Sheet background (dark plywood)
-  doc.setFillColor(107, 79, 49);
-  doc.setDrawColor(46, 31, 15);
-  doc.setLineWidth(0.7);
+  // Sheet background — LIGHT CREAM wood. Light enough that colored
+  // panels read clearly on top, but warm enough to feel like wood.
+  doc.setFillColor(245, 239, 217);
+  doc.setDrawColor(180, 162, 112);
+  doc.setLineWidth(0.6);
   doc.rect(ox, oy, dW, dH, 'FD');
 
-  // Part overlays — uniform LIGHT BIRCH (#E8D6B0), translucent. Reads as
-  // "this is wood you're cutting" without competing with the cut lines
-  // or the colored 3D view. (Previously used per-body colors; user asked
-  // for a single light wood tone here.)
-  const gs = (doc as any).GState ? new (doc as any).GState({ opacity: 0.60 }) : null;
-  if (gs) (doc as any).setGState(gs);
-  doc.setFillColor(232, 214, 176);
+  // Part overlays — per-body COLOR at 50% opacity, or 15% if the panel
+  // has already been fully separated by an earlier cut (visually "removed"
+  // from the stock). Cut lines render on top so they stay readable.
+  const GS = (doc as any).GState;
   for (const p of parts) {
+    const isCutOff = p.separatedAt > 0 && p.separatedAt <= cutIdx;
+    const alpha = isCutOff ? 0.15 : 0.50;
+    if (GS) (doc as any).setGState(new GS({ opacity: alpha }));
+    const [r, g, b] = hexToRgb(p.color);
+    doc.setFillColor(r, g, b);
     doc.rect(ox + p.x * scale, oy + p.y * scale, p.w * scale, p.h * scale, 'F');
   }
-  if (gs) (doc as any).setGState(new (doc as any).GState({ opacity: 1 }));
+  if (GS) (doc as any).setGState(new GS({ opacity: 1 }));
 
   // Per-panel labels ("3a", "3b" — sheet global index + panel letter).
   doc.setFont('helvetica', 'bold');
