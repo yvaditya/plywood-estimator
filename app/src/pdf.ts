@@ -517,10 +517,11 @@ function drawCutInstructions(
   const cuts = allCutSteps(result);
 
   const totalCuts = cuts.reduce((a, sc) => a + sc.steps.length, 0);
-  // Header
+
+  // Cover header
   doc.setFont('helvetica', 'bold');
   doc.setFontSize(20);
-  doc.text('Cut instructions', PAGE_PAD, PAGE_PAD + 6);
+  doc.text('Cut sequence', PAGE_PAD, PAGE_PAD + 6);
   doc.setFont('helvetica', 'normal');
   doc.setFontSize(11);
   doc.setTextColor(60);
@@ -528,55 +529,175 @@ function drawCutInstructions(
   doc.setFontSize(9);
   doc.setTextColor(120);
   doc.text(
-    'Order: rip cuts (along sheet length / grain) first, then crosscuts. Distances from the named reference edge.',
+    'For each sheet, follow the cuts in order. The bold red line is the current cut; thin gray lines are cuts already made.',
     PAGE_PAD, PAGE_PAD + 38,
   );
   doc.setTextColor(0);
 
-  let y = PAGE_PAD + 58;
-  const lineH = 14;
-  const minY = PAGE_H - PAGE_PAD;
+  // Constants for the per-cut grid
+  const TOP0 = PAGE_PAD + 58;          // y for the first row of diagrams on the cover page
+  const TOP_NEW = PAGE_PAD + 28;       // y for the first row on subsequent pages (less header)
+  const BOTTOM_PAD = PAGE_PAD;
+  const cardGutter = 12;
+  const cardCaptionH = 22;
+  // Choose card width so 4–5 cards fit per row on most paper sizes
+  const cols = PAGE_W > 1000 ? 6 : PAGE_W > 750 ? 5 : 4;
+  const innerW = PAGE_W - 2 * PAGE_PAD;
+  const cardW = (innerW - cardGutter * (cols - 1)) / cols;
 
-  for (const sc of cuts) {
-    if (y > minY - 80) {
+  for (let sIdx = 0; sIdx < cuts.length; sIdx++) {
+    const sc = cuts[sIdx];
+
+    // Sheet header — break to a new page if there isn't room for at least
+    // one row of cards underneath it.
+    const sheetAspect = sc.sheetL / sc.sheetW;
+    const cardDiagH = cardW * sheetAspect;
+    const cardH = cardDiagH + cardCaptionH;
+    const headerH = 22;
+
+    let y = sIdx === 0 ? TOP0 : TOP_NEW;
+    if (sIdx > 0) {
       doc.addPage();
-      y = PAGE_PAD + 6;
+      y = TOP_NEW;
     }
     doc.setFont('helvetica', 'bold');
-    doc.setFontSize(12);
+    doc.setFontSize(13);
     doc.setTextColor(20);
     doc.text(
-      `Sheet ${sc.groupIndex}.${sc.sheetIndex}  ·  ${fmtDim(sc.thickness, opt.units)} thick  ·  ${fmtDim(sc.sheetW, opt.units)} × ${fmtDim(sc.sheetL, opt.units)}`,
+      `Sheet ${sc.groupIndex}.${sc.sheetIndex}  ·  ${fmtDim(sc.thickness, opt.units)} thick  ·  ${fmtDim(sc.sheetW, opt.units)} × ${fmtDim(sc.sheetL, opt.units)}  ·  ${sc.steps.length} cuts`,
       PAGE_PAD, y,
     );
-    y += lineH + 2;
+    y += headerH;
 
     if (sc.steps.length === 0) {
       doc.setFont('helvetica', 'italic');
       doc.setFontSize(10);
       doc.setTextColor(120);
-      doc.text('No interior cuts (single part fills the sheet).', PAGE_PAD + 14, y);
+      doc.text('No interior cuts — single part fills the sheet.', PAGE_PAD, y + 4);
       doc.setTextColor(0);
-      y += lineH + 6;
       continue;
     }
 
-    doc.setFont('helvetica', 'normal');
-    doc.setFontSize(10);
-    doc.setTextColor(40);
-    for (const step of sc.steps) {
-      if (y > minY - lineH) {
+    let col = 0;
+    for (let i = 0; i < sc.steps.length; i++) {
+      // Card sits at (x, y); start a new row when col fills; start a new
+      // page when we'd run off the bottom.
+      if (y + cardH > PAGE_H - BOTTOM_PAD) {
         doc.addPage();
-        y = PAGE_PAD + 6;
+        y = TOP_NEW;
+        col = 0;
       }
-      const edgeRef = step.axis === 'rip' ? 'left edge' : 'bottom edge';
-      const label = step.axis === 'rip' ? 'Rip' : 'Crosscut';
-      doc.text(
-        `${String(step.index).padStart(2, ' ')}.  ${label}  at  ${fmtDim(step.distance, opt.units)}  from ${edgeRef}`,
-        PAGE_PAD + 14, y,
-      );
-      y += lineH;
+      const x = PAGE_PAD + col * (cardW + cardGutter);
+      drawCutCard(doc, sc, i, x, y, cardW, cardDiagH, opt);
+      col++;
+      if (col >= cols) {
+        col = 0;
+        y += cardH + cardGutter;
+      }
     }
-    y += 10;
   }
+}
+
+/**
+ * Draw one cut-step card: caption above, sheet diagram below with prior
+ * cuts in thin gray and the current cut highlighted in red.
+ */
+function drawCutCard(
+  doc: jsPDF,
+  sc: ReturnType<typeof allCutSteps>[number],
+  cutIdx: number,
+  x: number,
+  y: number,
+  cardW: number,
+  diagH: number,
+  opt: PdfOptions,
+) {
+  const cur = sc.steps[cutIdx];
+
+  // Caption (above the diagram)
+  doc.setFont('helvetica', 'bold');
+  doc.setFontSize(10);
+  doc.setTextColor(40);
+  doc.text(`Cut ${cur.index}`, x, y + 9);
+  doc.setFont('helvetica', 'normal');
+  doc.setFontSize(8.5);
+  doc.setTextColor(90);
+  const edgeRef = cur.axis === 'rip' ? 'from L edge' : 'from B edge';
+  const label = cur.axis === 'rip' ? 'Rip' : 'Crosscut';
+  doc.text(`${label}  ${fmtDim(cur.distance, opt.units)}  ${edgeRef}`, x, y + 20);
+  doc.setTextColor(0);
+
+  // Diagram: sheet rectangle + cuts
+  const diagY = y + 24;
+  const scale = Math.min(cardW / sc.sheetW, diagH / sc.sheetL);
+  const dW = sc.sheetW * scale;
+  const dH = sc.sheetL * scale;
+  const ox = x + (cardW - dW) / 2;
+  const oy = diagY;
+
+  // Sheet background (dark plywood)
+  doc.setFillColor(107, 79, 49);
+  doc.setDrawColor(46, 31, 15);
+  doc.setLineWidth(0.7);
+  doc.rect(ox, oy, dW, dH, 'FD');
+
+  // Prior cuts as thin gray lines
+  doc.setLineWidth(0.4);
+  doc.setDrawColor(255, 255, 255);
+  for (let i = 0; i < cutIdx; i++) {
+    drawCutLine(doc, sc.steps[i], sc, ox, oy, dW, dH, scale);
+  }
+
+  // Current cut as bold red line with arrow caps
+  doc.setLineWidth(2.0);
+  doc.setDrawColor(224, 62, 62);
+  drawCutLine(doc, cur, sc, ox, oy, dW, dH, scale, true);
+}
+
+function drawCutLine(
+  doc: jsPDF,
+  step: { axis: 'rip' | 'cross'; distance: number },
+  sc: ReturnType<typeof allCutSteps>[number],
+  ox: number,
+  oy: number,
+  dW: number,
+  dH: number,
+  scale: number,
+  withArrows = false,
+) {
+  // Rip vs crosscut wrt sheet: same convention as cutStepsForSheet.
+  const lengthIsY = sc.sheetL >= sc.sheetW;
+  // Rip cuts run parallel to the length axis.
+  const isVertical = lengthIsY ? step.axis === 'rip' : step.axis === 'cross';
+  if (isVertical) {
+    const dx = ox + step.distance * scale;
+    doc.line(dx, oy, dx, oy + dH);
+    if (withArrows) {
+      // Small triangle markers at top & bottom
+      doc.setFillColor(224, 62, 62);
+      drawTri(doc, dx, oy - 1, 'down');
+      drawTri(doc, dx, oy + dH + 1, 'up');
+    }
+  } else {
+    const dy = oy + step.distance * scale;
+    doc.line(ox, dy, ox + dW, dy);
+    if (withArrows) {
+      doc.setFillColor(224, 62, 62);
+      drawTri(doc, ox - 1, dy, 'right');
+      drawTri(doc, ox + dW + 1, dy, 'left');
+    }
+  }
+}
+
+function drawTri(doc: jsPDF, x: number, y: number, dir: 'up' | 'down' | 'left' | 'right') {
+  const s = 3.5;
+  let pts: [number, number][];
+  if (dir === 'down')      pts = [[x - s, y], [x + s, y], [x, y + s]];
+  else if (dir === 'up')   pts = [[x - s, y], [x + s, y], [x, y - s]];
+  else if (dir === 'right')pts = [[x, y - s], [x, y + s], [x + s, y]];
+  else                      pts = [[x, y - s], [x, y + s], [x - s, y]];
+  const lines: [number, number][] = [];
+  for (let i = 1; i < pts.length; i++) lines.push([pts[i][0] - pts[i - 1][0], pts[i][1] - pts[i - 1][1]]);
+  lines.push([pts[0][0] - pts[pts.length - 1][0], pts[0][1] - pts[pts.length - 1][1]]);
+  doc.lines(lines, pts[0][0], pts[0][1], [1, 1], 'F', true);
 }
