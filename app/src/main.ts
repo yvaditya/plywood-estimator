@@ -1264,31 +1264,34 @@ downloadPdfBtn.addEventListener('click', () => {
     }
   }
 
-  const cabinets: { name: string; partIds: string[]; assembledPng: string; explodedPng: string }[] = [];
+  // Use a clean WHITE scene background + faint shadow floor for all PDF
+  // snapshots — the dark studio backdrop the live viewer uses prints
+  // poorly. exitPdfBg restores the live look at the end.
+  viewer.enterPdfBg();
+  const cabinets: import('./pdf').CabinetSnapshot[] = [];
+  let assembledPng: string | undefined;
+  let explodedPng: string | undefined;
   try {
     for (const [tag, bodies] of byFile) {
       const visibleIds = new Set(bodies.map((b) => b.id));
-      const assembledPng = viewer.snapshotFiltered(visibleIds, null, 0);
-      const explodedPng = viewer.snapshotFiltered(visibleIds, directions, explodeDist);
-      // Collect this cabinet's panel ids (in the order they were placed).
+      const assembled = viewer.snapshotFiltered(visibleIds, null, 0);
+      const exploded = viewer.snapshotFiltered(visibleIds, directions, explodeDist);
       const ids: string[] = [];
       for (const b of bodies) {
         const arr = idByBodyPartId.get(String(b.id));
         if (arr) ids.push(...arr);
       }
-      cabinets.push({ name: tag, partIds: ids, assembledPng, explodedPng });
+      cabinets.push({ name: tag, partIds: ids, assembled, exploded });
     }
+    // Backwards-compat fallback: combined all-cabinet snapshots (used
+    // when a future caller doesn't populate `cabinets`).
+    assembledPng = viewer.snapshot().dataUrl;
+    explodedPng = viewer.snapshotExploded(directions, explodeDist).dataUrl;
   } catch (err) {
     console.warn('Per-cabinet snapshot failed; assembly pages skipped.', err);
+  } finally {
+    viewer.exitPdfBg();
   }
-  // Backwards-compat fallback fields — single combined snapshot if anything
-  // breaks above (or callers haven't been updated).
-  let assembledPng: string | undefined;
-  let explodedPng: string | undefined;
-  try {
-    assembledPng = viewer.snapshot();
-    explodedPng = viewer.snapshotExploded(directions, explodeDist);
-  } catch { /* non-fatal */ }
 
   const doc = buildPdf(state.lastNest, {
     sheetW: state.lastSheet.w,

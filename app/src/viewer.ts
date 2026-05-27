@@ -487,15 +487,14 @@ export class Viewer {
   }
 
   /**
-   * Snapshot the current 3D scene as a base64 PNG data URL.
-   * The composer is rendered immediately, then the back buffer is read
-   * before the next animation frame swaps it. preserveDrawingBuffer isn't
-   * enabled (perf cost on every frame), so this MUST be called and the
-   * data URL captured within the same JS tick.
+   * Snapshot the current 3D scene as a base64 PNG.
+   * Returns the canvas pixel dimensions too so callers can preserve
+   * aspect ratio when placing the image elsewhere (e.g. in a PDF).
    */
-  snapshot(): string {
+  snapshot(): { dataUrl: string; width: number; height: number } {
     this.composer.render();
-    return this.renderer.domElement.toDataURL('image/png');
+    const c = this.renderer.domElement;
+    return { dataUrl: c.toDataURL('image/png'), width: c.width, height: c.height };
   }
 
   /**
@@ -511,7 +510,7 @@ export class Viewer {
     directions: Map<number, [number, number, number]>,
     distance: number,
     selectionOnly = false,
-  ): string {
+  ): { dataUrl: string; width: number; height: number } {
     const backup = new Map<number, THREE.Vector3>();
     for (const b of this.bodies) {
       if (selectionOnly && !this.selection.has(b.id)) continue;
@@ -523,14 +522,64 @@ export class Viewer {
       b.mesh.position.z += dir[2] * distance;
     }
     this.composer.render();
-    const url = this.renderer.domElement.toDataURL('image/png');
+    const c = this.renderer.domElement;
+    const out = { dataUrl: c.toDataURL('image/png'), width: c.width, height: c.height };
     // Restore so the live viewer doesn't visibly jump
     for (const b of this.bodies) {
       const bk = backup.get(b.id);
       if (bk) b.mesh.position.copy(bk);
     }
     this.composer.render();
-    return url;
+    return out;
+  }
+
+  /**
+   * Switch the scene to a clean white background + faint shadow floor for
+   * PDF capture. Call enterPdfBg() before snapshot(), then exitPdfBg() after.
+   * The dark studio backdrop is restored on exit so the live viewer is
+   * unaffected.
+   */
+  private _pdfBgBackup: {
+    background: any;
+    envMapIntensity: number[];
+    shadowOpacity: number;
+    hemiIntensity: number;
+    toneExposure: number;
+  } | null = null;
+  enterPdfBg() {
+    if (this._pdfBgBackup) return; // already in PDF mode
+    const shadowMat = this.shadowFloor.material as THREE.ShadowMaterial;
+    const envIntensities: number[] = [];
+    for (const b of this.bodies) {
+      const m = b.mesh.material as THREE.MeshPhysicalMaterial;
+      envIntensities.push(m.envMapIntensity);
+      m.envMapIntensity = 0.65; // brighter for white bg
+    }
+    this._pdfBgBackup = {
+      background: this.scene.background,
+      envMapIntensity: envIntensities,
+      shadowOpacity: shadowMat.opacity,
+      hemiIntensity: this.hemi.intensity,
+      toneExposure: this.renderer.toneMappingExposure,
+    };
+    this.scene.background = new THREE.Color(0xffffff);
+    shadowMat.opacity = 0.12;
+    this.hemi.intensity = 0.55;          // lift fill so whites stay white
+    this.renderer.toneMappingExposure = 1.05;
+  }
+  exitPdfBg() {
+    if (!this._pdfBgBackup) return;
+    const shadowMat = this.shadowFloor.material as THREE.ShadowMaterial;
+    this.scene.background = this._pdfBgBackup.background;
+    shadowMat.opacity = this._pdfBgBackup.shadowOpacity;
+    this.hemi.intensity = this._pdfBgBackup.hemiIntensity;
+    this.renderer.toneMappingExposure = this._pdfBgBackup.toneExposure;
+    for (let i = 0; i < this.bodies.length; i++) {
+      const m = this.bodies[i].mesh.material as THREE.MeshPhysicalMaterial;
+      m.envMapIntensity = this._pdfBgBackup.envMapIntensity[i] ?? m.envMapIntensity;
+    }
+    this._pdfBgBackup = null;
+    this.composer.render(); // restore the visible scene
   }
 
   /** Diagonal length of the AABB enclosing all loaded bodies, in world mm. */
@@ -554,7 +603,7 @@ export class Viewer {
     visibleIds: Set<number>,
     directions: Map<number, [number, number, number]> | null,
     distance: number,
-  ): string {
+  ): { dataUrl: string; width: number; height: number } {
     // 1. Snapshot current visibility + positions
     const visBackup = new Map<number, boolean>();
     const posBackup = new Map<number, THREE.Vector3>();
@@ -608,9 +657,10 @@ export class Viewer {
       }
     }
 
-    // 4. Render + grab
+    // 4. Render + grab (canvas dims captured for downstream aspect-fit)
     this.composer.render();
-    const url = this.renderer.domElement.toDataURL('image/png');
+    const c = this.renderer.domElement;
+    const out = { dataUrl: c.toDataURL('image/png'), width: c.width, height: c.height };
 
     // 5. Restore EVERYTHING
     for (const b of this.bodies) {
@@ -627,7 +677,7 @@ export class Viewer {
     this.camera.updateProjectionMatrix();
     this.controls.update();
     this.composer.render();
-    return url;
+    return out;
   }
 
   private meshFromOcct(m: OcctMesh, idx: number, hex: string): THREE.Mesh {

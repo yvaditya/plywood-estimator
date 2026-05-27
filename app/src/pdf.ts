@@ -42,6 +42,12 @@ export interface PdfOptions {
   cabinets?: CabinetSnapshot[];
 }
 
+export interface SnapshotImage {
+  dataUrl: string;
+  width: number;
+  height: number;
+}
+
 export interface CabinetSnapshot {
   /** Display name (typically the source STEP filename). */
   name: string;
@@ -49,8 +55,8 @@ export interface CabinetSnapshot {
    *  cabinet — drawn as a small inventory list on the assembly page. */
   partIds: string[];
   /** Snapshots showing ONLY this cabinet's panels (others hidden). */
-  assembledPng: string;
-  explodedPng: string;
+  assembled: SnapshotImage;
+  exploded: SnapshotImage;
 }
 
 export interface InventoryCheck {
@@ -195,13 +201,18 @@ function drawAssemblyGuide(
 }
 
 /**
- * Draw an image data URL inside (x, y, w, h), centered + aspect-preserved,
- * with a hairline border and a light background "stage" so transparency
- * (if any) doesn't blow out against the page.
+ * Draw a snapshot image inside (x, y, w, h):
+ *   - Hairline-bordered "stage" panel
+ *   - Image centered AND aspect-fit (letterboxed) using the source canvas
+ *     dimensions, so a 16:9 snapshot doesn't get stretched into a 4:3 box
+ *     or vice versa.
+ *
+ * Pass `img` (SnapshotImage) for proper aspect fit; a bare string data URL
+ * still works (legacy callers) but will stretch.
  */
 function drawSnapshotPanel(
   doc: jsPDF,
-  dataUrl: string,
+  img: SnapshotImage | string,
   x: number, y: number, w: number, h: number,
 ) {
   // Frame
@@ -210,15 +221,33 @@ function drawSnapshotPanel(
   doc.setLineWidth(0.6);
   doc.rect(x, y, w, h, 'FD');
 
-  // Aspect-fit the image. jsPDF's addImage needs explicit dims; we don't
-  // know the image's native ratio without decoding, so we fit it to the
-  // panel with a small inset and let the image's own aspect dominate.
   const inset = 6;
+  const innerW = w - 2 * inset;
+  const innerH = h - 2 * inset;
+  const dataUrl = typeof img === 'string' ? img : img.dataUrl;
+
+  // Compute aspect-fit dims
+  let drawW = innerW;
+  let drawH = innerH;
+  if (typeof img !== 'string' && img.width > 0 && img.height > 0) {
+    const imgRatio = img.width / img.height;
+    const boxRatio = innerW / innerH;
+    if (imgRatio > boxRatio) {
+      // image is wider than box → fit width, shrink height
+      drawW = innerW;
+      drawH = innerW / imgRatio;
+    } else {
+      // image taller → fit height, shrink width
+      drawH = innerH;
+      drawW = innerH * imgRatio;
+    }
+  }
+  const ox = x + inset + (innerW - drawW) / 2;
+  const oy = y + inset + (innerH - drawH) / 2;
+
   try {
-    // addImage with type 'PNG'. jsPDF will scale to fit (w, h).
-    doc.addImage(dataUrl, 'PNG', x + inset, y + inset, w - 2 * inset, h - 2 * inset, undefined, 'FAST');
+    doc.addImage(dataUrl, 'PNG', ox, oy, drawW, drawH, undefined, 'FAST');
   } catch (e) {
-    // If the image fails to embed, draw a placeholder
     doc.setTextColor(160);
     doc.setFont('helvetica', 'normal');
     doc.setFontSize(9);
@@ -781,13 +810,13 @@ function drawCabinetAssembly(
 
   // Right: exploded above + assembled below, sharing the column.
   const halfH = (diagramH - gutter) / 2;
-  drawSnapshotPanel(doc, cab.explodedPng, diagramX, top, diagramW, halfH);
+  drawSnapshotPanel(doc, cab.exploded, diagramX, top, diagramW, halfH);
   doc.setFont('helvetica', 'bold');
   doc.setFontSize(9.5);
   doc.setTextColor(120);
   doc.text('EXPLODED', diagramX, top + halfH + 14);
 
-  drawSnapshotPanel(doc, cab.assembledPng, diagramX, top + halfH + 20, diagramW, halfH - 20);
+  drawSnapshotPanel(doc, cab.assembled, diagramX, top + halfH + 20, diagramW, halfH - 20);
   doc.text('ASSEMBLED', diagramX, top + halfH + halfH + 14);
   doc.setTextColor(0);
 }
