@@ -48,12 +48,31 @@ export interface SnapshotImage {
   height: number;
 }
 
+export interface CabinetPanel {
+  /** Sheet-relative panel id like "1a", "2c". */
+  id: string;
+  /** Long edge in mm. */
+  length: number;
+  /** Short edge in mm. */
+  width: number;
+  /** Sheet-goods thickness in mm. */
+  thickness: number;
+  /** Display name (typically derived from STEP body name). */
+  name: string;
+  /** Hex color matching the 3D viewer + cut layouts. */
+  color: string;
+}
+
 export interface CabinetSnapshot {
   /** Display name (typically the source STEP filename). */
   name: string;
   /** Letter IDs (e.g. "1a", "2c") of every panel that belongs to this
    *  cabinet — drawn as a small inventory list on the assembly page. */
   partIds: string[];
+  /** Detailed per-panel info used to render step-by-step assembly cards.
+   *  Optional for backwards-compat (a missing field falls back to the
+   *  legacy single-page assembly layout). */
+  panels?: CabinetPanel[];
   /** Snapshots showing ONLY this cabinet's panels (others hidden). */
   assembled: SnapshotImage;
   exploded: SnapshotImage;
@@ -64,6 +83,42 @@ export interface InventoryCheck {
   needed: number;
   available: number;
   label: string;
+}
+
+// ---------------------------------------------------------------------------
+// Sheet display orientation.
+// Always render with the LONG edge of the plywood along the page horizontal:
+// portrait sheets (L > W) get rotated by swapping x↔y / w↔h on every rect.
+// In both the rotated and non-rotated cases, the LENGTH axis ends up running
+// horizontally in the display, so:
+//   - rip cut  (parallel to length) → horizontal LINE in display
+//   - crosscut (perpendicular)       → vertical   LINE in display
+// ---------------------------------------------------------------------------
+interface Orient {
+  dispW: number;
+  dispH: number;
+  rotated: boolean;
+  rect(x: number, y: number, w: number, h: number): { x: number; y: number; w: number; h: number };
+}
+
+function makeOrient(sheetW: number, sheetL: number): Orient {
+  const rotated = sheetL > sheetW;
+  if (!rotated) {
+    return {
+      dispW: sheetW,
+      dispH: sheetL,
+      rotated: false,
+      rect: (x, y, w, h) => ({ x, y, w, h }),
+    };
+  }
+  return {
+    dispW: sheetL,
+    dispH: sheetW,
+    rotated: true,
+    // Swap sheet x↔y and w↔h. Reflection across the diagonal — preserves the
+    // visual layout of every rect while flipping the long axis to horizontal.
+    rect: (x, y, w, h) => ({ x: y, y: x, w: h, h: w }),
+  };
 }
 
 // pt-based page sizes (1 pt = 1/72 in).
@@ -127,12 +182,15 @@ export function buildPdf(result: NestResult, opt: PdfOptions): jsPDF {
     }
   }
 
-  // 5. ASSEMBLY — one page per cabinet (per source STEP file)
+  // 5. ASSEMBLY — overview page per cabinet, then step-by-step panel cards
   if (opt.cabinets && opt.cabinets.length > 0) {
     for (const cab of opt.cabinets) {
       const sectionName = `Assembly · ${cab.name}`;
       addPage(sectionName);
       drawCabinetAssembly(doc, cab, opt, dims);
+      if (cab.panels && cab.panels.length > 0) {
+        drawCabinetSteps(doc, cab, opt, dims, () => addPage(sectionName));
+      }
     }
   } else if (opt.assembledPng && opt.explodedPng) {
     // Backwards-compat fallback: single all-cabinet assembly page.
@@ -378,6 +436,7 @@ function drawSheet(doc: jsPDF, sheet: NestSheet, opt: PdfOptions, dims: { w: num
   // Use the sheet's actual chosen dims (auto-orient may have swapped them)
   const swMm = sheet.sheetW;
   const slMm = sheet.sheetL;
+  const orient = makeOrient(swMm, slMm);
   // Header
   doc.setFont('helvetica', 'bold');
   doc.setFontSize(14);
@@ -411,9 +470,9 @@ function drawSheet(doc: jsPDF, sheet: NestSheet, opt: PdfOptions, dims: { w: num
   const innerW = drawW - dimRoom;
   const innerH = drawH - dimRoom;
 
-  const scale = Math.min(innerW / swMm, innerH / slMm);
-  const sheetPtW = swMm * scale;
-  const sheetPtH = slMm * scale;
+  const scale = Math.min(innerW / orient.dispW, innerH / orient.dispH);
+  const sheetPtW = orient.dispW * scale;
+  const sheetPtH = orient.dispH * scale;
 
   // Center horizontally, top-align vertically
   const ox = drawX + dimRoom + (innerW - sheetPtW) / 2;
@@ -425,7 +484,8 @@ function drawSheet(doc: jsPDF, sheet: NestSheet, opt: PdfOptions, dims: { w: num
   doc.setLineWidth(1.0);
   doc.rect(ox, oy, sheetPtW, sheetPtH, 'FD');
 
-  // Margin
+  // Margin (symmetric, so just insets the sheet on all sides — orientation
+  // doesn't change the inset).
   if (opt.margin > 0) {
     doc.setDrawColor(180);
     doc.setLineWidth(0.4);
@@ -433,8 +493,8 @@ function drawSheet(doc: jsPDF, sheet: NestSheet, opt: PdfOptions, dims: { w: num
     doc.rect(
       ox + opt.margin * scale,
       oy + opt.margin * scale,
-      (swMm - 2 * opt.margin) * scale,
-      (slMm - 2 * opt.margin) * scale,
+      sheetPtW - 2 * opt.margin * scale,
+      sheetPtH - 2 * opt.margin * scale,
       'S',
     );
     doc.setLineDashPattern([], 0);
@@ -442,12 +502,15 @@ function drawSheet(doc: jsPDF, sheet: NestSheet, opt: PdfOptions, dims: { w: num
 
   // Parts
   for (const p of sheet.parts) {
-    drawPart(doc, p, ox, oy, scale, opt, `${sheet.globalIndex}${p.panelLabel}`);
+    drawPart(doc, p, ox, oy, scale, opt, `${sheet.globalIndex}${p.panelLabel}`, orient);
   }
 
-  // Overall sheet dimensions outside the sheet
-  drawDimH(doc, ox, ox + sheetPtW, oy + sheetPtH + 14, fmtDim(swMm, opt.units));
-  drawDimV(doc, oy, oy + sheetPtH, ox - 14, fmtDim(slMm, opt.units));
+  // Overall sheet dimensions — labels show the actual (long, short) values
+  // in their display positions: long edge along the page horizontal.
+  const longLabel = fmtDim(Math.max(swMm, slMm), opt.units);
+  const shortLabel = fmtDim(Math.min(swMm, slMm), opt.units);
+  drawDimH(doc, ox, ox + sheetPtW, oy + sheetPtH + 14, longLabel);
+  drawDimV(doc, oy, oy + sheetPtH, ox - 14, shortLabel);
 }
 
 function drawPart(
@@ -457,7 +520,8 @@ function drawPart(
   oy: number,
   scale: number,
   opt: PdfOptions,
-  letter?: string,
+  letter: string | undefined,
+  orient: Orient,
 ) {
   const [r, g, b] = hexToRgb(p.color);
   const GS = (doc as any).GState;
@@ -468,32 +532,33 @@ function drawPart(
   // Outer ring fill at 50% transparency so the cream sheet shows through —
   // matches the cut-card overlay convention.
   if (GS) (doc as any).setGState(new GS({ opacity: 0.50 }));
-  drawPolygon(doc, p.outer, p.x, p.y, ox, oy, scale, 'F');
+  drawPolygon(doc, p.outer, p.x, p.y, ox, oy, scale, 'F', orient);
   if (GS) (doc as any).setGState(new GS({ opacity: 1 }));
-  // Stroke (solid darker) sits on top for a crisp panel boundary.
-  drawPolygon(doc, p.outer, p.x, p.y, ox, oy, scale, 'S');
+  drawPolygon(doc, p.outer, p.x, p.y, ox, oy, scale, 'S', orient);
 
   // Holes: fill white then stroke
   doc.setFillColor(255, 255, 255);
   for (const hole of p.holes) {
-    drawPolygon(doc, hole, p.x, p.y, ox, oy, scale, 'F');
+    drawPolygon(doc, hole, p.x, p.y, ox, oy, scale, 'F', orient);
     doc.setDrawColor(Math.floor(r * 0.55), Math.floor(g * 0.55), Math.floor(b * 0.55));
-    drawPolygon(doc, hole, p.x, p.y, ox, oy, scale, 'S');
+    drawPolygon(doc, hole, p.x, p.y, ox, oy, scale, 'S', orient);
   }
 
-  const px = ox + p.x * scale;
-  const py = oy + p.y * scale;
-  const pwPt = p.w * scale;
-  const phPt = p.h * scale;
+  const r0 = orient.rect(p.x, p.y, p.w, p.h);
+
+  const px = ox + r0.x * scale;
+  const py = oy + r0.y * scale;
+  const pwPt = r0.w * scale;
+  const phPt = r0.h * scale;
   const cx = px + pwPt / 2;
   const cy = py + phPt / 2;
   const partPt = Math.min(pwPt, phPt);
+  // Always show the LONG side first so the readout matches the layout
+  const longMm = Math.max(p.w, p.h);
+  const shortMm = Math.min(p.w, p.h);
   doc.setTextColor(20);
 
-  // Per-sheet panel id ("1a", "2c") + tiny dim subtitle. ANSI policy:
-  // per-part dimensions live in the Parts overview cards, not stamped on
-  // every panel in the layout (which got noisy fast). The layout shows
-  // the id; the user looks up sizes in the Parts overview.
+  // Per-sheet panel id ("1a", "2c") + tiny dim subtitle.
   if (letter) {
     const big = Math.max(10, Math.min(36, partPt * 0.36));
     doc.setFont('helvetica', 'bold');
@@ -505,7 +570,7 @@ function drawPart(
     doc.setFontSize(subSize);
     doc.setTextColor(80);
     doc.text(
-      `${fmtDim(p.w, opt.units)} × ${fmtDim(p.h, opt.units)}`,
+      `${fmtDim(longMm, opt.units)} × ${fmtDim(shortMm, opt.units)}`,
       cx,
       cy + big * 0.55 + subSize,
       { align: 'center' },
@@ -575,12 +640,17 @@ function drawPolygon(
   oy: number,
   scale: number,
   mode: 'S' | 'F' | 'FD',
+  orient?: Orient,
 ) {
   if (ring.length < 3) return;
-  const pts: [number, number][] = ring.map(([x, y]) => [
-    ox + (x + offX) * scale,
-    oy + (y + offY) * scale,
-  ]);
+  const pts: [number, number][] = ring.map(([x, y]) => {
+    const sx = x + offX;
+    const sy = y + offY;
+    if (orient && orient.rotated) {
+      return [ox + sy * scale, oy + sx * scale];
+    }
+    return [ox + sx * scale, oy + sy * scale];
+  });
   // jsPDF.lines takes deltas — use moveTo + lineTo via custom path through 'lines'.
   const lines: [number, number][] = [];
   for (let i = 1; i < pts.length; i++) {
@@ -702,7 +772,7 @@ function drawCutsForSingleSheet(
   const PAGE_H = dims.h;
   // Generate a SheetCuts wrapper (cutStepsForSheet handles guillotine vs
   // fallback). We need the same shape drawCutCard expects.
-  const sc = (allCutSteps({ groups: [{ thickness: sheet.thickness, sheets: [sheet], unplaced: [] }] } as any))[0];
+  const sc = (allCutSteps({ groups: [{ thickness: sheet.thickness, sheets: [sheet], unplaced: [] }] } as any, opt.margin))[0];
   if (!sc || sc.steps.length === 0) return;
 
   // Start a new page for the cut cards — keeps the sheet layout page clean.
@@ -822,6 +892,185 @@ function drawCabinetAssembly(
 }
 
 // ---------------------------------------------------------------------------
+// Step-by-step assembly cards — one panel per card. Multiple cards per
+// page in a 2-up grid so each card has room for ANSI-style leader lines
+// to the dimensions. Panels are ordered by area descending so the user
+// installs structural panels first.
+// ---------------------------------------------------------------------------
+function drawCabinetSteps(
+  doc: jsPDF,
+  cab: CabinetSnapshot,
+  opt: PdfOptions,
+  dims: { w: number; h: number },
+  openNewPage: () => void,
+) {
+  if (!cab.panels || cab.panels.length === 0) return;
+  const PAGE_W = dims.w;
+  const PAGE_H = dims.h;
+
+  // De-duplicate by (id) so two instances of the same panel share one card
+  // with a "× 2" qty pill instead of getting two near-identical cards.
+  const dedup = new Map<string, { panel: CabinetPanel; qty: number }>();
+  for (const p of cab.panels) {
+    const ex = dedup.get(p.id);
+    if (ex) ex.qty += 1;
+    else dedup.set(p.id, { panel: p, qty: 1 });
+  }
+  const steps = Array.from(dedup.values())
+    .sort((a, b) => (b.panel.length * b.panel.width) - (a.panel.length * a.panel.width));
+
+  // 2-up grid: 2 cols × 2 rows = 4 cards per page on widescreen.
+  const cols = 2;
+  const rows = 2;
+  const cardGutter = 18;
+  const top = PAGE_PAD + 36;
+  const bottom = PAGE_H - PAGE_PAD;
+  const innerW = PAGE_W - 2 * PAGE_PAD;
+  const cardW = (innerW - cardGutter * (cols - 1)) / cols;
+  const cardH = (bottom - top - cardGutter * (rows - 1)) / rows;
+  const perPage = cols * rows;
+
+  for (let i = 0; i < steps.length; i++) {
+    const onPage = i % perPage;
+    if (i === 0 || onPage === 0) {
+      if (i > 0) openNewPage();
+      // Page header
+      doc.setFont('helvetica', 'bold');
+      doc.setFontSize(16);
+      doc.setTextColor(20);
+      doc.text(`${cab.name} — assembly steps`, PAGE_PAD, PAGE_PAD + 6);
+      doc.setFont('helvetica', 'normal');
+      doc.setFontSize(9.5);
+      doc.setTextColor(120);
+      const pageNum = Math.floor(i / perPage) + 1;
+      const pageCount = Math.ceil(steps.length / perPage);
+      doc.text(
+        `Steps ${i + 1}–${Math.min(i + perPage, steps.length)} of ${steps.length}  ·  page ${pageNum} of ${pageCount}`,
+        PAGE_W - PAGE_PAD, PAGE_PAD + 6, { align: 'right' },
+      );
+      doc.setTextColor(0);
+    }
+    const col = onPage % cols;
+    const row = Math.floor(onPage / cols);
+    const x = PAGE_PAD + col * (cardW + cardGutter);
+    const y = top + row * (cardH + cardGutter);
+    drawAssemblyStepCard(doc, steps[i].panel, steps[i].qty, i + 1, x, y, cardW, cardH, opt);
+  }
+}
+
+/**
+ * One assembly-step card: step number, panel id badge, qty pill, then a
+ * to-scale silhouette of the panel with leader-line dimensions on the
+ * long edge (top) and short edge (right). Thickness annotated in a
+ * second-row caption.
+ */
+function drawAssemblyStepCard(
+  doc: jsPDF,
+  p: CabinetPanel,
+  qty: number,
+  stepNum: number,
+  x: number,
+  y: number,
+  w: number,
+  h: number,
+  opt: PdfOptions,
+) {
+  // Card frame
+  doc.setDrawColor(225);
+  doc.setLineWidth(0.6);
+  doc.setFillColor(252, 251, 247);
+  doc.rect(x, y, w, h, 'FD');
+
+  // Top row: step badge + panel id (left), qty (right)
+  const headerH = 36;
+  // Step badge — circle with the step number
+  const badgeR = 12;
+  const bx = x + 16 + badgeR;
+  const by = y + 6 + badgeR;
+  doc.setFillColor(30, 30, 30);
+  doc.circle(bx, by, badgeR, 'F');
+  doc.setTextColor(255);
+  doc.setFont('helvetica', 'bold');
+  doc.setFontSize(13);
+  doc.text(String(stepNum), bx, by + 4.5, { align: 'center' });
+  doc.setTextColor(0);
+
+  // Panel id large
+  doc.setFont('helvetica', 'bold');
+  doc.setFontSize(20);
+  doc.text(p.id, bx + badgeR + 12, by + 7);
+
+  // Qty pill (only if > 1)
+  if (qty > 1) {
+    const pillText = `× ${qty}`;
+    doc.setFont('helvetica', 'bold');
+    doc.setFontSize(11);
+    const tw = doc.getTextWidth(pillText) + 14;
+    const px = x + w - 12 - tw;
+    const py = y + 10;
+    doc.setFillColor(232, 226, 210);
+    doc.roundedRect(px, py, tw, 18, 9, 9, 'F');
+    doc.setTextColor(60);
+    doc.text(pillText, px + tw / 2, py + 12.5, { align: 'center' });
+    doc.setTextColor(0);
+  }
+
+  // Silhouette area: below header, leaving caption row at bottom
+  const captionH = 32;
+  const silTop = y + headerH + 6;
+  const silBottom = y + h - captionH - 4;
+  // Reserve margin for dimension callouts (top + right + bottom + left)
+  const dimPad = 26;
+  const silMaxW = w - 2 * dimPad - 16;
+  const silMaxH = silBottom - silTop - 2 * dimPad;
+  // Long edge horizontal in the silhouette (matches the per-sheet layout
+  // convention) — even if (p.length, p.width) came in either order, force
+  // length-as-X.
+  const longMm = Math.max(p.length, p.width);
+  const shortMm = Math.min(p.length, p.width);
+  const aspect = longMm / shortMm;
+  let drawW = silMaxW;
+  let drawH = drawW / aspect;
+  if (drawH > silMaxH) { drawH = silMaxH; drawW = drawH * aspect; }
+  const cx = x + w / 2;
+  const cy = (silTop + silBottom) / 2;
+  const rx = cx - drawW / 2;
+  const ry = cy - drawH / 2;
+
+  // Panel silhouette — color fill + dark border
+  const [cr, cg, cb] = hexToRgb(p.color);
+  const GS = (doc as any).GState;
+  if (GS) (doc as any).setGState(new GS({ opacity: 0.40 }));
+  doc.setFillColor(cr, cg, cb);
+  doc.rect(rx, ry, drawW, drawH, 'F');
+  if (GS) (doc as any).setGState(new GS({ opacity: 1 }));
+  doc.setDrawColor(Math.floor(cr * 0.55), Math.floor(cg * 0.55), Math.floor(cb * 0.55));
+  doc.setLineWidth(0.8);
+  doc.rect(rx, ry, drawW, drawH, 'S');
+
+  // Leader-line dimensions: long edge ABOVE the silhouette, short edge to
+  // its RIGHT. Reuses the existing ANSI dim helpers.
+  drawDimH(doc, rx, rx + drawW, ry - 8, fmtDim(longMm, opt.units));
+  drawDimV(doc, ry, ry + drawH, rx + drawW + 8, fmtDim(shortMm, opt.units));
+
+  // Caption row: name + thickness
+  doc.setFont('helvetica', 'normal');
+  doc.setFontSize(10);
+  doc.setTextColor(80);
+  const nameY = y + h - captionH + 12;
+  const name = p.name.length > 48 ? p.name.slice(0, 45) + '…' : p.name;
+  doc.text(name, x + 14, nameY);
+  doc.setFont('helvetica', 'bold');
+  doc.setFontSize(11);
+  doc.setTextColor(30);
+  doc.text(
+    `${fmtDim(p.thickness, opt.units)} thick`,
+    x + w - 14, nameY, { align: 'right' },
+  );
+  doc.setTextColor(0);
+}
+
+// ---------------------------------------------------------------------------
 // Shopping list page — same data the sidebar Shopping list shows.
 // We don't have direct access to the ShoppingRow[] here, so the page renders
 // the `inventoryCheck` array the caller already populates. Header + table.
@@ -916,7 +1165,7 @@ function drawCutListSummary(
 ) {
   const PAGE_W = dims.w;
   const PAGE_H = dims.h;
-  const cuts = allCutSteps(result);
+  const cuts = allCutSteps(result, opt.margin);
   const total = cuts.reduce((a, sc) => a + sc.steps.length, 0);
 
   doc.setFont('helvetica', 'bold');
@@ -1179,7 +1428,7 @@ function drawCutInstructions(
   // Pair each SheetCuts with its source NestSheet so the cut cards can
   // overlay the placed parts (color-tinted under the cut lines).
   const pairs: { sc: ReturnType<typeof allCutSteps>[number]; parts: NestSheet['parts'] }[] = [];
-  const cuts = allCutSteps(result);
+  const cuts = allCutSteps(result, opt.margin);
   let pi = 0;
   for (const g of result.groups) {
     for (const s of g.sheets) {
@@ -1273,8 +1522,10 @@ function drawCutInstructions(
 
 /**
  * Draw one cut-step card: caption above, sheet diagram below with
- * placed parts overlaid in their colors (heavily transparent), prior
- * cuts in thin white, and the current cut highlighted in red.
+ * placed parts overlaid in their colors, the active parent piece
+ * highlighted, and the surrounding cut-off stock faded to 20% opacity.
+ *
+ * Orientation: the sheet's LONG edge is always horizontal in display.
  */
 function drawCutCard(
   doc: jsPDF,
@@ -1286,9 +1537,18 @@ function drawCutCard(
   cardW: number,
   diagH: number,
   opt: PdfOptions,
-  labels?: Map<string, PartLabel>,
+  _labels?: Map<string, PartLabel>,
 ) {
   const cur = sc.steps[cutIdx];
+  // Cut sequence cards intentionally keep the SHEET's original orientation
+  // (per-sheet "overview" page is the one that rotates to long-edge-horizontal).
+  // Identity orient = no swap.
+  const orient: Orient = {
+    dispW: sc.sheetW,
+    dispH: sc.sheetL,
+    rotated: false,
+    rect: (x, y, w, h) => ({ x, y, w, h }),
+  };
 
   // Caption (above the diagram)
   doc.setFont('helvetica', 'bold');
@@ -1298,16 +1558,24 @@ function drawCutCard(
   doc.setFont('helvetica', 'normal');
   doc.setFontSize(8.5);
   doc.setTextColor(90);
-  const edgeRef = cur.axis === 'rip' ? 'from L edge' : 'from B edge';
-  const label = cur.axis === 'rip' ? 'Rip' : 'Crosscut';
+  let label: string;
+  let edgeRef: string;
+  if (cur.isTrim) {
+    label = 'Trim margin';
+    edgeRef = '(square the sheet)';
+  } else {
+    label = cur.axis === 'rip' ? 'Rip' : 'Crosscut';
+    edgeRef = cur.axis === 'rip' ? 'from L edge' : 'from B edge';
+  }
   doc.text(`${label}  ${fmtDim(cur.distance, opt.units)}  ${edgeRef}`, x, y + 20);
   doc.setTextColor(0);
 
-  // Diagram: sheet rectangle + parts + cuts
+  // Diagram: sheet rectangle + parts + cuts. Scale uses display dims so
+  // the long edge sits horizontally regardless of sheet orientation.
   const diagY = y + 24;
-  const scale = Math.min(cardW / sc.sheetW, diagH / sc.sheetL);
-  const dW = sc.sheetW * scale;
-  const dH = sc.sheetL * scale;
+  const scale = Math.min(cardW / orient.dispW, diagH / orient.dispH);
+  const dW = orient.dispW * scale;
+  const dH = orient.dispH * scale;
   const ox = x + (cardW - dW) / 2;
   const oy = diagY;
 
@@ -1318,91 +1586,124 @@ function drawCutCard(
   doc.setLineWidth(0.6);
   doc.rect(ox, oy, dW, dH, 'FD');
 
-  // Part overlays — per-body COLOR at 50% opacity, or 15% if the panel
-  // has already been fully separated by an earlier cut (visually "removed"
-  // from the stock). Cut lines render on top so they stay readable.
+  // Part overlays — per-body COLOR at 50% opacity. Cut lines render on
+  // top of them so they stay readable. The "cut-off vs remaining" focus
+  // comes from the white fade overlay applied below, not from per-part
+  // alpha.
   const GS = (doc as any).GState;
+  if (GS) (doc as any).setGState(new GS({ opacity: 0.50 }));
   for (const p of parts) {
-    const isCutOff = p.separatedAt > 0 && p.separatedAt <= cutIdx;
-    const alpha = isCutOff ? 0.15 : 0.50;
-    if (GS) (doc as any).setGState(new GS({ opacity: alpha }));
+    const r0 = orient.rect(p.x, p.y, p.w, p.h);
     const [r, g, b] = hexToRgb(p.color);
     doc.setFillColor(r, g, b);
-    doc.rect(ox + p.x * scale, oy + p.y * scale, p.w * scale, p.h * scale, 'F');
+    doc.rect(ox + r0.x * scale, oy + r0.y * scale, r0.w * scale, r0.h * scale, 'F');
   }
   if (GS) (doc as any).setGState(new GS({ opacity: 1 }));
 
-  // Per-panel labels ("3a", "3b" — sheet global index + panel letter).
+  // Per-panel callouts — id + size when there's room ("3a · 24"×18""),
+  // id-only when the cell is mid-sized, nothing when tiny.
   doc.setFont('helvetica', 'bold');
   doc.setTextColor(50);
   for (const p of parts) {
-    const id = `${sc.globalIndex}${p.panelLabel}`;
-    const cellW = p.w * scale;
-    const cellH = p.h * scale;
+    const r0 = orient.rect(p.x, p.y, p.w, p.h);
+    const cellW = r0.w * scale;
+    const cellH = r0.h * scale;
     const minPx = Math.min(cellW, cellH);
     if (minPx < 10) continue;
+    const id = `${sc.globalIndex}${p.panelLabel}`;
+    const cx = ox + (r0.x + r0.w / 2) * scale;
+    const cy = oy + (r0.y + r0.h / 2) * scale;
+    const longMm = Math.max(p.w, p.h);
+    const shortMm = Math.min(p.w, p.h);
+    const dimText = `${fmtDim(longMm, opt.units)} × ${fmtDim(shortMm, opt.units)}`;
     const fs = Math.max(6, Math.min(14, minPx * 0.32));
+    doc.setFont('helvetica', 'bold');
     doc.setFontSize(fs);
-    doc.text(
-      id,
-      ox + (p.x + p.w / 2) * scale,
-      oy + (p.y + p.h / 2) * scale + fs * 0.32,
-      { align: 'center' },
-    );
+    if (minPx >= 28) {
+      // Room for id + size on two lines
+      doc.text(id, cx, cy - fs * 0.05, { align: 'center' });
+      const subSize = Math.max(5, Math.min(9, fs * 0.55));
+      doc.setFont('helvetica', 'normal');
+      doc.setFontSize(subSize);
+      doc.setTextColor(95);
+      doc.text(dimText, cx, cy + fs * 0.65, { align: 'center' });
+      doc.setTextColor(50);
+    } else {
+      doc.text(id, cx, cy + fs * 0.32, { align: 'center' });
+    }
   }
 
-  const lengthIsY = sc.sheetL >= sc.sheetW;
-  // Prior cuts as thin white lines (above the overlay). Each cut is drawn
-  // WITHIN its parent piece, not across the whole sheet — that's how the
-  // real cut actually happens after earlier cuts have split the stock.
+  // Prior cuts as thin white lines.
   doc.setLineWidth(0.4);
   doc.setDrawColor(255, 255, 255);
   for (let i = 0; i < cutIdx; i++) {
-    drawCutLineInParent(doc, sc.steps[i], lengthIsY, ox, oy, scale);
+    drawCutLineInParent(doc, sc.steps[i], sc.sheetW, sc.sheetL, orient, ox, oy, scale);
   }
 
-  // Highlight the PARENT PIECE of the current cut with a thin red border
-  // so the user sees what piece they're cutting.
+  // White fade overlay over EVERYTHING outside the current parent piece —
+  // emphasises the piece the user is about to cut, fading already-cut
+  // stock to 20% remaining opacity (paint white at 80% opacity).
+  const parentRect = orient.rect(cur.parentX, cur.parentY, cur.parentW, cur.parentH);
+  const pX = ox + parentRect.x * scale;
+  const pY = oy + parentRect.y * scale;
+  const pW = parentRect.w * scale;
+  const pH = parentRect.h * scale;
+  if (GS) (doc as any).setGState(new GS({ opacity: 0.80 }));
+  doc.setFillColor(255, 255, 255);
+  // Top strip
+  if (pY > oy + 0.5) doc.rect(ox, oy, dW, pY - oy, 'F');
+  // Bottom strip
+  if (pY + pH < oy + dH - 0.5) doc.rect(ox, pY + pH, dW, (oy + dH) - (pY + pH), 'F');
+  // Left strip (between top + bottom strips)
+  if (pX > ox + 0.5) doc.rect(ox, pY, pX - ox, pH, 'F');
+  // Right strip
+  if (pX + pW < ox + dW - 0.5) doc.rect(pX + pW, pY, (ox + dW) - (pX + pW), pH, 'F');
+  if (GS) (doc as any).setGState(new GS({ opacity: 1 }));
+
+  // Highlight the active parent piece with a thin red border.
   doc.setDrawColor(224, 62, 62);
   doc.setLineWidth(0.7);
-  doc.rect(
-    ox + cur.parentX * scale,
-    oy + cur.parentY * scale,
-    cur.parentW * scale,
-    cur.parentH * scale,
-    'S',
-  );
+  doc.rect(pX, pY, pW, pH, 'S');
 
   // Current cut as bold red line with arrow caps, drawn inside the parent.
   doc.setLineWidth(2.0);
   doc.setDrawColor(224, 62, 62);
-  drawCutLineInParent(doc, cur, lengthIsY, ox, oy, scale, true);
+  drawCutLineInParent(doc, cur, sc.sheetW, sc.sheetL, orient, ox, oy, scale, true);
 }
 
 /**
  * Draw a single cut step's line INSIDE its parent piece's rectangle.
- * Rip cuts run parallel to the sheet's length axis; crosscuts run across.
- * `step.distance` is measured from:
- *   - parent's LEFT edge for vertical cuts
- *   - parent's BOTTOM edge for horizontal cuts
+ *
+ * Cut-axis mapping (rip = parallel to sheet's length axis, cross = across):
+ *   - Sheet space: rip is V (constant X) when sheetL>=sheetW, else H.
+ *   - Display space: applying the orient swap flips V↔H.
+ *
+ * `step.distance` is the offset from the parent's reference edge in sheet
+ * coords; after `orient.rect` swaps parent (x,y), the same distance value
+ * lands on the right display axis automatically.
  */
 function drawCutLineInParent(
   doc: jsPDF,
   step: { axis: 'rip' | 'cross'; distance: number; parentX: number; parentY: number; parentW: number; parentH: number },
-  lengthIsY: boolean,
+  sheetW: number,
+  sheetL: number,
+  orient: Orient,
   ox: number,
   oy: number,
   scale: number,
   withArrows = false,
 ) {
-  // Convert rip/cross → vertical/horizontal in screen orientation.
-  const isVertical = lengthIsY ? step.axis === 'rip' : step.axis === 'cross';
-  const px = ox + step.parentX * scale;
-  const py = oy + step.parentY * scale;
-  const pw = step.parentW * scale;
-  const ph = step.parentH * scale;
+  const pr = orient.rect(step.parentX, step.parentY, step.parentW, step.parentH);
+  const px = ox + pr.x * scale;
+  const py = oy + pr.y * scale;
+  const pw = pr.w * scale;
+  const ph = pr.h * scale;
 
-  if (isVertical) {
+  const lengthIsY = sheetL >= sheetW;
+  const isVerticalInSheet = lengthIsY ? step.axis === 'rip' : step.axis === 'cross';
+  const isVerticalInDisplay = orient.rotated ? !isVerticalInSheet : isVerticalInSheet;
+
+  if (isVerticalInDisplay) {
     const dx = px + step.distance * scale;
     doc.line(dx, py, dx, py + ph);
     if (withArrows) {

@@ -1250,7 +1250,9 @@ downloadPdfBtn.addEventListener('click', () => {
   }
 
   // Build per-panel id ("3a") from the lastNest so PDF panel ids match.
+  // Also build a panel-detail map for the step-by-step assembly cards.
   const idByBodyPartId = new Map<string, string[]>();
+  const panelById = new Map<string, import('./pdf').CabinetPanel>();
   if (state.lastNest) {
     for (const g of state.lastNest.groups) {
       for (const s of g.sheets) {
@@ -1259,6 +1261,14 @@ downloadPdfBtn.addEventListener('click', () => {
           const arr = idByBodyPartId.get(p.partId) ?? [];
           arr.push(id);
           idByBodyPartId.set(p.partId, arr);
+          panelById.set(id, {
+            id,
+            length: Math.max(p.w, p.h),
+            width: Math.min(p.w, p.h),
+            thickness: g.thickness,
+            name: p.partName,
+            color: p.color,
+          });
         }
       }
     }
@@ -1281,7 +1291,10 @@ downloadPdfBtn.addEventListener('click', () => {
         const arr = idByBodyPartId.get(String(b.id));
         if (arr) ids.push(...arr);
       }
-      cabinets.push({ name: tag, partIds: ids, assembled, exploded });
+      const panels = ids
+        .map((id) => panelById.get(id))
+        .filter((p): p is import('./pdf').CabinetPanel => p !== undefined);
+      cabinets.push({ name: tag, partIds: ids, panels, assembled, exploded });
     }
     // Backwards-compat fallback: combined all-cabinet snapshots (used
     // when a future caller doesn't populate `cabinets`).

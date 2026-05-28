@@ -37,6 +37,10 @@ export interface CutStep {
   parentH: number;
   /** Depth in the cut tree (0 = original sheet). */
   depth: number;
+  /** True for the initial margin-trim cuts that strip the sheet's perimeter
+   *  before the real layout cuts begin. UI may render these differently
+   *  (e.g. labelled "Trim L" instead of "Rip"). */
+  isTrim?: boolean;
 }
 
 export interface SheetCuts {
@@ -110,10 +114,44 @@ export function indexToLetters(i: number): string {
  *     an APPROXIMATION. These cuts may not be physically realizable as
  *     edge-to-edge in one pass, but they describe the cut LINES.
  */
-export function cutStepsForSheet(sheet: NestSheet, sheetIndex: number, groupIndex: number): SheetCuts {
+export function cutStepsForSheet(
+  sheet: NestSheet,
+  sheetIndex: number,
+  groupIndex: number,
+  margin = 0,
+): SheetCuts {
   const W = sheet.sheetW;
   const L = sheet.sheetL;
   const lengthIsY = L >= W;
+
+  // Margin trim cuts come first when margin > 0 — strip the perimeter so the
+  // remaining stock matches the bin space the packer used. Four cuts (L, R,
+  // B, T), each on the piece left after the previous trim.
+  const trimSteps: CutStep[] = [];
+  if (margin > 0) {
+    const m = margin;
+    // After "trim L" the active piece starts at x=m.
+    // After "trim R" it ends at x=W-m, so width = W-2m.
+    // After "trim B" it starts at y=m.
+    // After "trim T" it ends at y=L-m, so height = L-2m.
+    trimSteps.push({
+      index: 1, axis: lengthIsY ? 'rip' : 'cross', distance: m,
+      parentX: 0, parentY: 0, parentW: W, parentH: L, depth: 0, isTrim: true,
+    });
+    trimSteps.push({
+      index: 2, axis: lengthIsY ? 'rip' : 'cross', distance: W - 2 * m,
+      parentX: m, parentY: 0, parentW: W - m, parentH: L, depth: 0, isTrim: true,
+    });
+    trimSteps.push({
+      index: 3, axis: lengthIsY ? 'cross' : 'rip', distance: m,
+      parentX: m, parentY: 0, parentW: W - 2 * m, parentH: L, depth: 0, isTrim: true,
+    });
+    trimSteps.push({
+      index: 4, axis: lengthIsY ? 'cross' : 'rip', distance: L - 2 * m,
+      parentX: m, parentY: m, parentW: W - 2 * m, parentH: L - m, depth: 0, isTrim: true,
+    });
+  }
+  const offset = trimSteps.length;
 
   // Path 1: guillotine cut tree available — translate Cut → CutStep.
   if (sheet.cuts && sheet.cuts.length > 0) {
@@ -124,7 +162,7 @@ export function cutStepsForSheet(sheet: NestSheet, sheetIndex: number, groupInde
       //   - landscape → length runs horizontally → rip = horizontal cut (H)
       const isRip = (lengthIsY && c.axis === 'V') || (!lengthIsY && c.axis === 'H');
       return {
-        index: i + 1,
+        index: offset + i + 1,
         axis: isRip ? 'rip' : 'cross',
         // For a guillotine cut, the user makes it relative to its parent's
         // reference edge. We pass `distance` as the LOCAL value (from the
@@ -141,7 +179,7 @@ export function cutStepsForSheet(sheet: NestSheet, sheetIndex: number, groupInde
     return {
       sheetIndex, globalIndex: sheet.globalIndex || sheetIndex, groupIndex,
       thickness: sheet.thickness, sheetW: W, sheetL: L,
-      steps,
+      steps: [...trimSteps, ...steps],
       isGuillotineTree: true,
     };
   }
@@ -163,7 +201,7 @@ export function cutStepsForSheet(sheet: NestSheet, sheetIndex: number, groupInde
   const crossCuts = lengthIsY ? yList : xList;
 
   const steps: CutStep[] = [];
-  let idx = 1;
+  let idx = offset + 1;
   const baseParent = { parentX: 0, parentY: 0, parentW: W, parentH: L, depth: 0 };
   for (const d of ripCuts) steps.push({ index: idx++, axis: 'rip', distance: d, ...baseParent });
   for (const d of crossCuts) steps.push({ index: idx++, axis: 'cross', distance: d, ...baseParent });
@@ -171,17 +209,17 @@ export function cutStepsForSheet(sheet: NestSheet, sheetIndex: number, groupInde
   return {
     sheetIndex, globalIndex: sheet.globalIndex || sheetIndex, groupIndex,
     thickness: sheet.thickness, sheetW: W, sheetL: L,
-    steps,
+    steps: [...trimSteps, ...steps],
     isGuillotineTree: false,
   };
 }
 
 /** Generate cut step lists for every sheet in the job, in order. */
-export function allCutSteps(result: NestResult): SheetCuts[] {
+export function allCutSteps(result: NestResult, margin = 0): SheetCuts[] {
   const out: SheetCuts[] = [];
   result.groups.forEach((g, gi) => {
     g.sheets.forEach((s, si) => {
-      out.push(cutStepsForSheet(s, si + 1, gi + 1));
+      out.push(cutStepsForSheet(s, si + 1, gi + 1, margin));
     });
   });
   return out;
