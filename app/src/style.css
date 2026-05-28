@@ -788,7 +788,9 @@ input[type="checkbox"]:focus-visible { box-shadow: 0 0 0 2px var(--accent-ring);
 }
 
 #workArea {
-  --pane-split: 1fr;
+  /* Default split favours the Cut layout pane (long edge horizontal sheets
+   *  need more horizontal room than the 3D viewer once an estimate is done). */
+  --pane-split: 0.55fr;
   display: grid;
   grid-template-columns: var(--pane-split) 6px 1fr;
   min-height: 0;
@@ -972,20 +974,24 @@ input[type="checkbox"]:focus-visible { box-shadow: 0 0 0 2px var(--accent-ring);
    even-lighter plywood sheet pops as a distinct object (not a thick black
    border, just a hairline). */
 .detail-svg {
-  background: #EDECE8;
-  border: 1px solid var(--line);
-  border-radius: 8px;
-  padding: 20px;
-  box-shadow: inset 0 1px 2px rgba(15, 15, 15, 0.04);
+  background: transparent;
+  border: 0;
+  border-radius: 0;
+  padding: 0;
+  box-shadow: none;
   display: flex;
-  align-items: center;
-  justify-content: center;
+  flex-direction: column;
+  align-items: stretch;
+  justify-content: flex-start;
+  gap: 22px;
+  overflow-y: auto;
+  scroll-behavior: smooth;
 }
 .detail-svg svg {
   width: 100%;
   height: auto;
   display: block;
-  max-height: 360px;
+  max-height: 380px;
   /* Darker plywood-stock color so the lighter cut parts (rendered in a
      single warm wood tone) read as distinct pieces ON the sheet. */
   background: #6B4F31;
@@ -1091,6 +1097,58 @@ input[type="checkbox"]:focus-visible { box-shadow: 0 0 0 2px var(--accent-ring);
   overflow-y: auto;
 }
 
+/* Stacked sheet entries in the cut-layout pane — minimal: no card chrome */
+.sheet-entry {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 4px 0 12px;
+  background: transparent;
+  border: 0;
+  border-radius: 0;
+  box-shadow: none;
+  width: 100%;
+}
+.sheet-entry + .sheet-entry {
+  border-top: 1px solid var(--line);
+  padding-top: 16px;
+}
+.sheet-entry.active .sheet-entry-title { color: var(--accent, #2383E2); }
+.sheet-entry-header {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+.sheet-entry-title {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text);
+  letter-spacing: -0.01em;
+}
+.sheet-entry-meta {
+  font-size: 12px;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+.sheet-entry-meta strong {
+  color: var(--text-2);
+  font-weight: 600;
+}
+.sheet-entry-svg {
+  width: 100%;
+  background: transparent;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.sheet-entry-svg svg {
+  display: block;
+  width: 100%;
+  height: auto;
+  max-height: 380px;
+  background: transparent;
+}
+
 /* PDF button progress state */
 .ghost.busy {
   position: relative;
@@ -1168,9 +1226,7 @@ input[type="checkbox"]:focus-visible { box-shadow: 0 0 0 2px var(--accent-ring);
   min-height: 56px;
 }
 .thumb .thumb-svg svg {
-  background: #6B4F31;
-  border: 1px solid #2E1F0F;
-  border-radius: 2px;
+  background: transparent;
   display: block;
   width: 100%;
   height: 100%;
@@ -1191,7 +1247,8 @@ input[type="checkbox"]:focus-visible { box-shadow: 0 0 0 2px var(--accent-ring);
 /* ===========================================================================
    SVG entities — light-sheet palette. Thin hairline border, dark labels.
    =========================================================================== */
-.sheet-border { fill: none; stroke: #B5B3AE; stroke-width: 1; }
+/* Sheet rect: brown fill, no outline. */
+.sheet-border { fill: #6B4F31; stroke: none; }
 .margin-rect { fill: none; stroke: rgba(55, 53, 47, 0.22); stroke-dasharray: 4 4; stroke-width: 0.7; }
 .grain-arrow { stroke: #37352F; stroke-width: 1.2; fill: none; }
 .part-label { fill: #37352F; font-size: 10px; font-weight: 600; text-anchor: middle; pointer-events: none; }

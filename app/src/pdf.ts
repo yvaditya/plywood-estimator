@@ -602,36 +602,29 @@ function drawPartDims(
   const inset = 6;
   const tickLen = 4;
   const textSize = 8.5;
-  doc.setDrawColor(60);
+  doc.setDrawColor(50);
   doc.setLineWidth(0.5);
   doc.setFont('helvetica', 'normal');
   doc.setFontSize(textSize);
-  doc.setTextColor(60);
+  doc.setTextColor(40);
 
-  // BOTTOM (width) — horizontal dim line just above the part's bottom edge
+  // BOTTOM (width) — horizontal dim line just above the part's bottom edge.
+  // No white halo — the panel fill already provides enough contrast.
   const by = py + phPt - inset;
   doc.line(px + inset, by, px + pwPt - inset, by);
   doc.line(px + inset, by - tickLen / 2, px + inset, by + tickLen / 2);
   doc.line(px + pwPt - inset, by - tickLen / 2, px + pwPt - inset, by + tickLen / 2);
-  // Background nub behind text to keep it readable on top of the fill
-  doc.setFillColor(255, 255, 255);
   const wText = fmtDim(realW, opt.units);
-  const wWidth = doc.getTextWidth(wText) + 6;
-  doc.rect(px + pwPt / 2 - wWidth / 2, by - textSize * 0.95, wWidth, textSize + 4, 'F');
   doc.text(wText, px + pwPt / 2, by - 2, { align: 'center' });
 
-  // LEFT (height) — vertical dim line just inside the part's left edge
+  // LEFT (height) — vertical dim line just inside the part's left edge.
   const lx = px + inset;
   doc.line(lx, py + inset, lx, py + phPt - inset);
   doc.line(lx - tickLen / 2, py + inset, lx + tickLen / 2, py + inset);
   doc.line(lx - tickLen / 2, py + phPt - inset, lx + tickLen / 2, py + phPt - inset);
   const hText = fmtDim(realH, opt.units);
-  const hWidth = doc.getTextWidth(hText) + 6;
-  // Rotated text — paint a background rect rotated to match
-  doc.setFillColor(255, 255, 255);
   const ty = py + phPt / 2;
-  doc.rect(lx + 2, ty - hWidth / 2, textSize + 4, hWidth, 'F');
-  doc.text(hText, lx + 4 + textSize, ty, { align: 'center', angle: 90 });
+  doc.text(hText, lx + 4, ty, { align: 'center', angle: 90 });
   doc.setTextColor(0);
 }
 

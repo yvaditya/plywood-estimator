@@ -131,9 +131,6 @@ const inventoryCheckEl = $('inventoryCheck');
 const unplacedList = $('unplacedList');
 const downloadDxfBtn = $<HTMLButtonElement>('downloadDxfBtn');
 const downloadPdfBtn = $<HTMLButtonElement>('downloadPdfBtn');
-const thumbStrip = $('sheetThumbs');
-const sheetsPanel = $('sheetsPanel');
-const sheetsCount = $('sheetsCount');
 
 const shopList = $('shoppingList');
 const shopCount = $('shopCount');
@@ -806,7 +803,6 @@ nestBtn.addEventListener('click', () => {
   resultsEmpty.textContent = 'Optimizing layout…';
   resultsEmpty.hidden = false;
   resultsDetail.hidden = true;
-  sheetsPanel.hidden = true;
 
   setTimeout(() => {
     try {
@@ -867,64 +863,39 @@ function renderResults() {
   resultsDetail.hidden = false;
   downloadDxfBtn.disabled = false;
   downloadPdfBtn.disabled = false;
-  sheetsPanel.hidden = false;
   const totalSheets = result.groups.reduce((a, g) => a + g.sheets.length, 0);
-  sheetsCount.textContent = String(totalSheets);
 
-  // Detail view
-  if (!state.currentSheetKey) {
-    state.currentSheetKey = firstSheetKey(result);
-  }
-  const sel = findSheetByKey(state.currentSheetKey);
-  if (sel) {
-    renderDetail(sel.sheet, sel.groupIdx + 1);
-  } else {
-    detailTitle.textContent = 'No sheets';
-    detailSvg.innerHTML = '';
-  }
-
-  // Thumbnails — use each sheet's own dims so portrait + landscape both render.
-  thumbStrip.innerHTML = '';
+  // Stacked sheet list — every sheet rendered one below the other.
+  if (!state.currentSheetKey) state.currentSheetKey = firstSheetKey(result);
+  detailTitle.textContent = `${totalSheets} ${totalSheets === 1 ? 'sheet' : 'sheets'}`;
+  detailSub.textContent = `kerf ${fmtDim(sz.kerf, state.units)} · margin ${fmtDim(sz.margin, state.units)}`;
+  detailSvg.innerHTML = '';
   result.groups.forEach((g, gi) => {
     g.sheets.forEach((sh, si) => {
       const key = `g${gi}-s${si}`;
-      const t = document.createElement('div');
-      t.className = 'thumb' + (key === state.currentSheetKey ? ' active' : '');
+      const entry = document.createElement('section');
+      entry.className = 'sheet-entry' + (key === state.currentSheetKey ? ' active' : '');
+      entry.id = `sheet-${key}`;
       const tw = sh.sheetW, tl = sh.sheetL;
       const fill = sh.parts.length > 0 ? (sh.usedArea / (tw * tl)) * 100 : 0;
-      // Aspect-ratio-aware: tall (portrait) sheets get a taller thumb.
-      const aspect = tl / tw;
-      const wrap = document.createElement('div');
-      wrap.className = 'thumb-svg-wrap';
+      const head = document.createElement('header');
+      head.className = 'sheet-entry-header';
+      head.innerHTML = `
+        <div class="sheet-entry-title">Sheet ${sh.globalIndex || si + 1}</div>
+        <div class="sheet-entry-meta">
+          ${fmtDim(sh.thickness, state.units)} thick · ${sh.parts.length} parts ·
+          <strong>${fill.toFixed(1)}%</strong> fill ·
+          ${fmtDim(tw, state.units)} × ${fmtDim(tl, state.units)}
+        </div>`;
+      entry.appendChild(head);
       const svgWrap = document.createElement('div');
-      svgWrap.className = 'thumb-svg';
-      svgWrap.style.aspectRatio = `${tw} / ${tl}`;
-      // Constrain the inner dim that's the long axis so the other auto-sizes
-      // from aspect-ratio without overflowing the card.
-      if (aspect >= 1) {
-        // Portrait: limit height, width derived from aspect
-        svgWrap.style.height = '100%';
-        svgWrap.style.width = 'auto';
-      } else {
-        // Landscape: limit width, height derived from aspect
-        svgWrap.style.width = '100%';
-        svgWrap.style.height = 'auto';
-      }
-      svgWrap.appendChild(buildSheetSvg(sh, tw, tl, sz.margin, false));
-      wrap.appendChild(svgWrap);
-      t.appendChild(wrap);
-      const label = document.createElement('div');
-      label.className = 'thumb-label';
-      const orient = aspect > 1.05 ? '↕' : aspect < 0.95 ? '↔' : '□';
-      label.textContent = `${orient} #${si + 1} · ${fmtDim(sh.thickness, state.units)} · ${fill.toFixed(0)}%`;
-      t.appendChild(label);
-      t.addEventListener('click', () => {
-        state.currentSheetKey = key;
-        renderResults();
-      });
-      thumbStrip.appendChild(t);
+      svgWrap.className = 'sheet-entry-svg';
+      svgWrap.appendChild(buildSheetSvg(sh, tw, tl, sz.margin, true));
+      entry.appendChild(svgWrap);
+      detailSvg.appendChild(entry);
     });
   });
+
 
   // Overall metrics, shopping list, unplaced parts
   renderJobMetrics();
@@ -941,18 +912,6 @@ function refreshShoppingFromNest() {
   renderShoppingList();
 }
 
-function renderDetail(sheet: NestSheet, groupIdx: number) {
-  const sz = state.lastSheet!;
-  const tw = sheet.sheetW, tl = sheet.sheetL;
-  const fill = sheet.parts.length > 0 ? (sheet.usedArea / (tw * tl)) * 100 : 0;
-  const orient = tl > tw ? 'portrait' : (tw > tl ? 'landscape' : 'square');
-  detailTitle.textContent = `Sheet ${sheet.index} · ${fmtDim(sheet.thickness, state.units)} thick`;
-  detailSub.textContent =
-    `Group ${groupIdx} · ${sheet.parts.length} parts · ${fill.toFixed(1)}% fill · ` +
-    `${fmtDim(tw, state.units)} × ${fmtDim(tl, state.units)} ${orient} · kerf ${fmtDim(sz.kerf, state.units)}`;
-  detailSvg.innerHTML = '';
-  detailSvg.appendChild(buildSheetSvg(sheet, tw, tl, sz.margin, true));
-}
 
 function renderJobMetrics() {
   const result = state.lastNest!;
