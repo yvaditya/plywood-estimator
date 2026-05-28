@@ -75,6 +75,10 @@ const state: {
   /** Per-fileTag UI state: collapsed (true) hides the bodies inside this
    *  file group. Defaults to expanded when a new file is loaded. */
   collapsedFiles: Set<string>;
+  /** Last optimisation's per-trial captured layouts (current and final).
+   *  Replayed on demand via the play button beside the Cut layout title.
+   *  Cleared each time a new estimate kicks off. */
+  lastTrialFrames: { sheets: NestSheet[]; sheetW: number; sheetL: number; margin: number; trial: number; total: number; isNewBest: boolean }[];
 } = {
   result: null,
   bodies: [],
@@ -88,6 +92,7 @@ const state: {
   partLabels: new Map(),
   nonSheetCount: 0,
   collapsedFiles: new Set<string>(),
+  lastTrialFrames: [],
 };
 
 // --------------------------------------------------------------------------
@@ -125,6 +130,7 @@ const viewerEl = $('viewer');
 const resultsEmpty = $('resultsEmpty');
 const resultsDetail = $('resultsDetail');
 const detailTitle = $('detailTitle');
+const replayBtn = $<HTMLButtonElement>('replayBtn');
 const detailSub = $('detailSub');
 const detailSvg = $('detailSvg');
 const detailMetrics = $('detailMetrics');
@@ -801,20 +807,16 @@ nestBtn.addEventListener('click', async () => {
 
   nestBtn.disabled = true;
   nestBtn.textContent = 'Estimating…';
-  resultsEmpty.hidden = true;
-  resultsDetail.hidden = false;
+  resultsEmpty.hidden = false;
+  resultsEmpty.textContent = 'Optimising layout…';
+  resultsDetail.hidden = true;
   downloadDxfBtn.disabled = true;
   downloadPdfBtn.disabled = true;
+  replayBtn.disabled = true;
 
-  // 25 fps target → 1000/25 = 40ms per frame. We can't slow packOne down, but
-  // we can SHOW frames at a steady pace by only rendering on the next frame
-  // tick. Below the optimiser ticks faster than 25fps, the UI just shows the
-  // most recent state; above, it limits paint to one frame per 40ms.
-  const FRAME_MS = 1000 / 25;
-  let lastPaint = 0;
-  detailTitle.textContent = 'Optimising…';
-  detailSub.textContent = '';
-  detailSvg.innerHTML = '';
+  // Capture trial frames for the replay button. We do NOT paint frames live
+  // during the estimate (the user gets a fast 'final state' on completion).
+  state.lastTrialFrames = [];
 
   try {
     const result = await runNestAnimated(parts, {
@@ -823,21 +825,22 @@ nestBtn.addEventListener('click', async () => {
       restarts,
       cutStrategy: (cutStrategySelect.value as 'free' | 'guillotine' | 'save-last') || 'free',
     }, async (info) => {
-      const now = performance.now();
-      // Always update text counters so the user sees granular progress.
       const pct = ((info.trial + 1) / info.totalTrials) * 100;
-      const yieldNow = sumYield(info.best);
-      detailTitle.textContent = `Optimising · trial ${info.trial + 1} / ${info.totalTrials}`;
-      detailSub.textContent =
-        `Group ${info.groupIdx + 1} / ${info.totalGroups} · best ${info.best.length} sheet${info.best.length === 1 ? '' : 's'} · ${(yieldNow * 100).toFixed(1)}% yield`;
       nestBtn.textContent = `Trial ${info.trial + 1}/${info.totalTrials} · ${pct.toFixed(0)}%`;
-      // Throttle the heavy SVG paint to 15fps OR repaint immediately on a
-      // new best so the user always sees the latest improvement.
-      if (info.isNewBest || now - lastPaint >= FRAME_MS) {
-        lastPaint = now;
-        paintTrialPreview(info.current, info.sheetW, info.sheetL, margin);
-        await new Promise<void>((r) => requestAnimationFrame(() => r()));
-      }
+      const yieldNow = sumYield(info.best);
+      resultsEmpty.textContent =
+        `Optimising · trial ${info.trial + 1} of ${info.totalTrials} · ` +
+        `best ${info.best.length} sheet${info.best.length === 1 ? '' : 's'} · ${(yieldNow * 100).toFixed(1)}% yield`;
+      // Record this trial for later replay.
+      state.lastTrialFrames.push({
+        sheets: info.current,
+        sheetW: info.sheetW,
+        sheetL: info.sheetL,
+        margin,
+        trial: info.trial,
+        total: info.totalTrials,
+        isNewBest: info.isNewBest,
+      });
     });
 
     state.lastNest = result;
@@ -845,6 +848,7 @@ nestBtn.addEventListener('click', async () => {
     state.lastSheet = { w: sheetW, l: sheetL, margin, kerf };
     state.currentSheetKey = firstSheetKey(result);
     renderResults();
+    replayBtn.disabled = state.lastTrialFrames.length === 0;
   } catch (err: any) {
     resultsEmpty.hidden = false;
     resultsDetail.hidden = true;
@@ -854,6 +858,33 @@ nestBtn.addEventListener('click', async () => {
     nestBtn.disabled = false;
     nestBtn.textContent = 'Estimate cut sheets';
   }
+});
+
+// Replay button: animate the captured trial sequence at 25 fps. While the
+// replay runs, the button toggles to "stop" and the final state is restored
+// on stop or completion.
+let replayHandle: { stop: boolean } | null = null;
+replayBtn.addEventListener('click', async () => {
+  if (replayHandle) { replayHandle.stop = true; return; }
+  if (state.lastTrialFrames.length === 0) return;
+  const handle = { stop: false };
+  replayHandle = handle;
+  replayBtn.classList.add('busy');
+  const frames = state.lastTrialFrames;
+  const FRAME_MS = 1000 / 25;
+  const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+  for (let i = 0; i < frames.length; i++) {
+    if (handle.stop) break;
+    const f = frames[i];
+    detailTitle.textContent = `Replay · trial ${i + 1} / ${frames.length}`;
+    detailSub.textContent = f.isNewBest ? 'new best ★' : '';
+    paintTrialPreview(f.sheets, f.sheetW, f.sheetL, f.margin);
+    await sleep(FRAME_MS);
+  }
+  replayHandle = null;
+  replayBtn.classList.remove('busy');
+  // Restore the final state.
+  if (state.lastNest) renderResults();
 });
 
 /** Render a quick stacked preview of trial sheets during animation. */

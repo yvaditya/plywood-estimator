@@ -1152,6 +1152,15 @@ input[type="checkbox"]:focus-visible { box-shadow: 0 0 0 2px var(--accent-ring);
   background: transparent;
 }
 
+/* Icon-only ghost buttons (replay, etc.) */
+.ghost.icon-only {
+  padding: 4px 7px;
+  min-width: 0;
+  color: var(--muted);
+}
+.ghost.icon-only:not(:disabled):hover { color: var(--accent, #2383E2); background: var(--hover-wash); }
+.ghost.icon-only:disabled { opacity: 0.4; }
+
 /* PDF button progress state */
 .ghost.busy {
   position: relative;
