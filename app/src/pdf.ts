@@ -1315,10 +1315,12 @@ function drawHeaderFooter(
 }
 
 // ---------------------------------------------------------------------------
-// Parts overview (IKEA-style)
-//   - Header: "Parts" + total piece count
-//   - Grid of cards, each: big letter • silhouette • name • dimensions • qty
-//   - Sized to fit ~6-12 cards/page depending on paper size
+// Parts overview
+//   - Sections grouped by STEP file (one per cabinet)
+//   - Each section: cabinet name + grid of part cards
+//   - Cards use the SAME sheet-relative panel IDs (1a, 1b, 2a, ...) as the
+//     per-sheet layouts + assembly pages — labels match across the PDF.
+//   - Falls back to a flat A/B/C list if cabinet data isn't supplied.
 // ---------------------------------------------------------------------------
 function drawPartsOverview(
   doc: jsPDF,
@@ -1329,7 +1331,6 @@ function drawPartsOverview(
 ) {
   const PAGE_W = dims.w;
   const PAGE_H = dims.h;
-  const items = Array.from(labels.values());
 
   // Header
   doc.setFont('helvetica', 'bold');
@@ -1338,24 +1339,108 @@ function drawPartsOverview(
   doc.setFont('helvetica', 'normal');
   doc.setFontSize(10);
   doc.setTextColor(120);
-  const totalPieces = items.reduce((a, x) => a + x.totalQty, 0);
-  doc.text(
-    `${items.length} unique parts · ${totalPieces} pieces total`,
-    PAGE_W - PAGE_PAD, PAGE_PAD + 6, { align: 'right' },
-  );
+
+  // Build the list of cabinets to render.
+  const cabinets = (opt.cabinets ?? []).filter((c) => c.panels && c.panels.length > 0);
+
+  // Total piece count subtitle.
+  let totalPieces = 0;
+  if (cabinets.length > 0) {
+    for (const c of cabinets) totalPieces += c.panels!.length;
+    doc.text(
+      `${cabinets.length} ${cabinets.length === 1 ? 'cabinet' : 'cabinets'} · ${totalPieces} panels`,
+      PAGE_W - PAGE_PAD, PAGE_PAD + 6, { align: 'right' },
+    );
+  } else {
+    const items = Array.from(labels.values());
+    totalPieces = items.reduce((a, x) => a + x.totalQty, 0);
+    doc.text(
+      `${items.length} unique parts · ${totalPieces} pieces total`,
+      PAGE_W - PAGE_PAD, PAGE_PAD + 6, { align: 'right' },
+    );
+  }
   doc.setTextColor(0);
 
-  // Grid layout
+  // Card-grid metrics shared by both layouts.
   const cols = PAGE_W > 800 ? 4 : 3;
   const gutter = 18;
-  const top = PAGE_PAD + 28;
-  const bottom = PAGE_PAD;
   const innerW = PAGE_W - 2 * PAGE_PAD;
   const cardW = (innerW - gutter * (cols - 1)) / cols;
-  const cardH = 140;
-  const rowsPerPage = Math.max(1, Math.floor((PAGE_H - top - bottom) / (cardH + gutter)));
-  const perPage = cols * rowsPerPage;
+  const cardH = 130;
+  const sectionHeaderH = 26;
 
+  // ----------- Grouped layout: cabinets ---------------------------------
+  if (cabinets.length > 0) {
+    let y = PAGE_PAD + 36;
+    const bottom = PAGE_H - PAGE_PAD;
+    const newPage = () => {
+      doc.addPage(dims === PAPER_DIMS['letter-portrait'] ? 'letter' : undefined as any);
+      tagSection?.('Parts');
+      y = PAGE_PAD + 16;
+    };
+
+    for (const cab of cabinets) {
+      // Dedup panels by id so multiples of the same id collapse into one card.
+      const byId = new Map<string, { panel: CabinetPanel; qty: number }>();
+      for (const p of cab.panels!) {
+        const ex = byId.get(p.id);
+        if (ex) ex.qty += 1;
+        else byId.set(p.id, { panel: p, qty: 1 });
+      }
+      const panels = Array.from(byId.values()).sort((a, b) => a.panel.id.localeCompare(b.panel.id));
+
+      // Section header — fits on a fresh page if we're tight on space.
+      if (y + sectionHeaderH + cardH > bottom) newPage();
+      doc.setFont('helvetica', 'bold');
+      doc.setFontSize(12);
+      doc.setTextColor(20);
+      doc.text(cab.name, PAGE_PAD, y);
+      doc.setFont('helvetica', 'normal');
+      doc.setFontSize(9.5);
+      doc.setTextColor(140);
+      doc.text(
+        `${panels.length} ${panels.length === 1 ? 'panel' : 'panels'}`,
+        PAGE_W - PAGE_PAD, y, { align: 'right' },
+      );
+      doc.setTextColor(0);
+      // Hairline under the section title for separation.
+      doc.setDrawColor(225);
+      doc.setLineWidth(0.4);
+      doc.line(PAGE_PAD, y + 6, PAGE_W - PAGE_PAD, y + 6);
+      y += sectionHeaderH;
+
+      // Cards for this cabinet.
+      let col = 0;
+      for (const { panel, qty } of panels) {
+        if (y + cardH > bottom) newPage();
+        const x = PAGE_PAD + col * (cardW + gutter);
+        // Synthesize a PartLabel-shaped record using the panel ID as letter.
+        const label: PartLabel = {
+          partId: panel.id,
+          letter: panel.id,
+          partName: panel.name,
+          thickness: panel.thickness,
+          length: panel.length,
+          width: panel.width,
+          totalQty: qty,
+          color: panel.color,
+        };
+        drawPartCard(doc, label, x, y, cardW, cardH, opt);
+        col++;
+        if (col >= cols) { col = 0; y += cardH + gutter; }
+      }
+      // Advance past the last partial row before the next cabinet.
+      if (col !== 0) { y += cardH + gutter; }
+      y += 6; // breathing room between cabinets
+    }
+    return;
+  }
+
+  // ----------- Flat fallback (no cabinet data) --------------------------
+  const items = Array.from(labels.values());
+  const top = PAGE_PAD + 28;
+  const rowsPerPage = Math.max(1, Math.floor((PAGE_H - top - PAGE_PAD) / (cardH + gutter)));
+  const perPage = cols * rowsPerPage;
   for (let i = 0; i < items.length; i++) {
     const onPage = i % perPage;
     if (i > 0 && onPage === 0) {
