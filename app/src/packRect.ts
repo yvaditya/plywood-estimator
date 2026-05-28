@@ -861,7 +861,7 @@ export async function packMultiAnimated(
   job: PackJob,
   restarts: number,
   onProgress: (p: PackProgress) => void | Promise<void>,
-  yieldEvery = 1,
+  yieldEvery = 4,
 ): Promise<MultiSheetResult> {
   const effectiveStrategy = job.cutStrategy === 'save-last' ? 'free' : job.cutStrategy;
   const optJob: PackJob = effectiveStrategy === job.cutStrategy ? job : { ...job, cutStrategy: effectiveStrategy };
