@@ -625,7 +625,21 @@ export class Viewer {
      *  one consistent camera (frameIds = the full cabinet, even when only a
      *  subset is visible this step). */
     frameIds?: Set<number>,
+    /** Target canvas dimensions for the rendered snapshot. Defaults to the
+     *  current renderer size. Use for high-resolution PDF embedding — e.g.
+     *  pass { w: 1600, h: 1000 } to get a sharp wide image regardless of the
+     *  user's window size. The renderer is resized for the snapshot and
+     *  restored afterwards, transparently to the live viewer. */
+    target?: { w: number; h: number },
   ): { dataUrl: string; width: number; height: number } {
+    // 0. (Optional) resize the renderer for a high-resolution snapshot.
+    const sizeBackup = this.renderer.getSize(new THREE.Vector2());
+    const aspectBackup = this.camera.aspect;
+    if (target) {
+      this.renderer.setSize(target.w, target.h, false);
+      this.composer.setSize(target.w, target.h);
+      this.camera.aspect = target.w / target.h;
+    }
     // 1. Snapshot current visibility + positions
     const visBackup = new Map<number, boolean>();
     const posBackup = new Map<number, THREE.Vector3>();
@@ -658,7 +672,10 @@ export class Viewer {
       const center = new THREE.Vector3(); box.getCenter(center);
       const maxDim = Math.max(size.x, size.y, size.z) + distance * 2;
       const fov = (this.camera.fov * Math.PI) / 180;
-      const dist = (maxDim / 2) / Math.tan(fov / 2) * 1.7;
+      // Distance multiplier was 1.7 — the cabinet floated in lots of empty
+      // background. 1.25 frames it tightly with a small margin so the
+      // assembly fills the snapshot, much more readable in the PDF cards.
+      const dist = (maxDim / 2) / Math.tan(fov / 2) * 1.25;
       this.controls.target.copy(center);
       this.camera.position.copy(
         center.clone().add(new THREE.Vector3(1.0, -1.2, 0.9).normalize().multiplyScalar(dist)),
@@ -727,6 +744,12 @@ export class Viewer {
     this.controls.target.copy(cameraBackup.target);
     this.camera.near = cameraBackup.near;
     this.camera.far = cameraBackup.far;
+    // Restore renderer size + camera aspect if we changed them for the snapshot.
+    if (target) {
+      this.renderer.setSize(sizeBackup.x, sizeBackup.y, false);
+      this.composer.setSize(sizeBackup.x, sizeBackup.y);
+      this.camera.aspect = aspectBackup;
+    }
     this.camera.updateProjectionMatrix();
     this.controls.update();
     this.composer.render();

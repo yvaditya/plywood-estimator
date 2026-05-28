@@ -1305,10 +1305,14 @@ downloadPdfBtn.addEventListener('click', () => {
   let assembledPng: string | undefined;
   let explodedPng: string | undefined;
   try {
+    // Render snapshots at a fixed high-resolution wide aspect for sharp PDF
+    // embedding regardless of the user's window size. 1600x900 ≈ 16:9 which
+    // matches the widescreen PDF + the IKEA step cards (each ~2:1).
+    const SHOT = { w: 1600, h: 900 };
     for (const [tag, bodies] of byFile) {
       const visibleIds = new Set(bodies.map((b) => b.id));
-      const assembled = viewer.snapshotFiltered(visibleIds, null, 0);
-      const exploded = viewer.snapshotFiltered(visibleIds, directions, explodeDist);
+      const assembled = viewer.snapshotFiltered(visibleIds, null, 0, undefined, SHOT);
+      const exploded = viewer.snapshotFiltered(visibleIds, directions, explodeDist, undefined, SHOT);
       const ids: string[] = [];
       for (const b of bodies) {
         const arr = idByBodyPartId.get(String(b.id));
@@ -1333,7 +1337,7 @@ downloadPdfBtn.addEventListener('click', () => {
         const stepDirs = new Map<number, [number, number, number]>();
         const dir = directions.get(bodies[i].id);
         if (dir) stepDirs.set(bodies[i].id, dir);
-        const img = viewer.snapshotFiltered(installed, stepDirs, stepDist, visibleIds);
+        const img = viewer.snapshotFiltered(installed, stepDirs, stepDist, visibleIds, SHOT);
         steps.push(img);
         const arr = idByBodyPartId.get(String(bodies[i].id)) ?? [];
         stepPanelIds.push(arr[0] ?? `body ${bodies[i].id}`);
@@ -1342,7 +1346,7 @@ downloadPdfBtn.addEventListener('click', () => {
       // exploded. Reuses the same camera so it visually matches the previous
       // step but with the last panel settled.
       if (bodies.length > 0) {
-        const doneImg = viewer.snapshotFiltered(visibleIds, null, 0, visibleIds);
+        const doneImg = viewer.snapshotFiltered(visibleIds, null, 0, visibleIds, SHOT);
         steps.push(doneImg);
         stepPanelIds.push('done');
       }
