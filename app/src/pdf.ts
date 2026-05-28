@@ -193,7 +193,7 @@ export function buildPdf(result: NestResult, opt: PdfOptions): jsPDF {
       const sectionName = `Assembly · ${cab.name}`;
       addPage(sectionName);
       drawCabinetAssembly(doc, cab, opt, dims);
-      if (cab.panels && cab.panels.length > 0) {
+      if (cab.steps && cab.steps.length > 0) {
         drawCabinetSteps(doc, cab, opt, dims, () => addPage(sectionName));
       }
     }
@@ -1007,7 +1007,10 @@ function drawCabinetSteps(
   for (let i = 0; i < cab.steps.length; i++) {
     const onPage = i % perPage;
     if (i === 0 || onPage === 0) {
-      if (i > 0) openNewPage();
+      // Always start step grids on a fresh page — the cover page sits
+      // ahead of us (assembled snapshot + parts table), and within the
+      // sequence each `perPage`-sized batch gets its own page.
+      openNewPage();
       doc.setFont('helvetica', 'bold');
       doc.setFontSize(16);
       doc.setTextColor(20);
