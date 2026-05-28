@@ -506,9 +506,11 @@ function drawSheet(doc: jsPDF, sheet: NestSheet, opt: PdfOptions, dims: { w: num
     doc.setLineDashPattern([], 0);
   }
 
-  // Parts
+  // Parts — pass the sheet box so per-panel dim leaders can spill into
+  // adjacent waste areas (between the panel and the sheet's outer edge).
+  const sheetBox = { x: ox, y: oy, w: sheetPtW, h: sheetPtH };
   for (const p of sheet.parts) {
-    drawPart(doc, p, ox, oy, scale, opt, `${sheet.globalIndex}${p.panelLabel}`, orient);
+    drawPart(doc, p, ox, oy, scale, opt, `${sheet.globalIndex}${p.panelLabel}`, orient, sheetBox);
   }
 
   // Overall sheet dimensions — labels show the actual (long, short) values
@@ -528,6 +530,9 @@ function drawPart(
   opt: PdfOptions,
   letter: string | undefined,
   orient: Orient,
+  /** Sheet bounding box in display pt — used to detect free margin around
+   *  the panel so dim leaders can spill outside the panel into waste area. */
+  sheetBox?: { x: number; y: number; w: number; h: number },
 ) {
   const [r, g, b] = hexToRgb(p.color);
   const GS = (doc as any).GState;
@@ -573,21 +578,30 @@ function drawPart(
     doc.text(letter, cx, cy + big * 0.34, { align: 'center' });
   }
 
-  // ANSI dimension callouts inside the panel, near the edges. Skip on
-  // panels too small for the text to fit cleanly.
-  if (partPt >= 40) {
-    drawPartDims(doc, px, py, pwPt, phPt, r0.w, r0.h, opt);
-  }
+  // Space hints derived from the panel's position within the sheet — a
+  // leader callout fires only when there's actual waste room outside the
+  // panel in that direction (i.e., the panel sits near the sheet edge).
+  const space = sheetBox ? {
+    below: (sheetBox.y + sheetBox.h) - (py + phPt),
+    right: (sheetBox.x + sheetBox.w) - (px + pwPt),
+    above: py - sheetBox.y,
+    left: px - sheetBox.x,
+  } : {};
+  drawPartDims(doc, px, py, pwPt, phPt, r0.w, r0.h, opt, space);
 
-  // Suppress unused-var warning — longMm/shortMm read by drawPartDims via r0
   void longMm; void shortMm;
 }
 
 /**
- * Draw width + height dimension marks on the bottom and left edges of a
- * part rectangle. Lives INSIDE the part bounds so it never bleeds into
- * adjacent panels. Tick lines + value text only — no extension lines, to
- * keep it clean and Notion-like.
+ * Draw width + height dimension marks for a part rectangle, ANSI style:
+ *   |------  24"  ------|
+ *      (line broken with a gap where the value text sits)
+ *
+ * Inline (default): dim lines just inside the panel's bottom + left edges.
+ * Outside (fallback): when the panel is too small to fit the value text
+ *   inline, draw a leader line from inside the panel to the value placed
+ *   OUTSIDE — the caller passes free-space hints via `space` so the leader
+ *   only fires when there's actually room.
  */
 function drawPartDims(
   doc: jsPDF,
@@ -598,34 +612,85 @@ function drawPartDims(
   realW: number,
   realH: number,
   opt: PdfOptions,
+  space: { below?: number; right?: number; above?: number; left?: number } = {},
 ) {
-  const inset = 6;
-  const tickLen = 4;
-  const textSize = 8.5;
-  doc.setDrawColor(50);
-  doc.setLineWidth(0.5);
+  const COLOR: [number, number, number] = [60, 60, 60];
+  const TICK = 2.5;
+  const GAP_PAD = 4;          // px on each side of the value text inside the line gap
+  const INSET = 5;            // distance from panel edge to dim line
+  doc.setDrawColor(...COLOR);
+  doc.setLineWidth(0.45);
   doc.setFont('helvetica', 'normal');
-  doc.setFontSize(textSize);
-  doc.setTextColor(40);
+  doc.setTextColor(...COLOR);
 
-  // BOTTOM (width) — horizontal dim line just above the part's bottom edge.
-  // No white halo — the panel fill already provides enough contrast.
-  const by = py + phPt - inset;
-  doc.line(px + inset, by, px + pwPt - inset, by);
-  doc.line(px + inset, by - tickLen / 2, px + inset, by + tickLen / 2);
-  doc.line(px + pwPt - inset, by - tickLen / 2, px + pwPt - inset, by + tickLen / 2);
+  // ---- WIDTH (horizontal axis along bottom) ------------------------------
   const wText = fmtDim(realW, opt.units);
-  doc.text(wText, px + pwPt / 2, by - 2, { align: 'center' });
+  const wFontInline = clamp(pwPt * 0.085, 6.5, 9.5);
+  doc.setFontSize(wFontInline);
+  const wTextW = doc.getTextWidth(wText);
+  const lineLen = pwPt - 2 * INSET;
+  const canInlineW = lineLen >= wTextW + GAP_PAD * 4 && phPt >= 22;
+  if (canInlineW) {
+    const dimY = py + phPt - INSET;
+    const x1 = px + INSET;
+    const x2 = px + pwPt - INSET;
+    const cx = (x1 + x2) / 2;
+    const gx1 = cx - wTextW / 2 - GAP_PAD;
+    const gx2 = cx + wTextW / 2 + GAP_PAD;
+    // Witness ticks at both ends
+    doc.line(x1, dimY - TICK, x1, dimY + TICK);
+    doc.line(x2, dimY - TICK, x2, dimY + TICK);
+    // Broken line with gap for the value
+    doc.line(x1, dimY, gx1, dimY);
+    doc.line(gx2, dimY, x2, dimY);
+    doc.text(wText, cx, dimY + wFontInline * 0.34, { align: 'center' });
+  } else if ((space.below ?? 0) > 18) {
+    // Leader callout BELOW the panel — small dot inside, line out + text.
+    doc.setFontSize(8);
+    const sx = px + pwPt / 2;
+    const sy = py + phPt - 3;
+    const ey = py + phPt + Math.min(space.below ?? 18, 14);
+    doc.circle(sx, sy - 0.5, 0.7, 'F');
+    doc.line(sx, sy, sx, ey);
+    doc.text(wText, sx, ey + 7, { align: 'center' });
+  }
 
-  // LEFT (height) — vertical dim line just inside the part's left edge.
-  const lx = px + inset;
-  doc.line(lx, py + inset, lx, py + phPt - inset);
-  doc.line(lx - tickLen / 2, py + inset, lx + tickLen / 2, py + inset);
-  doc.line(lx - tickLen / 2, py + phPt - inset, lx + tickLen / 2, py + phPt - inset);
+  // ---- HEIGHT (vertical axis along left) ---------------------------------
   const hText = fmtDim(realH, opt.units);
-  const ty = py + phPt / 2;
-  doc.text(hText, lx + 4, ty, { align: 'center', angle: 90 });
+  const hFontInline = clamp(phPt * 0.085, 6.5, 9.5);
+  doc.setFontSize(hFontInline);
+  const hTextW = doc.getTextWidth(hText);
+  const hLineLen = phPt - 2 * INSET;
+  const canInlineH = hLineLen >= hTextW + GAP_PAD * 4 && pwPt >= 22;
+  if (canInlineH) {
+    const dimX = px + INSET;
+    const y1 = py + INSET;
+    const y2 = py + phPt - INSET;
+    const cy = (y1 + y2) / 2;
+    const gy1 = cy - hTextW / 2 - GAP_PAD;
+    const gy2 = cy + hTextW / 2 + GAP_PAD;
+    doc.line(dimX - TICK, y1, dimX + TICK, y1);
+    doc.line(dimX - TICK, y2, dimX + TICK, y2);
+    doc.line(dimX, y1, dimX, gy1);
+    doc.line(dimX, gy2, dimX, y2);
+    // Rotated text in the gap
+    doc.text(hText, dimX - hFontInline * 0.34, cy, { align: 'center', angle: 90 });
+  } else if ((space.right ?? 0) > 18) {
+    // Leader callout to the RIGHT of the panel.
+    doc.setFontSize(8);
+    const sx = px + pwPt - 3;
+    const sy = py + phPt / 2;
+    const ex = px + pwPt + Math.min(space.right ?? 18, 14);
+    doc.circle(sx - 0.5, sy, 0.7, 'F');
+    doc.line(sx, sy, ex, sy);
+    doc.text(hText, ex + 4, sy + 2.6);
+  }
+
   doc.setTextColor(0);
+}
+
+function clamp(v: number, lo: number, hi: number): number {
+  return Math.max(lo, Math.min(hi, v));
 }
 
 function drawPolygon(

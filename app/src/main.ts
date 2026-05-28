@@ -79,6 +79,10 @@ const state: {
    *  Replayed on demand via the play button beside the Cut layout title.
    *  Cleared each time a new estimate kicks off. */
   lastTrialFrames: { sheets: NestSheet[]; sheetW: number; sheetL: number; margin: number; trial: number; total: number; isNewBest: boolean }[];
+  /** Per-trial metrics for the convergence plot. Captured alongside frames
+   *  during the run. `bestCuts`/`bestSheets`/`bestYield` track the running
+   *  best so the chart shows monotonic improvement. */
+  lastTrialMetrics: { i: number; cuts: number; sheets: number; yieldPct: number; bestCuts: number; bestSheets: number; bestYield: number }[];
 } = {
   result: null,
   bodies: [],
@@ -93,6 +97,7 @@ const state: {
   nonSheetCount: 0,
   collapsedFiles: new Set<string>(),
   lastTrialFrames: [],
+  lastTrialMetrics: [],
 };
 
 // --------------------------------------------------------------------------
@@ -131,6 +136,7 @@ const resultsEmpty = $('resultsEmpty');
 const resultsDetail = $('resultsDetail');
 const detailTitle = $('detailTitle');
 const replayBtn = $<HTMLButtonElement>('replayBtn');
+const convergenceChart = $('convergenceChart');
 const detailSub = $('detailSub');
 const detailSvg = $('detailSvg');
 const detailMetrics = $('detailMetrics');
@@ -817,6 +823,10 @@ nestBtn.addEventListener('click', async () => {
   // Capture trial frames for the replay button. We do NOT paint frames live
   // during the estimate (the user gets a fast 'final state' on completion).
   state.lastTrialFrames = [];
+  state.lastTrialMetrics = [];
+  let bestCutsSoFar = Infinity;
+  let bestSheetsSoFar = Infinity;
+  let bestYieldSoFar = 0;
 
   try {
     const result = await runNestAnimated(parts, {
@@ -841,6 +851,24 @@ nestBtn.addEventListener('click', async () => {
         total: info.totalTrials,
         isNewBest: info.isNewBest,
       });
+      // Per-trial metrics for the convergence chart.
+      const tCuts = info.current.reduce((a, s) => a + (s.cuts?.length ?? 0), 0);
+      const tSheets = info.current.length;
+      const tUsed = info.current.reduce((a, s) => a + s.usedArea, 0);
+      const tTotal = info.current.reduce((a, s) => a + s.sheetW * s.sheetL, 0);
+      const tYield = tTotal > 0 ? (tUsed / tTotal) * 100 : 0;
+      bestCutsSoFar = Math.min(bestCutsSoFar, tCuts);
+      bestSheetsSoFar = Math.min(bestSheetsSoFar, tSheets);
+      bestYieldSoFar = Math.max(bestYieldSoFar, tYield);
+      state.lastTrialMetrics.push({
+        i: info.trial,
+        cuts: tCuts,
+        sheets: tSheets,
+        yieldPct: tYield,
+        bestCuts: bestCutsSoFar,
+        bestSheets: bestSheetsSoFar,
+        bestYield: bestYieldSoFar,
+      });
     });
 
     state.lastNest = result;
@@ -848,6 +876,7 @@ nestBtn.addEventListener('click', async () => {
     state.lastSheet = { w: sheetW, l: sheetL, margin, kerf };
     state.currentSheetKey = firstSheetKey(result);
     renderResults();
+    renderConvergenceChart();
     replayBtn.disabled = state.lastTrialFrames.length === 0;
   } catch (err: any) {
     resultsEmpty.hidden = false;
@@ -907,6 +936,66 @@ function paintTrialPreview(sheets: NestSheet[], sheetW: number, sheetL: number, 
     entry.appendChild(svgWrap);
     detailSvg.appendChild(entry);
   }
+}
+
+/**
+ * Render an SVG line chart of the optimiser's per-iteration metrics:
+ * - Yield % (running best)
+ * - Sheets used (running best)
+ * - Total cuts (running best)
+ * X axis = trial number. Drawn into #convergenceChart.
+ */
+function renderConvergenceChart() {
+  const data = state.lastTrialMetrics;
+  if (data.length === 0) { convergenceChart.hidden = true; return; }
+  convergenceChart.hidden = false;
+  const W = 880, H = 140, PAD_L = 36, PAD_R = 12, PAD_T = 18, PAD_B = 22;
+  const plotW = W - PAD_L - PAD_R;
+  const plotH = H - PAD_T - PAD_B;
+  const N = data.length;
+  const xs = (i: number) => PAD_L + (i / Math.max(1, N - 1)) * plotW;
+
+  // Normalise each series into [0, 1] within the plot.
+  const maxCuts = Math.max(...data.map((d) => d.cuts));
+  const maxSheets = Math.max(...data.map((d) => d.sheets));
+  const yScale = (v: number, lo: number, hi: number) =>
+    PAD_T + plotH - ((v - lo) / Math.max(1e-6, hi - lo)) * plotH;
+  const path = (values: number[], lo: number, hi: number) => {
+    let d = '';
+    for (let i = 0; i < values.length; i++) {
+      d += (i === 0 ? 'M' : 'L') + xs(i).toFixed(1) + ',' + yScale(values[i], lo, hi).toFixed(1);
+    }
+    return d;
+  };
+
+  // Series — best-so-far (monotonic improvement)
+  const yieldPath = path(data.map((d) => d.bestYield), 0, 100);
+  const sheetsPath = path(data.map((d) => d.bestSheets), 0, maxSheets);
+  const cutsPath = path(data.map((d) => d.bestCuts), 0, maxCuts);
+
+  // Final values for legend
+  const last = data[data.length - 1];
+  const trialLabel = (i: number) => String(i + 1);
+
+  convergenceChart.innerHTML = `
+    <div class="conv-header">
+      <span class="conv-title">Optimiser convergence (${N} trials)</span>
+      <span class="conv-legend">
+        <span class="ll yield">Yield ${last.bestYield.toFixed(1)}%</span>
+        <span class="ll sheets">Sheets ${last.bestSheets}</span>
+        <span class="ll cuts">Cuts ${last.bestCuts}</span>
+      </span>
+    </div>
+    <svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="xMidYMid meet" class="conv-svg">
+      <rect x="${PAD_L}" y="${PAD_T}" width="${plotW}" height="${plotH}" class="conv-plot-bg"/>
+      <line x1="${PAD_L}" y1="${PAD_T + plotH}" x2="${PAD_L + plotW}" y2="${PAD_T + plotH}" class="conv-axis"/>
+      <line x1="${PAD_L}" y1="${PAD_T}" x2="${PAD_L}" y2="${PAD_T + plotH}" class="conv-axis"/>
+      <path d="${yieldPath}" class="conv-line yield" fill="none"/>
+      <path d="${sheetsPath}" class="conv-line sheets" fill="none"/>
+      <path d="${cutsPath}" class="conv-line cuts" fill="none"/>
+      <text x="${PAD_L}" y="${H - 6}" class="conv-label">trial 1</text>
+      <text x="${PAD_L + plotW}" y="${H - 6}" class="conv-label" text-anchor="end">trial ${trialLabel(N - 1)}</text>
+    </svg>`;
 }
 
 function sumYield(sheets: NestSheet[]): number {

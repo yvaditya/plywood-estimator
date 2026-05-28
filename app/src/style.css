@@ -1152,6 +1152,33 @@ input[type="checkbox"]:focus-visible { box-shadow: 0 0 0 2px var(--accent-ring);
   background: transparent;
 }
 
+/* Optimiser convergence chart — sits above the stacked sheets */
+.convergence-chart { margin-bottom: 14px; }
+.conv-header {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 4px;
+}
+.conv-title { font-size: 12px; color: var(--muted); font-weight: 600; letter-spacing: 0.02em; }
+.conv-legend { display: inline-flex; gap: 12px; font-size: 11px; font-variant-numeric: tabular-nums; color: var(--muted); }
+.conv-legend .ll { display: inline-flex; align-items: center; gap: 4px; }
+.conv-legend .ll::before {
+  content: ''; display: inline-block; width: 10px; height: 2px; border-radius: 1px;
+}
+.conv-legend .yield::before { background: #38B477; }
+.conv-legend .sheets::before { background: #2383E2; }
+.conv-legend .cuts::before { background: #E55050; }
+.conv-svg { width: 100%; height: auto; max-height: 160px; display: block; }
+.conv-plot-bg { fill: var(--hover-wash, #F7F6F3); }
+.conv-axis { stroke: var(--line, #E5E5E5); stroke-width: 0.8; }
+.conv-line { stroke-width: 1.4; }
+.conv-line.yield { stroke: #38B477; }
+.conv-line.sheets { stroke: #2383E2; stroke-dasharray: 3 2; }
+.conv-line.cuts { stroke: #E55050; stroke-dasharray: 5 3; }
+.conv-label { fill: var(--muted); font-size: 10px; font-family: var(--font-mono, monospace); }
+
 /* Icon-only ghost buttons (replay, etc.) */
 .ghost.icon-only {
   padding: 4px 7px;
