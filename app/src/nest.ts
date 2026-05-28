@@ -23,9 +23,9 @@
  */
 
 import type { Vec2 } from './geometry';
-import { packMulti, type PackInput, type PackPlacement, type CutStrategy, type Cut } from './packRect';
+import { packMulti, packMultiAnimated, type PackInput, type PackPlacement, type CutStrategy, type Cut, type PackProgress } from './packRect';
 
-export type { CutStrategy, Cut };
+export type { CutStrategy, Cut, PackProgress };
 
 export type GrainLock = 'free' | 'length' | 'width';
 export type RotationMode = 'lock' | 'flip90' | 'any';
@@ -318,6 +318,135 @@ export function runNest(parts: NestPart[], config: NestConfig): NestResult {
     totalSheets,
     totalPartArea,
     totalSheetArea,
+    yield: totalSheetArea > 0 ? totalPartArea / totalSheetArea : 0,
+  };
+}
+
+/**
+ * Animated/observable variant of `runNest`. Runs each thickness bucket
+ * through `packMultiAnimated` so the optimiser yields back to the browser
+ * between trials. `onTrial` is invoked with a per-trial preview of the
+ * current and best-so-far layouts so the UI can animate panel shuffling
+ * at the requested frame rate.
+ */
+export async function runNestAnimated(
+  parts: NestPart[],
+  config: NestConfig,
+  onTrial: (info: {
+    groupIdx: number;
+    totalGroups: number;
+    trial: number;
+    totalTrials: number;
+    current: NestSheet[];
+    best: NestSheet[];
+    isNewBest: boolean;
+    sheetW: number;
+    sheetL: number;
+  }) => void | Promise<void>,
+): Promise<NestResult> {
+  const { sheetW, sheetL, margin, kerf } = config;
+  const usableW = sheetW - 2 * margin;
+  const usableL = sheetL - 2 * margin;
+  if (usableW <= 0 || usableL <= 0) throw new Error('Sheet margin leaves no usable area.');
+  const restarts = Math.max(4, config.restarts ?? 8);
+
+  const buckets = new Map<number, NestPart[]>();
+  for (const p of parts) {
+    const k = Math.round(p.thickness * 2) / 2;
+    if (!buckets.has(k)) buckets.set(k, []);
+    buckets.get(k)!.push(p);
+  }
+  const thicknesses = Array.from(buckets.keys()).sort((a, b) => a - b);
+
+  const groups: ThicknessGroup[] = [];
+  let totalPartArea = 0;
+  let totalSheetArea = 0;
+  let totalSheets = 0;
+  const totalGroups = thicknesses.length;
+
+  for (let gi = 0; gi < totalGroups; gi++) {
+    const t = thicknesses[gi];
+    const bucket = buckets.get(t)!;
+    const items: PackInput[] = [];
+    const meta = new Map<string, InstanceMeta>();
+    for (const p of bucket) {
+      const foot = buildFootprint(p);
+      const policy = rotationPolicy(p.grain, p.rotation, foot.w0, foot.h0);
+      const allowFlip = (config.cutStrategy === 'guillotine' && p.grain === 'free')
+        ? true
+        : policy.allowFlip;
+      for (let inst = 1; inst <= p.qty; inst++) {
+        const id = `${p.id}#${inst}`;
+        const w = policy.preRotate === 0 ? foot.w0 : foot.w90;
+        const h = policy.preRotate === 0 ? foot.h0 : foot.h90;
+        items.push({ id, w, h, allowRotate: allowFlip });
+        meta.set(id, { part: p, foot, policy, instance: inst });
+      }
+    }
+
+    // Convert a packMulti result into the per-group NestSheet[] the UI uses.
+    const winnerSheetW = sheetL;  // landscape locked (see runNest)
+    const winnerSheetL = sheetW;
+    const toNestSheets = (winner: { sheets: { placements: PackPlacement[]; usedArea: number; largestFree: { w: number; h: number } | null; cuts: Cut[] }[] }): NestSheet[] =>
+      winner.sheets.map((ps, idx) => {
+        const sh: NestSheet = {
+          index: idx + 1,
+          globalIndex: 0,
+          thickness: t,
+          parts: ps.placements.map((pl) => placementToPart(pl, meta, margin)),
+          usedArea: ps.usedArea,
+          largestFree: ps.largestFree,
+          sheetW: winnerSheetW,
+          sheetL: winnerSheetL,
+          cuts: ps.cuts.map((c) => ({
+            parentX: c.parentX + margin,
+            parentY: c.parentY + margin,
+            parentW: c.parentW,
+            parentH: c.parentH,
+            axis: c.axis,
+            distance: c.distance,
+            depth: c.depth,
+          })),
+        };
+        annotatePlacedParts(sh);
+        return sh;
+      });
+
+    const winner = await packMultiAnimated(
+      { items, sheetW: usableL, sheetH: usableW, kerf, cutStrategy: config.cutStrategy },
+      restarts,
+      async (p) => {
+        await onTrial({
+          groupIdx: gi,
+          totalGroups,
+          trial: p.i,
+          totalTrials: p.total,
+          current: toNestSheets(p.current),
+          best: toNestSheets(p.best),
+          isNewBest: p.isNewBest,
+          sheetW: winnerSheetW,
+          sheetL: winnerSheetL,
+        });
+      },
+    );
+
+    const sheets: NestSheet[] = toNestSheets(winner);
+    const unplaced = winner.unplaced.map((u) => {
+      const m = meta.get(u.id)!;
+      return { partId: m.part.id, partName: m.part.name, instance: m.instance };
+    });
+    const groupSheetArea = sheets.length * winnerSheetW * winnerSheetL;
+    const groupPartArea = sheets.reduce((acc, s) => acc + s.usedArea, 0);
+    totalSheetArea += groupSheetArea;
+    totalPartArea += groupPartArea;
+    totalSheets += sheets.length;
+    groups.push({ thickness: t, sheets, unplaced });
+  }
+
+  let gIdx = 1;
+  for (const g of groups) for (const s of g.sheets) s.globalIndex = gIdx++;
+  return {
+    groups, totalSheets, totalPartArea, totalSheetArea,
     yield: totalSheetArea > 0 ? totalPartArea / totalSheetArea : 0,
   };
 }

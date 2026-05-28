@@ -19,6 +19,7 @@ import { Viewer, bodyColor } from './viewer';
 import { analyzeBody, type BodyAnalysis } from './geometry';
 import {
   runNest,
+  runNestAnimated,
   type GrainLock,
   type RotationMode,
   type NestPart,
@@ -777,7 +778,7 @@ renderShoppingList();
 // --------------------------------------------------------------------------
 // Nesting + results
 // --------------------------------------------------------------------------
-nestBtn.addEventListener('click', () => {
+nestBtn.addEventListener('click', async () => {
   const selected = state.bodies.filter((b) => b.selected);
   if (selected.length === 0) return;
   const sheetW = toMm(parseFloat(sheetWInput.value), state.units);
@@ -800,33 +801,92 @@ nestBtn.addEventListener('click', () => {
 
   nestBtn.disabled = true;
   nestBtn.textContent = 'Estimating…';
-  resultsEmpty.textContent = 'Optimizing layout…';
-  resultsEmpty.hidden = false;
-  resultsDetail.hidden = true;
+  resultsEmpty.hidden = true;
+  resultsDetail.hidden = false;
+  downloadDxfBtn.disabled = true;
+  downloadPdfBtn.disabled = true;
 
-  setTimeout(() => {
-    try {
-      const result = runNest(parts, {
-        sheetW, sheetL, margin, kerf,
-        resolution: estimateResolution(sheetW, sheetL),
-        restarts,
-        cutStrategy: (cutStrategySelect.value as 'free' | 'guillotine') || 'free',
-      });
-      state.lastNest = result;
-      state.partLabels = assignPartLabels(result);
-      state.lastSheet = { w: sheetW, l: sheetL, margin, kerf };
-      const firstKey = firstSheetKey(result);
-      state.currentSheetKey = firstKey;
-      renderResults();
-    } catch (err: any) {
-      resultsEmpty.textContent = err.message || 'Nesting failed.';
-      console.error(err);
-    } finally {
-      nestBtn.disabled = false;
-      nestBtn.textContent = 'Estimate cut sheets';
-    }
-  }, 30);
+  // 15 fps target → 1000/15 ≈ 67ms per frame. We can't slow packOne down, but
+  // we can SHOW frames at a steady pace by only rendering on the next frame
+  // tick. Below the optimiser ticks faster than 15fps, the UI just shows the
+  // most recent state; above, it limits paint to one frame per ~67ms.
+  const FRAME_MS = 1000 / 15;
+  let lastPaint = 0;
+  detailTitle.textContent = 'Optimising…';
+  detailSub.textContent = '';
+  detailSvg.innerHTML = '';
+
+  try {
+    const result = await runNestAnimated(parts, {
+      sheetW, sheetL, margin, kerf,
+      resolution: estimateResolution(sheetW, sheetL),
+      restarts,
+      cutStrategy: (cutStrategySelect.value as 'free' | 'guillotine' | 'save-last') || 'free',
+    }, async (info) => {
+      const now = performance.now();
+      // Always update text counters so the user sees granular progress.
+      const pct = ((info.trial + 1) / info.totalTrials) * 100;
+      const yieldNow = sumYield(info.best);
+      detailTitle.textContent = `Optimising · trial ${info.trial + 1} / ${info.totalTrials}`;
+      detailSub.textContent =
+        `Group ${info.groupIdx + 1} / ${info.totalGroups} · best ${info.best.length} sheet${info.best.length === 1 ? '' : 's'} · ${(yieldNow * 100).toFixed(1)}% yield`;
+      nestBtn.textContent = `Trial ${info.trial + 1}/${info.totalTrials} · ${pct.toFixed(0)}%`;
+      // Throttle the heavy SVG paint to 15fps OR repaint immediately on a
+      // new best so the user always sees the latest improvement.
+      if (info.isNewBest || now - lastPaint >= FRAME_MS) {
+        lastPaint = now;
+        paintTrialPreview(info.current, info.sheetW, info.sheetL, margin);
+        await new Promise<void>((r) => requestAnimationFrame(() => r()));
+      }
+    });
+
+    state.lastNest = result;
+    state.partLabels = assignPartLabels(result);
+    state.lastSheet = { w: sheetW, l: sheetL, margin, kerf };
+    state.currentSheetKey = firstSheetKey(result);
+    renderResults();
+  } catch (err: any) {
+    resultsEmpty.hidden = false;
+    resultsDetail.hidden = true;
+    resultsEmpty.textContent = err.message || 'Nesting failed.';
+    console.error(err);
+  } finally {
+    nestBtn.disabled = false;
+    nestBtn.textContent = 'Estimate cut sheets';
+  }
 });
+
+/** Render a quick stacked preview of trial sheets during animation. */
+function paintTrialPreview(sheets: NestSheet[], sheetW: number, sheetL: number, margin: number) {
+  detailSvg.innerHTML = '';
+  for (let i = 0; i < sheets.length; i++) {
+    const sh = sheets[i];
+    const entry = document.createElement('section');
+    entry.className = 'sheet-entry';
+    const head = document.createElement('header');
+    head.className = 'sheet-entry-header';
+    const fill = sh.parts.length > 0 ? (sh.usedArea / (sheetW * sheetL)) * 100 : 0;
+    head.innerHTML = `
+      <div class="sheet-entry-title">Sheet ${i + 1}</div>
+      <div class="sheet-entry-meta">${sh.parts.length} parts · <strong>${fill.toFixed(1)}%</strong> fill</div>`;
+    entry.appendChild(head);
+    const svgWrap = document.createElement('div');
+    svgWrap.className = 'sheet-entry-svg';
+    svgWrap.appendChild(buildSheetSvg(sh, sheetW, sheetL, margin, false));
+    entry.appendChild(svgWrap);
+    detailSvg.appendChild(entry);
+  }
+}
+
+function sumYield(sheets: NestSheet[]): number {
+  let used = 0;
+  let total = 0;
+  for (const s of sheets) {
+    used += s.usedArea;
+    total += s.sheetW * s.sheetL;
+  }
+  return total > 0 ? used / total : 0;
+}
 
 function estimateResolution(sheetW: number, sheetL: number): number {
   const longer = Math.max(sheetW, sheetL);

@@ -838,6 +838,77 @@ export function packMulti(job: PackJob, restarts: number): MultiSheetResult {
   return result;
 }
 
+export interface PackProgress {
+  /** 0-based iteration index. */
+  i: number;
+  /** Total iterations the optimiser will run. */
+  total: number;
+  /** The layout produced by THIS iteration. */
+  current: MultiSheetResult;
+  /** The best layout seen so far. */
+  best: MultiSheetResult;
+  /** True iff this iteration BECAME the new best. */
+  isNewBest: boolean;
+}
+
+/**
+ * Async, observable multi-restart optimiser. Same search space + objective
+ * as `packMulti`, but yields control back to the browser between batches so
+ * the UI can animate panel shuffling, update a progress bar, etc. Calls
+ * `onProgress` per trial and yields with `await`.
+ */
+export async function packMultiAnimated(
+  job: PackJob,
+  restarts: number,
+  onProgress: (p: PackProgress) => void | Promise<void>,
+  yieldEvery = 1,
+): Promise<MultiSheetResult> {
+  const effectiveStrategy = job.cutStrategy === 'save-last' ? 'free' : job.cutStrategy;
+  const optJob: PackJob = effectiveStrategy === job.cutStrategy ? job : { ...job, cutStrategy: effectiveStrategy };
+  const heuristics: Heuristic[] = ['BSSF', 'BLSF', 'BAF', 'BL'];
+  const baseline = job.items.slice().sort((a, b) => b.w * b.h - a.w * a.h);
+  const bySide = job.items.slice().sort((a, b) => Math.max(b.w, b.h) - Math.max(a.w, a.h));
+  const objectiveStrategy: CutStrategy = job.cutStrategy ?? 'free';
+
+  // Build the trial schedule eagerly so we know `total` for progress reports.
+  type Trial = { order: PackInput[]; heur: Heuristic };
+  const trials: Trial[] = [];
+  for (const h of heuristics) trials.push({ order: baseline, heur: h });
+  for (const h of heuristics) trials.push({ order: bySide,  heur: h });
+  // Phase 3: random shuffles (deterministic seed for reproducibility).
+  let seed = 0x9e3779b1;
+  const rand = () => { seed = (seed * 1664525 + 1013904223) >>> 0; return seed / 0xffffffff; };
+  const phase3 = Math.max(0, restarts - heuristics.length * 2);
+  for (let i = 0; i < phase3; i++) {
+    const shuffled = baseline.slice();
+    for (let k = shuffled.length - 1; k > 0; k--) {
+      const j = Math.floor(rand() * (k + 1));
+      [shuffled[k], shuffled[j]] = [shuffled[j], shuffled[k]];
+    }
+    trials.push({ order: shuffled, heur: heuristics[i % heuristics.length] });
+  }
+
+  const total = trials.length;
+  let best: MultiSheetResult | null = null;
+  for (let i = 0; i < total; i++) {
+    const t = trials[i];
+    const current = packOne(optJob, t.heur, t.order);
+    const isNewBest = !best || isBetter(current, best, objectiveStrategy);
+    if (isNewBest) best = current;
+    await onProgress({ i, total, current, best: best!, isNewBest });
+    if (i % yieldEvery === 0) await new Promise<void>((r) => setTimeout(r, 0));
+  }
+
+  const result = best!;
+  if (job.cutStrategy === 'save-last' && result.sheets.length > 0) {
+    const meta = new Map<string, { id: string; w: number; h: number; allowRotate: boolean }>();
+    for (const it of job.items) meta.set(it.id, { id: it.id, w: it.w, h: it.h, allowRotate: it.allowRotate });
+    const repacked = repackLastSheetCorner(result.sheets[result.sheets.length - 1], job, meta);
+    if (repacked) result.sheets[result.sheets.length - 1] = repacked;
+  }
+  return result;
+}
+
 /**
  * Strategy-aware "is A better than B" comparator. Each strategy has a
  * distinct OBJECTIVE the multi-restart optimiser should actually optimise
