@@ -2,6 +2,7 @@ app/node_modules
 app/dist
 app/.vite
 app/_screenshots
+tests/_output
 .vite
 .claude/
 .DS_Store

@@ -105,6 +105,7 @@ export class Viewer {
 
   private root = new THREE.Group();
   private grainGroup = new THREE.Group();
+  private nonSheetGroup = new THREE.Group();
   private grainArrows = new Map<number, THREE.Group>();
   private grainConfigs = new Map<number, GrainArrowConfig>();
   private grainStates = new Map<number, GrainLock>();
@@ -217,6 +218,7 @@ export class Viewer {
 
     this.scene.add(this.root);
     this.scene.add(this.grainGroup);
+    this.scene.add(this.nonSheetGroup);
 
     // ----- Post-processing chain -------------------------------------------
     // We render into a HalfFloat target so AgX has headroom and the outline
@@ -460,7 +462,7 @@ export class Viewer {
     const mesh = new THREE.Mesh(geom, mat);
     mesh.castShadow = false;
     mesh.receiveShadow = false;
-    this.root.add(mesh);
+    this.nonSheetGroup.add(mesh);
 
     // Dashed edge outline at sharp angles. LineDashedMaterial needs
     // computeLineDistances() after geometry creation.
@@ -477,7 +479,7 @@ export class Viewer {
     );
     edges.computeLineDistances();
     edges.renderOrder = 3;
-    this.root.add(edges);
+    this.nonSheetGroup.add(edges);
   }
 
   /** Frame everything currently loaded and refresh selection colors. */
@@ -616,12 +618,15 @@ export class Viewer {
       visBackup.set(b.id, b.mesh.visible);
       b.mesh.visible = visibleIds.has(b.id);
     }
-    // Hide non-sheet bodies and grain arrows during a clean per-cabinet shot
+    // Hide non-sheet bodies (red ghost meshes for legs, dowels, etc.) and
+    // grain arrows during a clean per-cabinet snapshot.
     const grainBackup: { obj: THREE.Object3D; vis: boolean }[] = [];
     this.grainGroup.children.forEach((c) => {
       grainBackup.push({ obj: c, vis: c.visible });
       c.visible = false;
     });
+    const nonSheetVisBackup = this.nonSheetGroup.visible;
+    this.nonSheetGroup.visible = false;
 
     // 2. Refit camera + shadow camera to the visible bodies
     const cameraBackup = {
@@ -676,6 +681,7 @@ export class Viewer {
       if (p) b.mesh.position.copy(p);
     }
     for (const g of grainBackup) g.obj.visible = g.vis;
+    this.nonSheetGroup.visible = nonSheetVisBackup;
     this.camera.position.copy(cameraBackup.pos);
     this.controls.target.copy(cameraBackup.target);
     this.camera.near = cameraBackup.near;
