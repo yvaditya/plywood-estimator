@@ -669,13 +669,35 @@ export class Viewer {
       this.controls.update();
     }
 
-    // 3. Optionally explode the visible subset
+    // 3. Optionally explode the visible subset. For each body we explode we
+    //    also drop a TRANSPARENT "ghost" clone at the body's rest position —
+    //    classic IKEA convention showing where the panel will land.
     const explodeBackup = new Map<number, THREE.Vector3>();
+    const ghosts: THREE.Mesh[] = [];
     if (directions) {
       for (const b of this.bodies) {
         if (!visibleIds.has(b.id)) continue;
         const dir = directions.get(b.id);
         if (!dir) continue;
+        // Ghost = same geometry, faintly transparent — placed at the body's
+        // CURRENT (rest) position before we move the original out.
+        const ghostMat = new THREE.MeshBasicMaterial({
+          color: (b.mesh.material as THREE.MeshPhysicalMaterial).color,
+          transparent: true,
+          opacity: 0.15,
+          depthWrite: false,
+          side: THREE.DoubleSide,
+        });
+        const ghost = new THREE.Mesh(b.mesh.geometry, ghostMat);
+        ghost.position.copy(b.mesh.position);
+        ghost.rotation.copy(b.mesh.rotation);
+        ghost.scale.copy(b.mesh.scale);
+        ghost.castShadow = false;
+        ghost.receiveShadow = false;
+        ghost.renderOrder = 2;
+        this.root.add(ghost);
+        ghosts.push(ghost);
+        // Now actually explode the original.
         explodeBackup.set(b.id, b.mesh.position.clone());
         b.mesh.position.x += dir[0] * distance;
         b.mesh.position.y += dir[1] * distance;
@@ -688,7 +710,11 @@ export class Viewer {
     const c = this.renderer.domElement;
     const out = { dataUrl: c.toDataURL('image/png'), width: c.width, height: c.height };
 
-    // 5. Restore EVERYTHING
+    // 5. Restore EVERYTHING — remove ghosts, restore positions and visibility.
+    for (const g of ghosts) {
+      this.root.remove(g);
+      (g.material as THREE.Material).dispose();
+    }
     for (const b of this.bodies) {
       const v = visBackup.get(b.id);
       if (v !== undefined) b.mesh.visible = v;

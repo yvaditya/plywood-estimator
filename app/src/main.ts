@@ -1235,11 +1235,10 @@ downloadPdfBtn.addEventListener('click', () => {
   // each STEP file is treated as a unique cabinet / furniture piece.
   // Group selected sheet-good bodies by their fileTag, then for each
   // cabinet generate (1) assembled snapshot of just its bodies and
-  // (2) exploded snapshot pulling each panel along its faceNormal.
-  const directions = new Map<number, [number, number, number]>();
-  for (const b of state.bodies) {
-    directions.set(b.id, b.analysis.faceNormal);
-  }
+  // (2) exploded snapshot pulling each panel along an OUTWARD-FROM-CENTER
+  // direction. Panel face normals are unreliable here (a shelf normal can
+  // point INTO another panel); using outward-from-center guarantees the
+  // explode direction is clear of the rest of the assembly.
   const explodeDist = Math.max(20, viewer.modelDiagonal() * 0.28);
 
   const byFile = new Map<string, BodyState[]>();
@@ -1247,6 +1246,30 @@ downloadPdfBtn.addEventListener('click', () => {
     const arr = byFile.get(b.fileTag) ?? [];
     arr.push(b);
     byFile.set(b.fileTag, arr);
+  }
+
+  // Per-cabinet center → per-body outward direction. Falls back to faceNormal
+  // for the rare case where the body sits AT the cabinet center.
+  const directions = new Map<number, [number, number, number]>();
+  for (const bodies of byFile.values()) {
+    let cx = 0, cy = 0, cz = 0;
+    for (const b of bodies) {
+      cx += b.analysis.centerWorld[0];
+      cy += b.analysis.centerWorld[1];
+      cz += b.analysis.centerWorld[2];
+    }
+    cx /= bodies.length; cy /= bodies.length; cz /= bodies.length;
+    for (const b of bodies) {
+      const dx = b.analysis.centerWorld[0] - cx;
+      const dy = b.analysis.centerWorld[1] - cy;
+      const dz = b.analysis.centerWorld[2] - cz;
+      const len = Math.hypot(dx, dy, dz);
+      if (len > 1e-3) {
+        directions.set(b.id, [dx / len, dy / len, dz / len]);
+      } else {
+        directions.set(b.id, b.analysis.faceNormal);
+      }
+    }
   }
 
   // Build per-panel id ("3a") from the lastNest so PDF panel ids match.
