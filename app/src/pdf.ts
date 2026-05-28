@@ -784,17 +784,23 @@ function drawCutsForSingleSheet(
 
   const cardGutter = 14;
   const cardCaptionH = 26;
-  // Bigger cards per the user — was 4–6 cols, now 3–4 so each card has room
-  // to show the cut clearly. On a 16:9 widescreen page this gives ~290pt
-  // cards (vs ~168pt before).
-  const cols = PAGE_W > 1100 ? 4 : 3;
-  const innerW = PAGE_W - 2 * PAGE_PAD;
-  const cardW = (innerW - cardGutter * (cols - 1)) / cols;
   const sheetAspect = sc.sheetL / sc.sheetW;
+  const innerW = PAGE_W - 2 * PAGE_PAD;
+  // Tightened top: the cut-sequence page only needs the section header
+  // (drawn at y = PAGE_PAD+10). That leaves more vertical room for big cards.
+  const TOP = PAGE_PAD + 14;
+  const BOTTOM = PAGE_H - PAGE_PAD;
+  const availableH = BOTTOM - TOP;
+  // Pick the smallest col count that keeps each card from overflowing the
+  // page vertically — gives the BIGGEST cards that still fit at least one
+  // row. For shorter (wider) sheets the result is fewer, bigger cards;
+  // for tall (portrait) sheets we end up with smaller cards but they fit.
+  const maxCardW = (availableH - cardCaptionH) / sheetAspect;
+  const minCols = Math.ceil((innerW + cardGutter) / (maxCardW + cardGutter));
+  const cols = Math.max(3, minCols);
+  const cardW = (innerW - cardGutter * (cols - 1)) / cols;
   const cardDiagH = cardW * sheetAspect;
   const cardH = cardDiagH + cardCaptionH;
-  const TOP = PAGE_PAD + 28;
-  const BOTTOM = PAGE_H - PAGE_PAD;
 
   // Header
   doc.setFont('helvetica', 'bold');
@@ -861,13 +867,8 @@ function drawCabinetAssembly(
   const rightW = PAGE_W - PAGE_PAD - rightX;
   const diagramH = bottom - top;
 
-  // Left: assembled snapshot
-  drawSnapshotPanel(doc, cab.assembled, PAGE_PAD, top, leftW, diagramH);
-  doc.setFont('helvetica', 'bold');
-  doc.setFontSize(9.5);
-  doc.setTextColor(120);
-  doc.text('ASSEMBLED', PAGE_PAD, top - 6);
-  doc.setTextColor(0);
+  // Left: assembled snapshot (no "ASSEMBLED" label — the image speaks for itself)
+  drawSnapshotPanel(doc, cab.assembled, PAGE_PAD, top, leftW, diagramH, { frameless: true });
 
   // Right: parts inventory TABLE
   drawCabinetPartsTable(doc, cab, opt, rightX, top, rightW, diagramH);
@@ -887,12 +888,6 @@ function drawCabinetPartsTable(
   w: number,
   h: number,
 ) {
-  doc.setFont('helvetica', 'bold');
-  doc.setFontSize(9.5);
-  doc.setTextColor(120);
-  doc.text('PARTS', x, y - 6);
-  doc.setTextColor(0);
-
   // Aggregate panels by id (panels is preferred; fall back to partIds)
   type Row = { id: string; name: string; longMm: number; shortMm: number; thickness: number; qty: number; color: string };
   const rowsById = new Map<string, Row>();
@@ -1384,48 +1379,51 @@ function drawPartCard(
   h: number,
   opt: PdfOptions,
 ) {
-  // Card border (hairline, Notion-style)
-  doc.setDrawColor(230);
-  doc.setLineWidth(0.6);
-  doc.rect(x, y, w, h, 'S');
-
   // Letter — big bold in top-left corner
   doc.setFont('helvetica', 'bold');
   doc.setFontSize(32);
   doc.setTextColor(40);
-  doc.text(p.letter, x + 12, y + 32);
+  doc.text(p.letter, x + 4, y + 30);
 
-  // Qty pill top-right
-  doc.setFont('helvetica', 'bold');
-  doc.setFontSize(11);
-  doc.setTextColor(120);
-  doc.text(`× ${p.totalQty}`, x + w - 12, y + 18, { align: 'right' });
+  // Quantity — only when > 1; subtle gray.
+  if (p.totalQty > 1) {
+    doc.setFont('helvetica', 'normal');
+    doc.setFontSize(10);
+    doc.setTextColor(140);
+    doc.text(`× ${p.totalQty}`, x + w - 4, y + 14, { align: 'right' });
+  }
 
-  // Silhouette — scaled to fit the lower-right of the card
-  const silX = x + 60;
-  const silY = y + 12;
-  const silMaxW = w - 60 - 14;
-  const silMaxH = h - 60;
+  // Silhouette — uses the panel's color at low opacity so the card stays
+  // light. Border in a darker shade of the same color for context.
+  const silX = x + 54;
+  const silY = y + 8;
+  const silMaxW = w - 54 - 8;
+  const silMaxH = h - 52;
   const scale = Math.min(silMaxW / p.length, silMaxH / p.width);
   const drawW = p.length * scale;
   const drawH = p.width * scale;
-  doc.setDrawColor(180);
+  const [pr, pg, pb] = hexToRgb(p.color);
+  const GS = (doc as any).GState;
+  if (GS) (doc as any).setGState(new GS({ opacity: 0.40 }));
+  doc.setFillColor(pr, pg, pb);
+  doc.rect(silX, silY, drawW, drawH, 'F');
+  if (GS) (doc as any).setGState(new GS({ opacity: 1 }));
+  doc.setDrawColor(Math.floor(pr * 0.55), Math.floor(pg * 0.55), Math.floor(pb * 0.55));
   doc.setLineWidth(0.5);
-  doc.setFillColor(248, 245, 230);
-  doc.rect(silX, silY, drawW, drawH, 'FD');
+  doc.rect(silX, silY, drawW, drawH, 'S');
 
-  // Name + dims at the bottom
+  // Name + dims at the bottom — no separator border, just text on the card.
   doc.setFont('helvetica', 'normal');
-  doc.setFontSize(10);
-  doc.setTextColor(60);
+  doc.setFontSize(9.5);
+  doc.setTextColor(110);
   const name = p.partName.length > 36 ? p.partName.slice(0, 33) + '…' : p.partName;
-  doc.text(name, x + 12, y + h - 20);
+  doc.text(name, x + 4, y + h - 18);
   doc.setFont('helvetica', 'bold');
-  doc.setFontSize(11);
-  doc.setTextColor(20);
+  doc.setFontSize(10.5);
+  doc.setTextColor(25);
   doc.text(
     `${fmtDim(p.length, opt.units)} × ${fmtDim(p.width, opt.units)} × ${fmtDim(p.thickness, opt.units)}`,
-    x + 12, y + h - 8,
+    x + 4, y + h - 4,
   );
 }
 

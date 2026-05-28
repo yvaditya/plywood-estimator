@@ -1305,14 +1305,15 @@ downloadPdfBtn.addEventListener('click', () => {
   let assembledPng: string | undefined;
   let explodedPng: string | undefined;
   try {
-    // Render snapshots at a fixed high-resolution wide aspect for sharp PDF
-    // embedding regardless of the user's window size. 1600x900 ≈ 16:9 which
-    // matches the widescreen PDF + the IKEA step cards (each ~2:1).
-    const SHOT = { w: 1600, h: 900 };
+    // Two render targets — cover gets a near-square aspect to fill the
+    // half-page snapshot box; IKEA step cards are wide (2:1-ish) and use a
+    // 16:9 target so the cabinet fills the card horizontally.
+    const SHOT_COVER = { w: 1200, h: 1100 };
+    const SHOT_STEP  = { w: 1600, h: 900 };
     for (const [tag, bodies] of byFile) {
       const visibleIds = new Set(bodies.map((b) => b.id));
-      const assembled = viewer.snapshotFiltered(visibleIds, null, 0, undefined, SHOT);
-      const exploded = viewer.snapshotFiltered(visibleIds, directions, explodeDist, undefined, SHOT);
+      const assembled = viewer.snapshotFiltered(visibleIds, null, 0, undefined, SHOT_COVER);
+      const exploded = viewer.snapshotFiltered(visibleIds, directions, explodeDist, undefined, SHOT_COVER);
       const ids: string[] = [];
       for (const b of bodies) {
         const arr = idByBodyPartId.get(String(b.id));
@@ -1337,7 +1338,7 @@ downloadPdfBtn.addEventListener('click', () => {
         const stepDirs = new Map<number, [number, number, number]>();
         const dir = directions.get(bodies[i].id);
         if (dir) stepDirs.set(bodies[i].id, dir);
-        const img = viewer.snapshotFiltered(installed, stepDirs, stepDist, visibleIds, SHOT);
+        const img = viewer.snapshotFiltered(installed, stepDirs, stepDist, visibleIds, SHOT_STEP);
         steps.push(img);
         const arr = idByBodyPartId.get(String(bodies[i].id)) ?? [];
         stepPanelIds.push(arr[0] ?? `body ${bodies[i].id}`);
@@ -1346,7 +1347,7 @@ downloadPdfBtn.addEventListener('click', () => {
       // exploded. Reuses the same camera so it visually matches the previous
       // step but with the last panel settled.
       if (bodies.length > 0) {
-        const doneImg = viewer.snapshotFiltered(visibleIds, null, 0, visibleIds, SHOT);
+        const doneImg = viewer.snapshotFiltered(visibleIds, null, 0, visibleIds, SHOT_STEP);
         steps.push(doneImg);
         stepPanelIds.push('done');
       }

@@ -19,6 +19,8 @@ export interface PartLabel {
   length: number;       // mm
   width: number;        // mm
   totalQty: number;     // total instances across the whole job
+  /** Hex color matching the 3D viewer + per-sheet layout panel for this id. */
+  color: string;
 }
 
 export interface CutStep {
@@ -79,6 +81,7 @@ export function assignPartLabels(result: NestResult): Map<string, PartLabel> {
             length: Math.max(p.w, p.h),
             width: Math.min(p.w, p.h),
             totalQty: 1,
+            color: p.color,
           });
         }
       }
