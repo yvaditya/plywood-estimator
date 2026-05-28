@@ -24,12 +24,16 @@ export interface Rect { x: number; y: number; w: number; h: number }
 export type Heuristic = 'BSSF' | 'BLSF' | 'BAF' | 'BL';
 
 /**
- * 'free' = MaxRects (any cut, max yield).
- * 'guillotine' = each placement splits its free rect into TWO with
- * edge-to-edge cuts. Resulting layout is producible with a track saw or
- * panel saw — every cut runs all the way across a piece of stock.
+ * 'free'        = MaxRects (any cut, max yield).
+ * 'guillotine'  = shelf-based, edge-to-edge guillotine cuts (min cuts;
+ *                  track-saw / panel-saw friendly).
+ * 'save-last'   = MaxRects for all sheets EXCEPT the last, which gets
+ *                  re-packed with Bottom-Left placement so parts cluster
+ *                  in one corner and the remaining material on the last
+ *                  sheet is a clean rectangle the user can save for
+ *                  another job.
  */
-export type CutStrategy = 'free' | 'guillotine';
+export type CutStrategy = 'free' | 'guillotine' | 'save-last';
 
 export interface PackInput {
   /** Stable identifier; opaque to the packer. */
@@ -714,11 +718,72 @@ export function packOne(job: PackJob, heur: Heuristic, order: PackInput[]): Mult
 }
 
 /**
+ * Repack the LAST sheet's parts into a fresh bin using strict Bottom-Left
+ * placement so they cluster in one corner. The rest of the sheet becomes
+ * a single large contiguous remnant the user can save for another job.
+ *
+ * If the BL repack fails to fit everything (shouldn't, since these parts
+ * already fit on this sheet before), keeps the original layout.
+ */
+function repackLastSheetCorner(
+  last: PackedSheet,
+  job: PackJob,
+  meta: Map<string, { id: string; w: number; h: number; allowRotate: boolean }>,
+): PackedSheet | null {
+  const items: { id: string; w: number; h: number; allowRotate: boolean }[] = [];
+  for (const p of last.placements) {
+    const m = meta.get(p.id);
+    if (!m) return null;
+    items.push(m);
+  }
+  // Sort by area desc — same first-fit-decreasing convention.
+  items.sort((a, b) => (b.w * b.h) - (a.w * a.h));
+
+  const bin = new MaxRectsBin(job.sheetW, job.sheetH);
+  const placements: PackPlacement[] = [];
+  let usedArea = 0;
+  for (const item of items) {
+    const w = item.w + job.kerf;
+    const h = item.h + job.kerf;
+    const placed = bin.insert(w, h, item.allowRotate, 'BL');
+    if (!placed) return null; // bail — keep the original
+    const halfKerf = job.kerf / 2;
+    const actualW = placed.w - job.kerf;
+    const actualH = placed.h - job.kerf;
+    placements.push({
+      id: item.id,
+      x: placed.x + halfKerf,
+      y: placed.y + halfKerf,
+      w: actualW,
+      h: actualH,
+      rotated: placed.rotated,
+    });
+    usedArea += actualW * actualH;
+  }
+  let best: { w: number; h: number; a: number } | null = null;
+  for (const f of bin.free) {
+    const a = f.w * f.h;
+    if (!best || a > best.a) best = { w: f.w, h: f.h, a };
+  }
+  return {
+    placements,
+    usedArea,
+    largestFree: best ? { w: best.w, h: best.h } : null,
+    cuts: [], // MaxRects doesn't carry a guillotine cut tree
+  };
+}
+
+/**
  * Multi-restart optimizer: shuffles insertion order + tries different
  * heuristics, keeps the best result by (fewest unplaced → fewest sheets
  * → highest fill on last sheet).
  */
 export function packMulti(job: PackJob, restarts: number): MultiSheetResult {
+  // 'save-last' uses the 'free' (MaxRects) strategy throughout, then
+  // post-processes the last sheet to corner-cluster. From the multi-restart
+  // optimiser's perspective it's the same as 'free' until the very end.
+  const effectiveStrategy = job.cutStrategy === 'save-last' ? 'free' : job.cutStrategy;
+  const optJob: PackJob = effectiveStrategy === job.cutStrategy ? job : { ...job, cutStrategy: effectiveStrategy };
   const heuristics: Heuristic[] = ['BSSF', 'BLSF', 'BAF', 'BL'];
 
   // Baseline: area-descending — the standard first-fit-decreasing order.
@@ -726,7 +791,7 @@ export function packMulti(job: PackJob, restarts: number): MultiSheetResult {
 
   let best: MultiSheetResult | null = null;
   const tryOrder = (order: PackInput[], heur: Heuristic) => {
-    const r = packOne(job, heur, order);
+    const r = packOne(optJob, heur, order);
     if (!best || isBetter(r, best)) best = r;
   };
 
@@ -753,7 +818,19 @@ export function packMulti(job: PackJob, restarts: number): MultiSheetResult {
     tryOrder(shuffled, heur);
   }
 
-  return best!;
+  const result = best!;
+
+  // Save-last post-process: cluster the last sheet's parts in one corner.
+  if (job.cutStrategy === 'save-last' && result.sheets.length > 0) {
+    const meta = new Map<string, { id: string; w: number; h: number; allowRotate: boolean }>();
+    for (const it of job.items) meta.set(it.id, { id: it.id, w: it.w, h: it.h, allowRotate: it.allowRotate });
+    const repacked = repackLastSheetCorner(result.sheets[result.sheets.length - 1], job, meta);
+    if (repacked) {
+      result.sheets[result.sheets.length - 1] = repacked;
+    }
+  }
+
+  return result;
 }
 
 function isBetter(a: MultiSheetResult, b: MultiSheetResult): boolean {

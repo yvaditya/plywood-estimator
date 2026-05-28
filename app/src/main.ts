@@ -71,6 +71,9 @@ const state: {
   jobName: string;
   partLabels: Map<string, PartLabel>;
   nonSheetCount: number;
+  /** Per-fileTag UI state: collapsed (true) hides the bodies inside this
+   *  file group. Defaults to expanded when a new file is loaded. */
+  collapsedFiles: Set<string>;
 } = {
   result: null,
   bodies: [],
@@ -83,6 +86,7 @@ const state: {
   jobName: '',
   partLabels: new Map(),
   nonSheetCount: 0,
+  collapsedFiles: new Set<string>(),
 };
 
 // --------------------------------------------------------------------------
@@ -348,6 +352,8 @@ async function handleFiles(files: FileList | File[]) {
       const tag = file.name.replace(/\.(step|stp)$/i, '');
       // Use the next-color slot per body so each new file's colors continue.
       const colorBase = state.bodies.length;
+      // Bodies list starts COLLAPSED at the file level — opens on a click.
+      state.collapsedFiles.add(tag);
 
       let perFileValid = 0;
       res.meshes.forEach((m, meshIdx) => {
@@ -460,73 +466,152 @@ function renderBodyList() {
     return;
   }
   bodyList.innerHTML = '';
-  for (const b of state.bodies) {
-    const row = document.createElement('div');
-    row.className = 'body-row' + (b.selected ? ' selected' : '');
 
-    const checkbox = document.createElement('input');
-    checkbox.type = 'checkbox';
-    checkbox.checked = b.selected;
-    checkbox.addEventListener('change', () => {
-      b.selected = checkbox.checked;
+  // Group bodies by STEP file (fileTag). The map preserves insertion order so
+  // files render in the order they were dropped.
+  const byFile = new Map<string, BodyState[]>();
+  for (const b of state.bodies) {
+    const arr = byFile.get(b.fileTag) ?? [];
+    arr.push(b);
+    byFile.set(b.fileTag, arr);
+  }
+
+  for (const [tag, bodies] of byFile) {
+    const group = document.createElement('div');
+    group.className = 'file-group';
+
+    const collapsed = state.collapsedFiles.has(tag);
+    const selectedCount = bodies.filter((b) => b.selected).length;
+    const allSelected = selectedCount === bodies.length;
+    const noneSelected = selectedCount === 0;
+
+    // --- File header ---
+    const header = document.createElement('div');
+    header.className = 'file-header';
+
+    const chevron = document.createElement('button');
+    chevron.type = 'button';
+    chevron.className = 'file-chevron';
+    chevron.setAttribute('aria-label', collapsed ? 'Expand' : 'Collapse');
+    chevron.innerHTML = collapsed
+      ? '<svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="m9 6 6 6-6 6"/></svg>'
+      : '<svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="m6 9 6 6 6-6"/></svg>';
+    chevron.addEventListener('click', () => {
+      if (collapsed) state.collapsedFiles.delete(tag);
+      else state.collapsedFiles.add(tag);
+      renderBodyList();
+    });
+    header.appendChild(chevron);
+
+    const fileCheck = document.createElement('input');
+    fileCheck.type = 'checkbox';
+    fileCheck.checked = allSelected;
+    fileCheck.indeterminate = !allSelected && !noneSelected;
+    fileCheck.title = allSelected ? 'Deselect all in this file' : 'Select all in this file';
+    fileCheck.addEventListener('change', () => {
+      const target = fileCheck.checked;
+      for (const b of bodies) b.selected = target;
       syncViewerSelectionFromState();
       renderBodyList();
       updateNestBtn();
     });
-    row.appendChild(checkbox);
+    header.appendChild(fileCheck);
 
-    const swatch = document.createElement('div');
-    swatch.className = 'swatch';
-    swatch.style.background = b.color;
-    row.appendChild(swatch);
+    const nameWrap = document.createElement('div');
+    nameWrap.className = 'file-name-wrap';
+    nameWrap.innerHTML = `
+      <div class="file-name">${escapeHtml(tag)}</div>
+      <div class="file-sub">${bodies.length} ${bodies.length === 1 ? 'body' : 'bodies'} · ${selectedCount} selected</div>
+    `;
+    nameWrap.addEventListener('click', () => {
+      if (collapsed) state.collapsedFiles.delete(tag);
+      else state.collapsedFiles.add(tag);
+      renderBodyList();
+    });
+    header.appendChild(nameWrap);
 
-    const mid = document.createElement('div');
-    mid.innerHTML = `
-      <div class="body-name">${escapeHtml(b.name)}</div>
-      <div class="body-meta">
-        ${fmtDim(b.analysis.length, state.units)} × ${fmtDim(b.analysis.width, state.units)} ×
-        <strong>${fmtDim(b.analysis.thickness, state.units)}</strong>
-      </div>`;
-    row.appendChild(mid);
+    group.appendChild(header);
 
-    // Right-side spacer to balance grid (count cell)
-    row.appendChild(document.createElement('span'));
-
-    if (b.selected) {
-      const extra = document.createElement('div');
-      extra.className = 'body-extra';
-      extra.innerHTML = `
-        <label>Qty
-          <input type="number" min="1" step="1" value="${b.qty}" data-field="qty" />
-        </label>
-        <label>Grain
-          <select data-field="grain">
-            <option value="free" ${b.grain === 'free' ? 'selected' : ''}>Any direction</option>
-            <option value="length" ${b.grain === 'length' ? 'selected' : ''}>Along length</option>
-            <option value="width" ${b.grain === 'width' ? 'selected' : ''}>Along width</option>
-          </select>
-        </label>
-        <label>Rotation
-          <select data-field="rotation">
-            <option value="lock" ${b.rotation === 'lock' ? 'selected' : ''}>No rotation</option>
-            <option value="flip90" ${b.rotation === 'flip90' ? 'selected' : ''}>Allow 90° flip</option>
-          </select>
-        </label>`;
-      extra.querySelectorAll<HTMLInputElement | HTMLSelectElement>('[data-field]').forEach((el) => {
-        el.addEventListener('change', () => {
-          const field = el.dataset.field!;
-          if (field === 'qty') b.qty = Math.max(1, parseInt((el as HTMLInputElement).value) || 1);
-          if (field === 'grain') {
-            b.grain = (el as HTMLSelectElement).value as GrainLock;
-            pushGrainToViewer(b);
-          }
-          if (field === 'rotation') b.rotation = (el as HTMLSelectElement).value as RotationMode;
-        });
-      });
-      row.appendChild(extra);
+    // --- Body rows (only when expanded) ---
+    if (!collapsed) {
+      const rows = document.createElement('div');
+      rows.className = 'file-bodies';
+      for (const b of bodies) rows.appendChild(buildBodyRow(b));
+      group.appendChild(rows);
     }
-    bodyList.appendChild(row);
+
+    bodyList.appendChild(group);
   }
+}
+
+/** Render one body row (used inside each file group). Mostly the same UI as
+ *  the previous flat list, but with cleaner detail formatting. */
+function buildBodyRow(b: BodyState): HTMLDivElement {
+  const row = document.createElement('div');
+  row.className = 'body-row' + (b.selected ? ' selected' : '');
+
+  const checkbox = document.createElement('input');
+  checkbox.type = 'checkbox';
+  checkbox.checked = b.selected;
+  checkbox.addEventListener('change', () => {
+    b.selected = checkbox.checked;
+    syncViewerSelectionFromState();
+    renderBodyList();
+    updateNestBtn();
+  });
+  row.appendChild(checkbox);
+
+  const swatch = document.createElement('div');
+  swatch.className = 'swatch';
+  swatch.style.background = b.color;
+  row.appendChild(swatch);
+
+  const mid = document.createElement('div');
+  mid.innerHTML = `
+    <div class="body-name">${escapeHtml(b.name)}</div>
+    <div class="body-meta">
+      ${fmtDim(b.analysis.length, state.units)} × ${fmtDim(b.analysis.width, state.units)} ×
+      <strong>${fmtDim(b.analysis.thickness, state.units)}</strong>
+    </div>`;
+  row.appendChild(mid);
+
+  // Spacer to balance grid
+  row.appendChild(document.createElement('span'));
+
+  if (b.selected) {
+    const extra = document.createElement('div');
+    extra.className = 'body-extra';
+    extra.innerHTML = `
+      <label>Qty
+        <input type="number" min="1" step="1" value="${b.qty}" data-field="qty" />
+      </label>
+      <label>Grain
+        <select data-field="grain">
+          <option value="free" ${b.grain === 'free' ? 'selected' : ''}>Any direction</option>
+          <option value="length" ${b.grain === 'length' ? 'selected' : ''}>Along length</option>
+          <option value="width" ${b.grain === 'width' ? 'selected' : ''}>Along width</option>
+        </select>
+      </label>
+      <label>Rotation
+        <select data-field="rotation">
+          <option value="lock" ${b.rotation === 'lock' ? 'selected' : ''}>No rotation</option>
+          <option value="flip90" ${b.rotation === 'flip90' ? 'selected' : ''}>Allow 90° flip</option>
+        </select>
+      </label>`;
+    extra.querySelectorAll<HTMLInputElement | HTMLSelectElement>('[data-field]').forEach((el) => {
+      el.addEventListener('change', () => {
+        const field = el.dataset.field!;
+        if (field === 'qty') b.qty = Math.max(1, parseInt((el as HTMLInputElement).value) || 1);
+        if (field === 'grain') {
+          b.grain = (el as HTMLSelectElement).value as GrainLock;
+          pushGrainToViewer(b);
+        }
+        if (field === 'rotation') b.rotation = (el as HTMLSelectElement).value as RotationMode;
+      });
+    });
+    row.appendChild(extra);
+  }
+  return row;
 }
 
 function syncViewerSelectionFromState() {
