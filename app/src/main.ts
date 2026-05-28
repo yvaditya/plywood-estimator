@@ -892,6 +892,12 @@ function renderResults() {
       svgWrap.className = 'sheet-entry-svg';
       svgWrap.appendChild(buildSheetSvg(sh, tw, tl, sz.margin, true));
       entry.appendChild(svgWrap);
+      // Click to select — visual highlight + remembered active key.
+      entry.addEventListener('click', () => {
+        state.currentSheetKey = key;
+        for (const node of detailSvg.querySelectorAll('.sheet-entry')) node.classList.remove('active');
+        entry.classList.add('active');
+      });
       detailSvg.appendChild(entry);
     });
   });

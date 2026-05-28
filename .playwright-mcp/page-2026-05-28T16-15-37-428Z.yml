@@ -1,0 +1,136 @@
+- generic [ref=e2]:
+  - complementary [ref=e3]:
+    - generic [ref=e5]:
+      - img [ref=e7]
+      - generic [ref=e10]:
+        - heading "Plywood Estimator" [level=1] [ref=e11]
+        - paragraph [ref=e12]: Drop a STEP. Pick bodies. Get optimized cut sheets.
+        - paragraph [ref=e13]: aae9b7e · yvaditya · 2026-05-28
+    - generic [ref=e15]:
+      - img [ref=e17]
+      - strong [ref=e20]: Drop .step / .stp
+      - generic [ref=e21]: or
+      - button "Choose file(s)…" [ref=e22] [cursor=pointer]
+    - generic [ref=e24]:
+      - heading "Sheet" [level=2] [ref=e25]
+      - generic [ref=e26]:
+        - generic [ref=e27]:
+          - text: Width
+          - spinbutton "Width" [ref=e28]: "48"
+        - generic [ref=e29]:
+          - text: Length
+          - spinbutton "Length" [ref=e30]: "96"
+        - generic [ref=e31]:
+          - text: Edge margin
+          - spinbutton "Edge margin" [ref=e32]: "0.25"
+        - generic [ref=e33]:
+          - text: Kerf / spacing
+          - spinbutton "Kerf / spacing" [ref=e34]: "0.125"
+        - generic [ref=e35]:
+          - text: Units
+          - combobox "Units" [ref=e36] [cursor=pointer]:
+            - option "inches" [selected]
+            - option "mm"
+        - generic [ref=e37]:
+          - text: Preset
+          - combobox "Preset" [ref=e38] [cursor=pointer]:
+            - option "— preset —" [selected]
+            - option "4×8 ft"
+            - option "5×5 ft (Baltic birch)"
+            - option "5×10 ft"
+            - option "8×4 (rotated)"
+        - generic [ref=e39]:
+          - text: Optimize tries
+          - combobox "Optimize tries" [ref=e40] [cursor=pointer]:
+            - option "1 (fastest)"
+            - option "4"
+            - option "8"
+            - option "16"
+            - option "32"
+            - option "64"
+            - option "128"
+            - option "256 (default)" [selected]
+            - option "1024 (slowest)"
+        - generic [ref=e41]:
+          - text: Cut strategy
+          - combobox "Cut strategy" [ref=e42] [cursor=pointer]:
+            - option "Max yield (any cuts)"
+            - option "Min cuts (track saw / panel saw)" [selected]
+            - option "Max yield, save last sheet"
+    - generic [ref=e43]:
+      - generic [ref=e44]:
+        - heading "Bodies 0" [level=2] [ref=e45]:
+          - text: Bodies
+          - generic [ref=e46]: "0"
+        - generic [ref=e47]:
+          - button "All" [ref=e48] [cursor=pointer]
+          - button "None" [ref=e49] [cursor=pointer]
+          - button "Clear" [ref=e50] [cursor=pointer]
+      - generic [ref=e52]:
+        - img [ref=e54]
+        - generic [ref=e57]: No file loaded
+        - generic [ref=e58]: Drop a STEP file above to list solid bodies.
+    - generic [ref=e59]:
+      - heading "Job" [level=2] [ref=e60]
+      - generic [ref=e61]:
+        - generic [ref=e62]:
+          - text: Name
+          - textbox "Name" [ref=e63]:
+            - /placeholder: Kitchen — dishwasher base
+        - generic [ref=e64]:
+          - text: Currency
+          - combobox "Currency" [ref=e65] [cursor=pointer]:
+            - option "USD" [selected]
+            - option "CAD"
+            - option "EUR"
+            - option "GBP"
+            - option "AUD"
+        - generic [ref=e66]:
+          - text: PDF paper
+          - combobox "PDF paper" [ref=e67] [cursor=pointer]:
+            - option "16:9 widescreen" [selected]
+            - option "Letter landscape"
+            - option "Letter portrait"
+            - option "Legal landscape"
+            - option "Legal portrait"
+            - option "Tabloid (11×17)"
+            - option "A4 landscape"
+    - generic [ref=e68]:
+      - generic [ref=e69]:
+        - heading "Shopping list 0" [level=2] [ref=e70]:
+          - text: Shopping list
+          - generic [ref=e71]: "0"
+        - generic [ref=e72]:
+          - button "Copy" [disabled] [ref=e73]
+          - button "CSV" [disabled] [ref=e74]
+      - generic [ref=e76]: Run an estimate to see what to buy.
+    - button "Estimate cut sheets" [disabled] [ref=e78]:
+      - img [ref=e79]
+      - generic [ref=e81]: Estimate cut sheets
+  - main [ref=e82]:
+    - generic [ref=e83]:
+      - generic [ref=e84]:
+        - generic [ref=e85]:
+          - generic [ref=e86]: 3D model
+          - button "Maximize / restore" [ref=e87] [cursor=pointer]:
+            - img [ref=e88]
+        - generic [ref=e90]:
+          - generic:
+            - generic: Click a body · drag to orbit · scroll to zoom
+      - generic "Resize panes" [ref=e93]
+      - generic [ref=e95]:
+        - generic [ref=e96]:
+          - generic [ref=e97]: Cut layout
+          - generic [ref=e98]:
+            - button "DXF" [disabled] [ref=e99]:
+              - img [ref=e100]
+              - text: DXF
+            - button "PDF" [disabled] [ref=e103]:
+              - img [ref=e104]
+              - text: PDF
+            - button "Maximize / restore" [ref=e107] [cursor=pointer]:
+              - img [ref=e108]
+        - generic [ref=e111]:
+          - img [ref=e113]
+          - generic [ref=e117]: No layouts yet
+          - generic [ref=e118]: Select bodies, then run an estimate to see optimized cut sheets here.

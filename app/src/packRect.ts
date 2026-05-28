@@ -789,10 +789,15 @@ export function packMulti(job: PackJob, restarts: number): MultiSheetResult {
   // Baseline: area-descending — the standard first-fit-decreasing order.
   const baseline = job.items.slice().sort((a, b) => b.w * b.h - a.w * a.h);
 
+  // Use the USER'S strategy for the optimiser's objective, not the effective
+  // strategy. e.g. 'save-last' should objectively prefer LOWER last-sheet
+  // fill across all restarts, then we post-process — picking by effective
+  // 'free' yield would steer the search away from save-last's actual goal.
+  const objectiveStrategy: CutStrategy = job.cutStrategy ?? 'free';
   let best: MultiSheetResult | null = null;
   const tryOrder = (order: PackInput[], heur: Heuristic) => {
     const r = packOne(optJob, heur, order);
-    if (!best || isBetter(r, best)) best = r;
+    if (!best || isBetter(r, best, objectiveStrategy)) best = r;
   };
 
   // Phase 1: try every heuristic with the baseline order
@@ -833,11 +838,41 @@ export function packMulti(job: PackJob, restarts: number): MultiSheetResult {
   return result;
 }
 
-function isBetter(a: MultiSheetResult, b: MultiSheetResult): boolean {
+/**
+ * Strategy-aware "is A better than B" comparator. Each strategy has a
+ * distinct OBJECTIVE the multi-restart optimiser should actually optimise
+ * for. Two-tier prelude is the same for all: fewer unplaced → fewer
+ * sheets. The tiebreaker differs per strategy.
+ */
+function isBetter(a: MultiSheetResult, b: MultiSheetResult, strategy: CutStrategy = 'free'): boolean {
   if (a.unplaced.length !== b.unplaced.length) return a.unplaced.length < b.unplaced.length;
   if (a.sheets.length !== b.sheets.length) return a.sheets.length < b.sheets.length;
-  // More fill on the last sheet = tighter pack
-  const aLast = a.sheets.length ? a.sheets[a.sheets.length - 1].usedArea : 0;
-  const bLast = b.sheets.length ? b.sheets[b.sheets.length - 1].usedArea : 0;
-  return aLast > bLast;
+
+  const totalUsed = (r: MultiSheetResult) => r.sheets.reduce((s, sh) => s + sh.usedArea, 0);
+  const lastUsed = (r: MultiSheetResult) => (r.sheets.length ? r.sheets[r.sheets.length - 1].usedArea : 0);
+  const totalCuts = (r: MultiSheetResult) => r.sheets.reduce((s, sh) => s + (sh.cuts?.length ?? 0), 0);
+
+  switch (strategy) {
+    case 'guillotine': {
+      // Min cuts: PREFER FEWER CUTS. Tie-break on higher overall yield.
+      const ac = totalCuts(a), bc = totalCuts(b);
+      if (ac !== bc) return ac < bc;
+      return totalUsed(a) > totalUsed(b);
+    }
+    case 'save-last': {
+      // Save last: prefer LOWER fill on the last sheet (so the remnant is
+      // bigger and reusable). Tie-break on higher overall yield.
+      const al = lastUsed(a), bl = lastUsed(b);
+      if (al !== bl) return al < bl;
+      return totalUsed(a) > totalUsed(b);
+    }
+    case 'free':
+    default: {
+      // Max yield: prefer HIGHER total used area (= highest overall fill).
+      const at = totalUsed(a), bt = totalUsed(b);
+      if (at !== bt) return at > bt;
+      // Tie: more on the last sheet = packing parts as early as possible.
+      return lastUsed(a) > lastUsed(b);
+    }
+  }
 }

@@ -1113,7 +1113,10 @@ input[type="checkbox"]:focus-visible { box-shadow: 0 0 0 2px var(--accent-ring);
   border-top: 1px solid var(--line);
   padding-top: 16px;
 }
+.sheet-entry { cursor: pointer; transition: opacity .12s; }
+.sheet-entry:hover .sheet-entry-title { color: var(--text-2); }
 .sheet-entry.active .sheet-entry-title { color: var(--accent, #2383E2); }
+.sheet-entry.active .sheet-entry-svg svg { box-shadow: 0 0 0 2px var(--accent, #2383E2); border-radius: 2px; }
 .sheet-entry-header {
   display: flex;
   flex-direction: column;
