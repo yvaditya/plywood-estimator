@@ -806,11 +806,11 @@ nestBtn.addEventListener('click', async () => {
   downloadDxfBtn.disabled = true;
   downloadPdfBtn.disabled = true;
 
-  // 15 fps target → 1000/15 ≈ 67ms per frame. We can't slow packOne down, but
+  // 25 fps target → 1000/25 = 40ms per frame. We can't slow packOne down, but
   // we can SHOW frames at a steady pace by only rendering on the next frame
-  // tick. Below the optimiser ticks faster than 15fps, the UI just shows the
-  // most recent state; above, it limits paint to one frame per ~67ms.
-  const FRAME_MS = 1000 / 15;
+  // tick. Below the optimiser ticks faster than 25fps, the UI just shows the
+  // most recent state; above, it limits paint to one frame per 40ms.
+  const FRAME_MS = 1000 / 25;
   let lastPaint = 0;
   detailTitle.textContent = 'Optimising…';
   detailSub.textContent = '';
