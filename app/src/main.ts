@@ -1299,8 +1299,9 @@ downloadPdfBtn.addEventListener('click', () => {
       // we render bodies[0..i] visible, with body i alone floating along its
       // face-normal so the user sees where it's being installed. All steps
       // share one camera (frameIds = the full cabinet) so the scale doesn't
-      // jump between steps.
-      const stepDist = explodeDist * 0.55;
+      // jump between steps. The final step is the fully-assembled state so
+      // the user clearly sees the "done" position.
+      const stepDist = Math.max(15, explodeDist * 0.28);
       const steps: import('./pdf').SnapshotImage[] = [];
       const stepPanelIds: string[] = [];
       for (let i = 0; i < bodies.length; i++) {
@@ -1313,6 +1314,14 @@ downloadPdfBtn.addEventListener('click', () => {
         steps.push(img);
         const arr = idByBodyPartId.get(String(bodies[i].id)) ?? [];
         stepPanelIds.push(arr[0] ?? `body ${bodies[i].id}`);
+      }
+      // Final "done" frame — every panel back in its rest position, nothing
+      // exploded. Reuses the same camera so it visually matches the previous
+      // step but with the last panel settled.
+      if (bodies.length > 0) {
+        const doneImg = viewer.snapshotFiltered(visibleIds, null, 0, visibleIds);
+        steps.push(doneImg);
+        stepPanelIds.push('done');
       }
 
       cabinets.push({

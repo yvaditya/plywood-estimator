@@ -277,14 +277,15 @@ function drawSnapshotPanel(
   doc: jsPDF,
   img: SnapshotImage | string,
   x: number, y: number, w: number, h: number,
+  opts: { frameless?: boolean } = {},
 ) {
-  // Frame
-  doc.setFillColor(247, 246, 243);
-  doc.setDrawColor(220);
-  doc.setLineWidth(0.6);
-  doc.rect(x, y, w, h, 'FD');
-
-  const inset = 6;
+  if (!opts.frameless) {
+    doc.setFillColor(247, 246, 243);
+    doc.setDrawColor(220);
+    doc.setLineWidth(0.6);
+    doc.rect(x, y, w, h, 'FD');
+  }
+  const inset = opts.frameless ? 0 : 6;
   const innerW = w - 2 * inset;
   const innerH = h - 2 * inset;
   const dataUrl = typeof img === 'string' ? img : img.dataUrl;
@@ -1050,14 +1051,18 @@ function drawIkeaStepCard(
   w: number,
   h: number,
 ) {
-  // Snapshot fills the card; the badge / id overlay on top.
-  drawSnapshotPanel(doc, img, x, y, w, h);
+  // Hairline outer border + frameless snapshot lets the 3D image breathe.
+  doc.setDrawColor(225);
+  doc.setLineWidth(0.5);
+  doc.rect(x, y, w, h, 'S');
+  drawSnapshotPanel(doc, img, x + 1, y + 1, w - 2, h - 2, { frameless: true });
 
   // Step badge — large dark circle with white step number, top-left
+  const isDone = panelId === 'done';
   const badgeR = 16;
   const bx = x + 14 + badgeR;
   const by = y + 14 + badgeR;
-  doc.setFillColor(30, 30, 30);
+  doc.setFillColor(isDone ? 80 : 30, isDone ? 132 : 30, isDone ? 110 : 30);
   doc.circle(bx, by, badgeR, 'F');
   doc.setTextColor(255);
   doc.setFont('helvetica', 'bold');
@@ -1065,11 +1070,12 @@ function drawIkeaStepCard(
   doc.text(String(stepNum), bx, by + 6, { align: 'center' });
   doc.setTextColor(0);
 
-  // Panel id chip — top-right
-  if (panelId) {
+  // Panel id chip — top-right. "done" frame gets a different chip label.
+  const chipText = isDone ? 'Assembled' : panelId;
+  if (chipText) {
     doc.setFont('helvetica', 'bold');
-    doc.setFontSize(13);
-    const tw = doc.getTextWidth(panelId) + 18;
+    doc.setFontSize(isDone ? 11 : 13);
+    const tw = doc.getTextWidth(chipText) + 18;
     const px = x + w - 14 - tw;
     const py = y + 14;
     doc.setFillColor(255, 255, 255);
@@ -1077,7 +1083,7 @@ function drawIkeaStepCard(
     doc.setLineWidth(0.6);
     doc.roundedRect(px, py, tw, 24, 6, 6, 'FD');
     doc.setTextColor(30);
-    doc.text(panelId, px + tw / 2, py + 16, { align: 'center' });
+    doc.text(chipText, px + tw / 2, py + 16, { align: 'center' });
     doc.setTextColor(0);
   }
 }
