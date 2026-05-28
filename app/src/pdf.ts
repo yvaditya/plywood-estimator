@@ -673,8 +673,11 @@ function drawPartDims(
     doc.line(dimX - TICK, y2, dimX + TICK, y2);
     doc.line(dimX, y1, dimX, gy1);
     doc.line(dimX, gy2, dimX, y2);
-    // Rotated text in the gap
-    doc.text(hText, dimX - hFontInline * 0.34, cy, { align: 'center', angle: 90 });
+    // Rotated text in the gap. With angle=90 in jsPDF, the x coordinate is
+    // the baseline anchor — for the visual centre to sit ON the dim line we
+    // need to offset x to the RIGHT by half the font height (the character
+    // body extends LEFT from the baseline once rotated CCW).
+    doc.text(hText, dimX + hFontInline * 0.34, cy, { align: 'center', angle: 90 });
   } else if ((space.right ?? 0) > 18) {
     // Leader callout to the RIGHT of the panel.
     doc.setFontSize(8);
