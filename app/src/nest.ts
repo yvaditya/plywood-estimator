@@ -235,11 +235,20 @@ export function runNest(parts: NestPart[], config: NestConfig): NestResult {
     for (const p of bucket) {
       const foot = buildFootprint(p);
       const policy = rotationPolicy(p.grain, p.rotation, foot.w0, foot.h0);
+      // Min-cuts strategy needs rotational flexibility on free-grain parts
+      // to actually pack into wide shelves. The user said "I don't care
+      // about grain direction" by leaving grain='free', so honour that by
+      // unlocking the part's flip even if the rotation UI was set to
+      // 'lock' (which is the default). For parts with an explicit grain
+      // direction we leave the original policy untouched.
+      const allowFlip = (config.cutStrategy === 'guillotine' && p.grain === 'free')
+        ? true
+        : policy.allowFlip;
       for (let inst = 1; inst <= p.qty; inst++) {
         const id = `${p.id}#${inst}`;
         const w = policy.preRotate === 0 ? foot.w0 : foot.w90;
         const h = policy.preRotate === 0 ? foot.h0 : foot.h90;
-        items.push({ id, w, h, allowRotate: policy.allowFlip });
+        items.push({ id, w, h, allowRotate: allowFlip });
         meta.set(id, { part: p, foot, policy, instance: inst });
       }
     }

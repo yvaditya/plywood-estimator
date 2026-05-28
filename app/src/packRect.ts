@@ -163,6 +163,170 @@ class MaxRectsBin implements BinPacker {
 }
 
 /**
+ * SHELF bin packer — true min-cuts strategy.
+ *
+ * Parts are packed into horizontal "shelves" (strips) using First-Fit
+ * Decreasing Height (FFDH): try each existing shelf in order, open a new
+ * one only when none fit. The classic shelf strategy for guillotine
+ * cutting (Jylänki §3.2) — produces the fewest cuts because every shelf
+ * boundary is a single full-sheet rip, and within each shelf, every part
+ * boundary is a single crosscut.
+ *
+ * Cuts are emitted post-hoc (after all parts are placed) in saw-shop
+ * order: all horizontal rips first (separating shelves on the full sheet),
+ * then per-shelf vertical crosscuts (separating parts left-to-right). This
+ * matches how a panel-saw or track-saw operator actually cuts.
+ *
+ * Trade-off vs MaxRects/SAS: shelf packing can leave taller-than-needed
+ * gaps within a shelf (the "wasted vertical space" problem), so yield
+ * tends to be 5–15% lower than MaxRects on heterogeneous height mixes.
+ * But cut count drops sharply — exactly what the "Min cuts" strategy
+ * promises.
+ */
+class ShelfBin implements BinPacker {
+  binW: number;
+  binH: number;
+  free: FreeRect[] = []; // synthesized in finalize() for the largestFree report
+  cuts: Cut[] = [];      // populated by finalize()
+  private shelves: { y: number; h: number; usedW: number }[] = [];
+  /** Per-placement: which shelf and (x, w) along it. Used by finalize(). */
+  private partsByShelf: { shelf: number; x: number; w: number }[][] = [];
+
+  constructor(w: number, h: number) {
+    this.binW = w;
+    this.binH = h;
+  }
+
+  insert(w: number, h: number, allowRotate: boolean, _heur: Heuristic): PackPlacement | null {
+    // 1. Try every existing shelf — First-Fit Decreasing Height.
+    //    Prefer the orientation that fits the shelf TIGHTER (smaller wasted
+    //    height inside the shelf) — keeps shelves from accidentally locking
+    //    in a tall part that wastes vertical space on the rest of the row.
+    for (let i = 0; i < this.shelves.length; i++) {
+      const sh = this.shelves[i];
+      const okUnrot = sh.usedW + w <= this.binW && h <= sh.h;
+      const okRot   = allowRotate && sh.usedW + h <= this.binW && w <= sh.h;
+      if (!okUnrot && !okRot) continue;
+      // When both fit, prefer the orientation that uses LESS shelf width —
+      // packs more parts per shelf, reducing per-shelf vertical cuts.
+      const preferUnrot = okUnrot && (!okRot || w <= h);
+      if (preferUnrot) {
+        const x = sh.usedW;
+        sh.usedW += w;
+        this.partsByShelf[i].push({ shelf: i, x, w });
+        return { id: '', x, y: sh.y, w, h, rotated: false };
+      }
+      const x = sh.usedW;
+      sh.usedW += h;
+      this.partsByShelf[i].push({ shelf: i, x, w: h });
+      return { id: '', x, y: sh.y, w: h, h: w, rotated: true };
+    }
+    // 2. Open a new shelf above the last one.
+    const top = this.shelves.length > 0
+      ? this.shelves[this.shelves.length - 1].y + this.shelves[this.shelves.length - 1].h
+      : 0;
+    const remH = this.binH - top;
+    const fitsUnrot = h <= remH && w <= this.binW;
+    const fitsRot   = allowRotate && w <= remH && h <= this.binW;
+    if (!fitsUnrot && !fitsRot) return null;
+
+    // Rotation preference for a NEW shelf:
+    //   - In PORTRAIT bins (binH > binW), put the long edge VERTICAL so the
+    //     shelf becomes "tall" and the part eats less binW — leaving room for
+    //     more parts in the same shelf. This is the variant that reduces cut
+    //     count the most in practice.
+    //   - In LANDSCAPE bins (binW > binH), put the long edge HORIZONTAL so
+    //     the shelf stays "short" and we can stack more shelves vertically.
+    const portraitBin = this.binH > this.binW;
+    const longEdgeIsW = w >= h;
+    const wantLongVertical = portraitBin;
+    const preferRot = allowRotate && (wantLongVertical ? longEdgeIsW : !longEdgeIsW);
+
+    const useRot = preferRot ? fitsRot : !fitsUnrot && fitsRot;
+    if (useRot) {
+      const shelfIdx = this.shelves.length;
+      this.shelves.push({ y: top, h: w, usedW: h });
+      this.partsByShelf.push([{ shelf: shelfIdx, x: 0, w: h }]);
+      return { id: '', x: 0, y: top, w: h, h: w, rotated: true };
+    }
+    // Default: un-rotated
+    const shelfIdx = this.shelves.length;
+    this.shelves.push({ y: top, h, usedW: w });
+    this.partsByShelf.push([{ shelf: shelfIdx, x: 0, w }]);
+    return { id: '', x: 0, y: top, w, h, rotated: false };
+  }
+
+  /**
+   * Compute the cut sequence + free-rect snapshot AFTER all parts are placed.
+   * Called once by packOne when the bin is closed.
+   *
+   * Cut order (saw-shop friendly):
+   *   1. All horizontal rips on the FULL sheet → produces N strips.
+   *      (N rips when there's top waste, N-1 when shelves fill exactly.)
+   *   2. For each strip, vertical crosscuts → produces parts + right waste.
+   */
+  finalize() {
+    // ---- Cuts ----
+    this.cuts = [];
+    const N = this.shelves.length;
+    if (N === 0) return;
+
+    const totalShelfH = this.shelves[N - 1].y + this.shelves[N - 1].h;
+    const hasTopWaste = totalShelfH < this.binH - 0.001;
+
+    // Phase 1: full-sheet horizontal rips.
+    // Parent rect for cut k spans the un-cut portion above shelves[0..k-1].
+    let parentY = 0;
+    let parentH = this.binH;
+    // We emit one rip per gap between shelves. If there's top waste we ALSO
+    // need a rip to separate the last shelf from the waste. So the total is
+    // N rips if hasTopWaste else N-1.
+    const rips = hasTopWaste ? N : N - 1;
+    for (let i = 0; i < rips; i++) {
+      this.cuts.push({
+        parentX: 0, parentY, parentW: this.binW, parentH,
+        axis: 'H', distance: this.shelves[i].h, depth: 0,
+      });
+      parentY += this.shelves[i].h;
+      parentH -= this.shelves[i].h;
+    }
+
+    // Phase 2: per-shelf vertical crosscuts.
+    for (let i = 0; i < N; i++) {
+      const sh = this.shelves[i];
+      const parts = this.partsByShelf[i].slice().sort((a, b) => a.x - b.x);
+      let stripX = 0;
+      let stripW = this.binW;
+      for (let j = 0; j < parts.length; j++) {
+        const p = parts[j];
+        const rightEdge = p.x + p.w;
+        const isLast = j === parts.length - 1;
+        // Last part fills the shelf → no trailing cut needed.
+        if (isLast && rightEdge >= this.binW - 0.001) continue;
+        this.cuts.push({
+          parentX: stripX, parentY: sh.y, parentW: stripW, parentH: sh.h,
+          axis: 'V', distance: rightEdge - stripX, depth: 1,
+        });
+        stripX = rightEdge;
+        stripW = this.binW - rightEdge;
+      }
+    }
+
+    // ---- Free-rect snapshot (largestFree report) ----
+    const free: FreeRect[] = [];
+    for (const sh of this.shelves) {
+      if (sh.usedW < this.binW - 0.001) {
+        free.push({ x: sh.usedW, y: sh.y, w: this.binW - sh.usedW, h: sh.h });
+      }
+    }
+    if (hasTopWaste) {
+      free.push({ x: 0, y: totalShelfH, w: this.binW, h: this.binH - totalShelfH });
+    }
+    this.free = free;
+  }
+}
+
+/**
  * Guillotine bin packer.
  * Every part placement creates EXACTLY two child free rectangles via an
  * edge-to-edge "cut" — never a 4-way split. The result is producible with
@@ -171,6 +335,9 @@ class MaxRectsBin implements BinPacker {
  * Uses SAS (Shorter Axis Split): the cut runs along the shorter leftover
  * dimension, which tends to leave the most usable strip for the next part.
  * Reference: Jukka Jylänki, "A Thousand Ways to Pack the Bin", §4.
+ *
+ * Kept alongside ShelfBin so packMulti can try both and keep whichever
+ * produces fewer cuts for the same sheet count.
  */
 class GuillotineBin implements BinPacker {
   binW: number;
@@ -469,9 +636,21 @@ export function packOne(job: PackJob, heur: Heuristic, order: PackInput[]): Mult
     return true;
   });
 
+  // When the user asked for 'guillotine' (Min cuts), we sort by height
+  // descending and pre-place into a SHELF bin — FFDH. The pipeline still
+  // honours `heur` for the MaxRects path; for the shelf path heur is ignored.
+  const sortedRemaining = job.cutStrategy === 'guillotine'
+    ? remaining.slice().sort((a, b) => {
+        const ha = Math.max(a.h, a.w);
+        const hb = Math.max(b.h, b.w);
+        return hb - ha;
+      })
+    : remaining;
+  remaining = sortedRemaining;
+
   while (remaining.length > 0) {
     const bin: BinPacker = job.cutStrategy === 'guillotine'
-      ? new GuillotineBin(job.sheetW, job.sheetH)
+      ? new ShelfBin(job.sheetW, job.sheetH)
       : new MaxRectsBin(job.sheetW, job.sheetH);
     const cur: PackedSheet = { placements: [], usedArea: 0, largestFree: null, cuts: [] };
     const carry: PackInput[] = []; // didn't fit on THIS bin → try next bin
@@ -501,6 +680,8 @@ export function packOne(job: PackJob, heur: Heuristic, order: PackInput[]): Mult
     }
 
     if (anyPlacedThisBin) {
+      // ShelfBin defers cut + free-rect computation until all parts are placed.
+      if (bin instanceof ShelfBin) bin.finalize();
       // Snapshot the largest remaining free rectangle (by area).
       let best: { w: number; h: number; a: number } | null = null;
       for (const f of bin.free) {

@@ -304,10 +304,12 @@ export class Viewer {
 
     this.renderer.domElement.addEventListener('pointermove', this.handlePointerMove);
     this.renderer.domElement.addEventListener('click', this.handleClick);
-    // Trackpad two-finger pan (Mac Safari + Chrome on macOS).
-    //   - ctrlKey set     → pinch-to-zoom (browser convention) → OrbitControls
-    //   - deltaMode !== 0 → mouse wheel scroll → OrbitControls (zoom)
-    //   - deltaMode === 0, no ctrlKey → two-finger trackpad pan → custom
+    // Trackpad two-finger pan. Cross-platform detection:
+    //   - ctrlKey                       → pinch-to-zoom → defer to OrbitControls
+    //   - large vertical-only delta w/  → mouse wheel → defer (OrbitControls zoom)
+    //     non-zero deltaMode (lines)
+    //   - everything else (precision    → two-finger pan → handled here
+    //     trackpad on Mac OR Windows)
     this.renderer.domElement.addEventListener('wheel', this.handleWheelPan, { passive: false, capture: true });
     new ResizeObserver(() => this.resize(container)).observe(container);
 
@@ -315,12 +317,20 @@ export class Viewer {
   }
 
   private handleWheelPan = (ev: WheelEvent) => {
-    if (ev.ctrlKey) return;            // pinch-zoom — defer to OrbitControls
-    if (ev.deltaMode !== 0) return;     // mouse wheel — defer to OrbitControls
+    if (ev.ctrlKey) return; // pinch-zoom — defer to OrbitControls
+    // Distinguish trackpad vs mouse wheel. Mouse wheels emit:
+    //   - deltaMode > 0 (lines/pages) OR
+    //   - large vertical-only steps with deltaX === 0
+    // Precision touchpads on BOTH Mac and Windows emit deltaMode === 0 with
+    // small mixed deltaX/deltaY values — handle those as pan.
+    const isMouseWheel =
+      ev.deltaMode !== 0 || (ev.deltaX === 0 && Math.abs(ev.deltaY) >= 50);
+    if (isMouseWheel) return; // defer to OrbitControls (zoom)
+
     ev.preventDefault();
     ev.stopPropagation();
-    // Pan camera + target by trackpad delta, scaled to world units at the
-    // current target distance (same formula OrbitControls uses internally).
+    // Convert pixel deltas to world units at the target depth (same formula
+    // OrbitControls uses internally for screen-space pan).
     const offset = new THREE.Vector3().copy(this.camera.position).sub(this.controls.target);
     const targetDist = offset.length();
     const fov = (this.camera.fov * Math.PI) / 180;
@@ -330,7 +340,12 @@ export class Viewer {
     const right = new THREE.Vector3();
     const up = new THREE.Vector3();
     this.camera.matrix.extractBasis(right, up, new THREE.Vector3());
-    const pan = right.multiplyScalar(-panX).add(up.multiplyScalar(panY));
+    // Sign convention: drag scene WITH the fingers — two-finger swipe RIGHT
+    // moves the scene right (camera left = -right axis), swipe DOWN moves
+    // the scene down (camera up = +up axis). Note that browser wheel deltaY
+    // is positive when "scrolling down" which corresponds to a downward
+    // finger gesture on both Mac (natural scroll on) and Windows (default).
+    const pan = right.multiplyScalar(panX).add(up.multiplyScalar(-panY));
     this.camera.position.add(pan);
     this.controls.target.add(pan);
   };
