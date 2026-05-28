@@ -564,25 +564,23 @@ function drawPart(
   const shortMm = Math.min(p.w, p.h);
   doc.setTextColor(20);
 
-  // Per-sheet panel id ("1a", "2c") + tiny dim subtitle.
+  // Per-sheet panel id ("1a", "2c") — centered, no inline dim subtitle.
+  // Dimensions get their own ANSI-style callouts below + on the side.
   if (letter) {
-    const big = Math.max(10, Math.min(36, partPt * 0.36));
+    const big = Math.max(10, Math.min(34, partPt * 0.34));
     doc.setFont('helvetica', 'bold');
     doc.setFontSize(big);
-    doc.text(letter, cx, cy + big * 0.18, { align: 'center' });
-
-    const subSize = Math.max(4, Math.min(10, partPt * 0.085));
-    doc.setFont('helvetica', 'normal');
-    doc.setFontSize(subSize);
-    doc.setTextColor(80);
-    doc.text(
-      `${fmtDim(longMm, opt.units)} × ${fmtDim(shortMm, opt.units)}`,
-      cx,
-      cy + big * 0.55 + subSize,
-      { align: 'center' },
-    );
-    doc.setTextColor(0);
+    doc.text(letter, cx, cy + big * 0.34, { align: 'center' });
   }
+
+  // ANSI dimension callouts inside the panel, near the edges. Skip on
+  // panels too small for the text to fit cleanly.
+  if (partPt >= 40) {
+    drawPartDims(doc, px, py, pwPt, phPt, r0.w, r0.h, opt);
+  }
+
+  // Suppress unused-var warning — longMm/shortMm read by drawPartDims via r0
+  void longMm; void shortMm;
 }
 
 /**
@@ -784,9 +782,12 @@ function drawCutsForSingleSheet(
   // Start a new page for the cut cards — keeps the sheet layout page clean.
   openNewPage();
 
-  const cardGutter = 12;
-  const cardCaptionH = 22;
-  const cols = PAGE_W > 1000 ? 6 : PAGE_W > 750 ? 5 : 4;
+  const cardGutter = 14;
+  const cardCaptionH = 26;
+  // Bigger cards per the user — was 4–6 cols, now 3–4 so each card has room
+  // to show the cut clearly. On a 16:9 widescreen page this gives ~290pt
+  // cards (vs ~168pt before).
+  const cols = PAGE_W > 1100 ? 4 : 3;
   const innerW = PAGE_W - 2 * PAGE_PAD;
   const cardW = (innerW - cardGutter * (cols - 1)) / cols;
   const sheetAspect = sc.sheetL / sc.sheetW;
