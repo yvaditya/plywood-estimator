@@ -253,17 +253,18 @@ export function runNest(parts: NestPart[], config: NestConfig): NestResult {
       }
     }
 
-    // Auto-pick sheet orientation: try both bin orientations and keep the
-    // one with fewer sheets / better fill. For grain-constrained parts the
-    // outcomes can differ noticeably (e.g. a tall part fits in portrait but
-    // not landscape). The orientation that wins becomes the SVG/DXF/PDF
-    // sheet dims for this group.
-    const tryA = packMulti({ items, sheetW: usableW, sheetH: usableL, kerf, cutStrategy: config.cutStrategy }, restarts);
-    const tryB = packMulti({ items, sheetW: usableL, sheetH: usableW, kerf, cutStrategy: config.cutStrategy }, restarts);
-    const aBetter = compareTries(tryA, tryB);
-    const winner = aBetter ? tryA : tryB;
-    const winnerSheetW = aBetter ? sheetW : sheetL;
-    const winnerSheetL = aBetter ? sheetL : sheetW;
+    // Sheet orientation is LOCKED to landscape — long edge runs along
+    // the bin's X axis. This keeps the full plywood sheet's orientation
+    // constant across the per-sheet overview, the cut-sequence cards,
+    // the SVG/DXF, and the PDF. Some jobs would yield slightly tighter
+    // packing in portrait, but the user explicitly wants a consistent
+    // visual orientation in the documents.
+    const winner = packMulti(
+      { items, sheetW: usableL, sheetH: usableW, kerf, cutStrategy: config.cutStrategy },
+      restarts,
+    );
+    const winnerSheetW = sheetL;
+    const winnerSheetL = sheetW;
 
     const sheets: NestSheet[] = winner.sheets.map((ps, idx) => ({
       index: idx + 1,

@@ -131,7 +131,9 @@ const inventoryCheckEl = $('inventoryCheck');
 const unplacedList = $('unplacedList');
 const downloadDxfBtn = $<HTMLButtonElement>('downloadDxfBtn');
 const downloadPdfBtn = $<HTMLButtonElement>('downloadPdfBtn');
-const thumbStrip = $('thumbStrip');
+const thumbStrip = $('sheetThumbs');
+const sheetsPanel = $('sheetsPanel');
+const sheetsCount = $('sheetsCount');
 
 const shopList = $('shoppingList');
 const shopCount = $('shopCount');
@@ -804,7 +806,7 @@ nestBtn.addEventListener('click', () => {
   resultsEmpty.textContent = 'Optimizing layout…';
   resultsEmpty.hidden = false;
   resultsDetail.hidden = true;
-  thumbStrip.hidden = true;
+  sheetsPanel.hidden = true;
 
   setTimeout(() => {
     try {
@@ -865,7 +867,9 @@ function renderResults() {
   resultsDetail.hidden = false;
   downloadDxfBtn.disabled = false;
   downloadPdfBtn.disabled = false;
-  thumbStrip.hidden = false;
+  sheetsPanel.hidden = false;
+  const totalSheets = result.groups.reduce((a, g) => a + g.sheets.length, 0);
+  sheetsCount.textContent = String(totalSheets);
 
   // Detail view
   if (!state.currentSheetKey) {
@@ -1299,8 +1303,22 @@ downloadDxfBtn.addEventListener('click', () => {
   downloadDxf(`sheet_${sel.groupIdx + 1}_${sel.sheetIdx + 1}.dxf`, dxf);
 });
 
-downloadPdfBtn.addEventListener('click', () => {
+downloadPdfBtn.addEventListener('click', async () => {
   if (!state.lastNest || !state.lastSheet) return;
+  // Mark the button busy + show a progress indicator so the user knows the
+  // (multi-second) snapshot capture + PDF assembly is running. We yield to
+  // the browser between phases via requestAnimationFrame + await so the
+  // progress bar actually updates between heavy synchronous work.
+  const originalLabel = downloadPdfBtn.innerHTML;
+  downloadPdfBtn.disabled = true;
+  downloadPdfBtn.classList.add('busy');
+  const setProgress = (label: string, pct: number) => {
+    downloadPdfBtn.innerHTML = `<span class="progress-bar"><span class="progress-fill" style="width:${pct.toFixed(0)}%"></span></span><span class="progress-label">${label}</span>`;
+  };
+  const yieldFrame = () => new Promise<void>((r) => requestAnimationFrame(() => r()));
+  setProgress('Preparing…', 5);
+  await yieldFrame();
+
   // Pass the shopping list rows to the PDF as the "inventoryCheck" section
   // (the PDF module renders them as Need / Have / Shortfall).
   const invChecks: InventoryCheck[] = state.shopping.map((r) => ({
@@ -1395,7 +1413,12 @@ downloadPdfBtn.addEventListener('click', () => {
     // 16:9 target so the cabinet fills the card horizontally.
     const SHOT_COVER = { w: 1200, h: 1100 };
     const SHOT_STEP  = { w: 1600, h: 900 };
+    const fileCount = byFile.size;
+    let fileIdx = 0;
     for (const [tag, bodies] of byFile) {
+      fileIdx++;
+      setProgress(`Capturing ${tag}…`, 10 + (70 * (fileIdx - 1) / Math.max(1, fileCount)));
+      await yieldFrame();
       const visibleIds = new Set(bodies.map((b) => b.id));
       const assembled = viewer.snapshotFiltered(visibleIds, null, 0, undefined, SHOT_COVER);
       const exploded = viewer.snapshotFiltered(visibleIds, directions, explodeDist, undefined, SHOT_COVER);
@@ -1453,6 +1476,8 @@ downloadPdfBtn.addEventListener('click', () => {
     viewer.exitPdfBg();
   }
 
+  setProgress('Building PDF…', 85);
+  await yieldFrame();
   const doc = buildPdf(state.lastNest, {
     sheetW: state.lastSheet.w,
     sheetL: state.lastSheet.l,
@@ -1469,8 +1494,14 @@ downloadPdfBtn.addEventListener('click', () => {
     explodedPng,
     cabinets,
   });
+  setProgress('Saving…', 98);
+  await yieldFrame();
   const safe = (state.jobName || 'plywood_cut_estimate').replace(/[^a-z0-9_-]+/gi, '_').toLowerCase();
   downloadPdf(`${safe}.pdf`, doc);
+  // Restore button
+  downloadPdfBtn.innerHTML = originalLabel;
+  downloadPdfBtn.classList.remove('busy');
+  downloadPdfBtn.disabled = false;
 });
 
 // --------------------------------------------------------------------------
