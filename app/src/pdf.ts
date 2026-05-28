@@ -69,13 +69,18 @@ export interface CabinetSnapshot {
   /** Letter IDs (e.g. "1a", "2c") of every panel that belongs to this
    *  cabinet — drawn as a small inventory list on the assembly page. */
   partIds: string[];
-  /** Detailed per-panel info used to render step-by-step assembly cards.
-   *  Optional for backwards-compat (a missing field falls back to the
-   *  legacy single-page assembly layout). */
+  /** Detailed per-panel info used to render the parts inventory table on
+   *  the cabinet cover page. */
   panels?: CabinetPanel[];
   /** Snapshots showing ONLY this cabinet's panels (others hidden). */
   assembled: SnapshotImage;
   exploded: SnapshotImage;
+  /** IKEA-style per-step snapshots — one per body. Each shows the bodies
+   *  installed so far at rest, with the newly-installed body floating in
+   *  along its face normal. All steps share one camera framing. */
+  steps?: SnapshotImage[];
+  /** Panel id label for each step (same length as `steps`). */
+  stepPanelIds?: string[];
 }
 
 export interface InventoryCheck {
@@ -814,11 +819,12 @@ function drawCutsForSingleSheet(
 }
 
 // ---------------------------------------------------------------------------
-// Per-cabinet (per STEP file) assembly page — IKEA-inspired:
-//   - Cabinet name as the page title
-//   - Parts inventory on the left (panel IDs with quantities)
-//   - Big exploded view on the right with the assembled view below
-//   - Caption: match colors / IDs to the per-sheet layouts
+// Per-cabinet COVER page — IKEA "What you have" layout:
+//   - LEFT: large assembled snapshot of the finished cabinet
+//   - RIGHT: parts inventory TABLE (id, name, L × W, thickness, qty)
+//
+// Step pages with IKEA-style build-sequence snapshots come after this on
+// subsequent pages — see drawCabinetSteps.
 // ---------------------------------------------------------------------------
 function drawCabinetAssembly(
   doc: jsPDF,
@@ -837,65 +843,143 @@ function drawCabinetAssembly(
   doc.setFont('helvetica', 'normal');
   doc.setFontSize(10);
   doc.setTextColor(120);
+  const totalPanels = cab.panels?.length ?? cab.partIds.length;
   doc.text(
-    `${cab.partIds.length} panels — match each panel id to the layout pages`,
+    `${totalPanels} panels — what's in the box`,
     PAGE_PAD, PAGE_PAD + 22,
   );
   doc.setTextColor(0);
 
-  // Two-column layout: parts inventory (left, 25%) + diagrams (right, 75%)
+  // Two-column layout: assembled snapshot (left, ~50%) + parts table (right).
   const top = PAGE_PAD + 42;
   const bottom = PAGE_H - PAGE_PAD - 8;
-  const gutter = 18;
-  const inventoryW = Math.min(180, (PAGE_W - 2 * PAGE_PAD) * 0.22);
-  const diagramX = PAGE_PAD + inventoryW + gutter;
-  const diagramW = PAGE_W - PAGE_PAD - diagramX;
+  const gutter = 24;
+  const leftW = (PAGE_W - 2 * PAGE_PAD - gutter) * 0.50;
+  const rightX = PAGE_PAD + leftW + gutter;
+  const rightW = PAGE_W - PAGE_PAD - rightX;
   const diagramH = bottom - top;
 
-  // Left: parts inventory list
+  // Left: assembled snapshot
+  drawSnapshotPanel(doc, cab.assembled, PAGE_PAD, top, leftW, diagramH);
   doc.setFont('helvetica', 'bold');
   doc.setFontSize(9.5);
   doc.setTextColor(120);
-  doc.text('PANELS', PAGE_PAD, top + 4);
-  doc.setLineWidth(0.4);
-  doc.setDrawColor(225);
-  doc.line(PAGE_PAD, top + 9, PAGE_PAD + inventoryW, top + 9);
-  doc.setFont('helvetica', 'normal');
-  doc.setFontSize(11);
-  doc.setTextColor(40);
-  let iy = top + 26;
-  // Count duplicates so we can show "× 2" instead of two rows
-  const counts = new Map<string, number>();
-  for (const id of cab.partIds) counts.set(id, (counts.get(id) ?? 0) + 1);
-  for (const [id, n] of counts) {
-    if (iy > bottom - 12) break;
-    doc.text(id, PAGE_PAD, iy);
-    if (n > 1) {
-      doc.setTextColor(140);
-      doc.text(`× ${n}`, PAGE_PAD + 40, iy);
-      doc.setTextColor(40);
+  doc.text('ASSEMBLED', PAGE_PAD, top - 6);
+  doc.setTextColor(0);
+
+  // Right: parts inventory TABLE
+  drawCabinetPartsTable(doc, cab, opt, rightX, top, rightW, diagramH);
+}
+
+/**
+ * Parts inventory table: ID · Name · L × W · Thickness · Qty. De-duped by
+ * panel id so two instances of the same panel collapse into one row with
+ * "× 2" qty. Drawn inside the (x, y, w, h) box.
+ */
+function drawCabinetPartsTable(
+  doc: jsPDF,
+  cab: CabinetSnapshot,
+  opt: PdfOptions,
+  x: number,
+  y: number,
+  w: number,
+  h: number,
+) {
+  doc.setFont('helvetica', 'bold');
+  doc.setFontSize(9.5);
+  doc.setTextColor(120);
+  doc.text('PARTS', x, y - 6);
+  doc.setTextColor(0);
+
+  // Aggregate panels by id (panels is preferred; fall back to partIds)
+  type Row = { id: string; name: string; longMm: number; shortMm: number; thickness: number; qty: number; color: string };
+  const rowsById = new Map<string, Row>();
+  if (cab.panels && cab.panels.length > 0) {
+    for (const p of cab.panels) {
+      const ex = rowsById.get(p.id);
+      if (ex) ex.qty += 1;
+      else rowsById.set(p.id, {
+        id: p.id,
+        name: p.name,
+        longMm: Math.max(p.length, p.width),
+        shortMm: Math.min(p.length, p.width),
+        thickness: p.thickness,
+        qty: 1,
+        color: p.color,
+      });
     }
-    iy += 14;
+  } else {
+    for (const id of cab.partIds) {
+      const ex = rowsById.get(id);
+      if (ex) ex.qty += 1;
+      else rowsById.set(id, { id, name: '', longMm: 0, shortMm: 0, thickness: 0, qty: 1, color: '#cccccc' });
+    }
   }
+  const rows = Array.from(rowsById.values()).sort((a, b) => a.id.localeCompare(b.id));
 
-  // Right: exploded above + assembled below, sharing the column.
-  const halfH = (diagramH - gutter) / 2;
-  drawSnapshotPanel(doc, cab.exploded, diagramX, top, diagramW, halfH);
+  // Column layout
+  const cols = [
+    { key: 'ID',        x: x + 0,    align: 'left'  as const, w: 36 },
+    { key: 'NAME',      x: x + 44,   align: 'left'  as const, w: w * 0.30 },
+    { key: 'L × W',     x: x + 44 + w * 0.30 + 8, align: 'left' as const, w: w * 0.34 },
+    { key: 'THICK',     x: x + 44 + w * 0.30 + 8 + w * 0.34 + 8, align: 'left' as const, w: w * 0.16 },
+    { key: 'QTY',       x: x + w,    align: 'right' as const, w: 0 },
+  ];
+
+  // Header row
   doc.setFont('helvetica', 'bold');
-  doc.setFontSize(9.5);
-  doc.setTextColor(120);
-  doc.text('EXPLODED', diagramX, top + halfH + 14);
+  doc.setFontSize(8.5);
+  doc.setTextColor(110);
+  let hy = y + 10;
+  for (const c of cols) doc.text(c.key, c.x, hy, { align: c.align });
+  doc.setDrawColor(225);
+  doc.setLineWidth(0.4);
+  doc.line(x, hy + 4, x + w, hy + 4);
 
-  drawSnapshotPanel(doc, cab.assembled, diagramX, top + halfH + 20, diagramW, halfH - 20);
-  doc.text('ASSEMBLED', diagramX, top + halfH + halfH + 14);
+  // Rows
+  doc.setFont('helvetica', 'normal');
+  doc.setFontSize(10);
+  doc.setTextColor(40);
+  const lineH = 16;
+  let ry = hy + 18;
+  const bottomY = y + h;
+  for (const r of rows) {
+    if (ry > bottomY - 4) {
+      doc.setTextColor(140);
+      doc.setFontSize(9);
+      doc.text(`… and ${rows.length - rows.indexOf(r)} more`, x, ry);
+      break;
+    }
+    // Color swatch + id badge
+    const [cr, cg, cb] = hexToRgb(r.color);
+    doc.setFillColor(cr, cg, cb);
+    doc.rect(cols[0].x, ry - 8, 8, 10, 'F');
+    doc.setTextColor(40);
+    doc.setFont('helvetica', 'bold');
+    doc.text(r.id, cols[0].x + 12, ry);
+
+    doc.setFont('helvetica', 'normal');
+    const name = r.name.length > 28 ? r.name.slice(0, 25) + '…' : r.name;
+    doc.text(name, cols[1].x, ry);
+    doc.text(
+      r.longMm > 0 ? `${fmtDim(r.longMm, opt.units)} × ${fmtDim(r.shortMm, opt.units)}` : '—',
+      cols[2].x, ry,
+    );
+    doc.text(r.thickness > 0 ? fmtDim(r.thickness, opt.units) : '—', cols[3].x, ry);
+    doc.setFont('helvetica', 'bold');
+    doc.text(`× ${r.qty}`, cols[4].x, ry, { align: 'right' });
+    doc.setFont('helvetica', 'normal');
+    ry += lineH;
+  }
   doc.setTextColor(0);
 }
 
 // ---------------------------------------------------------------------------
-// Step-by-step assembly cards — one panel per card. Multiple cards per
-// page in a 2-up grid so each card has room for ANSI-style leader lines
-// to the dimensions. Panels are ordered by area descending so the user
-// installs structural panels first.
+// IKEA-style step-by-step assembly pages.
+// Each step renders a snapshot of the assembly state with the new panel
+// floating in along its face normal. No dimensions on each card — those
+// live in the parts table on the cabinet cover page. Numbered badge +
+// panel id chip is all the extra UI per step.
 // ---------------------------------------------------------------------------
 function drawCabinetSteps(
   doc: jsPDF,
@@ -904,48 +988,37 @@ function drawCabinetSteps(
   dims: { w: number; h: number },
   openNewPage: () => void,
 ) {
-  if (!cab.panels || cab.panels.length === 0) return;
+  if (!cab.steps || cab.steps.length === 0) return;
   const PAGE_W = dims.w;
   const PAGE_H = dims.h;
 
-  // De-duplicate by (id) so two instances of the same panel share one card
-  // with a "× 2" qty pill instead of getting two near-identical cards.
-  const dedup = new Map<string, { panel: CabinetPanel; qty: number }>();
-  for (const p of cab.panels) {
-    const ex = dedup.get(p.id);
-    if (ex) ex.qty += 1;
-    else dedup.set(p.id, { panel: p, qty: 1 });
-  }
-  const steps = Array.from(dedup.values())
-    .sort((a, b) => (b.panel.length * b.panel.width) - (a.panel.length * a.panel.width));
-
-  // 2-up grid: 2 cols × 2 rows = 4 cards per page on widescreen.
+  // 2 × 2 grid → 4 large step images per page on widescreen. Each card is
+  // mostly image — IKEA-style, almost no text. Step number + panel id only.
   const cols = 2;
   const rows = 2;
   const cardGutter = 18;
-  const top = PAGE_PAD + 36;
+  const top = PAGE_PAD + 32;
   const bottom = PAGE_H - PAGE_PAD;
   const innerW = PAGE_W - 2 * PAGE_PAD;
   const cardW = (innerW - cardGutter * (cols - 1)) / cols;
   const cardH = (bottom - top - cardGutter * (rows - 1)) / rows;
   const perPage = cols * rows;
 
-  for (let i = 0; i < steps.length; i++) {
+  for (let i = 0; i < cab.steps.length; i++) {
     const onPage = i % perPage;
     if (i === 0 || onPage === 0) {
       if (i > 0) openNewPage();
-      // Page header
       doc.setFont('helvetica', 'bold');
       doc.setFontSize(16);
       doc.setTextColor(20);
-      doc.text(`${cab.name} — assembly steps`, PAGE_PAD, PAGE_PAD + 6);
+      doc.text(`${cab.name} — assembly`, PAGE_PAD, PAGE_PAD + 6);
       doc.setFont('helvetica', 'normal');
       doc.setFontSize(9.5);
       doc.setTextColor(120);
       const pageNum = Math.floor(i / perPage) + 1;
-      const pageCount = Math.ceil(steps.length / perPage);
+      const pageCount = Math.ceil(cab.steps.length / perPage);
       doc.text(
-        `Steps ${i + 1}–${Math.min(i + perPage, steps.length)} of ${steps.length}  ·  page ${pageNum} of ${pageCount}`,
+        `Steps ${i + 1}–${Math.min(i + perPage, cab.steps.length)} of ${cab.steps.length}  ·  page ${pageNum} of ${pageCount}`,
         PAGE_W - PAGE_PAD, PAGE_PAD + 6, { align: 'right' },
       );
       doc.setTextColor(0);
@@ -954,120 +1027,56 @@ function drawCabinetSteps(
     const row = Math.floor(onPage / cols);
     const x = PAGE_PAD + col * (cardW + cardGutter);
     const y = top + row * (cardH + cardGutter);
-    drawAssemblyStepCard(doc, steps[i].panel, steps[i].qty, i + 1, x, y, cardW, cardH, opt);
+    drawIkeaStepCard(doc, cab.steps[i], cab.stepPanelIds?.[i] ?? '', i + 1, x, y, cardW, cardH);
   }
 }
 
 /**
- * One assembly-step card: step number, panel id badge, qty pill, then a
- * to-scale silhouette of the panel with leader-line dimensions on the
- * long edge (top) and short edge (right). Thickness annotated in a
- * second-row caption.
+ * One IKEA-style step card: large snapshot fills most of the area; a
+ * numbered circle badge sits in the top-left, and the panel id chip
+ * sits in the top-right. No dimensions, no name, no clutter — same
+ * principle as IKEA's almost-wordless step diagrams.
  */
-function drawAssemblyStepCard(
+function drawIkeaStepCard(
   doc: jsPDF,
-  p: CabinetPanel,
-  qty: number,
+  img: SnapshotImage,
+  panelId: string,
   stepNum: number,
   x: number,
   y: number,
   w: number,
   h: number,
-  opt: PdfOptions,
 ) {
-  // Card frame
-  doc.setDrawColor(225);
-  doc.setLineWidth(0.6);
-  doc.setFillColor(252, 251, 247);
-  doc.rect(x, y, w, h, 'FD');
+  // Snapshot fills the card; the badge / id overlay on top.
+  drawSnapshotPanel(doc, img, x, y, w, h);
 
-  // Top row: step badge + panel id (left), qty (right)
-  const headerH = 36;
-  // Step badge — circle with the step number
-  const badgeR = 12;
-  const bx = x + 16 + badgeR;
-  const by = y + 6 + badgeR;
+  // Step badge — large dark circle with white step number, top-left
+  const badgeR = 16;
+  const bx = x + 14 + badgeR;
+  const by = y + 14 + badgeR;
   doc.setFillColor(30, 30, 30);
   doc.circle(bx, by, badgeR, 'F');
   doc.setTextColor(255);
   doc.setFont('helvetica', 'bold');
-  doc.setFontSize(13);
-  doc.text(String(stepNum), bx, by + 4.5, { align: 'center' });
+  doc.setFontSize(18);
+  doc.text(String(stepNum), bx, by + 6, { align: 'center' });
   doc.setTextColor(0);
 
-  // Panel id large
-  doc.setFont('helvetica', 'bold');
-  doc.setFontSize(20);
-  doc.text(p.id, bx + badgeR + 12, by + 7);
-
-  // Qty pill (only if > 1)
-  if (qty > 1) {
-    const pillText = `× ${qty}`;
+  // Panel id chip — top-right
+  if (panelId) {
     doc.setFont('helvetica', 'bold');
-    doc.setFontSize(11);
-    const tw = doc.getTextWidth(pillText) + 14;
-    const px = x + w - 12 - tw;
-    const py = y + 10;
-    doc.setFillColor(232, 226, 210);
-    doc.roundedRect(px, py, tw, 18, 9, 9, 'F');
-    doc.setTextColor(60);
-    doc.text(pillText, px + tw / 2, py + 12.5, { align: 'center' });
+    doc.setFontSize(13);
+    const tw = doc.getTextWidth(panelId) + 18;
+    const px = x + w - 14 - tw;
+    const py = y + 14;
+    doc.setFillColor(255, 255, 255);
+    doc.setDrawColor(60);
+    doc.setLineWidth(0.6);
+    doc.roundedRect(px, py, tw, 24, 6, 6, 'FD');
+    doc.setTextColor(30);
+    doc.text(panelId, px + tw / 2, py + 16, { align: 'center' });
     doc.setTextColor(0);
   }
-
-  // Silhouette area: below header, leaving caption row at bottom
-  const captionH = 32;
-  const silTop = y + headerH + 6;
-  const silBottom = y + h - captionH - 4;
-  // Reserve margin for dimension callouts (top + right + bottom + left)
-  const dimPad = 26;
-  const silMaxW = w - 2 * dimPad - 16;
-  const silMaxH = silBottom - silTop - 2 * dimPad;
-  // Long edge horizontal in the silhouette (matches the per-sheet layout
-  // convention) — even if (p.length, p.width) came in either order, force
-  // length-as-X.
-  const longMm = Math.max(p.length, p.width);
-  const shortMm = Math.min(p.length, p.width);
-  const aspect = longMm / shortMm;
-  let drawW = silMaxW;
-  let drawH = drawW / aspect;
-  if (drawH > silMaxH) { drawH = silMaxH; drawW = drawH * aspect; }
-  const cx = x + w / 2;
-  const cy = (silTop + silBottom) / 2;
-  const rx = cx - drawW / 2;
-  const ry = cy - drawH / 2;
-
-  // Panel silhouette — color fill + dark border
-  const [cr, cg, cb] = hexToRgb(p.color);
-  const GS = (doc as any).GState;
-  if (GS) (doc as any).setGState(new GS({ opacity: 0.40 }));
-  doc.setFillColor(cr, cg, cb);
-  doc.rect(rx, ry, drawW, drawH, 'F');
-  if (GS) (doc as any).setGState(new GS({ opacity: 1 }));
-  doc.setDrawColor(Math.floor(cr * 0.55), Math.floor(cg * 0.55), Math.floor(cb * 0.55));
-  doc.setLineWidth(0.8);
-  doc.rect(rx, ry, drawW, drawH, 'S');
-
-  // Leader-line dimensions: long edge ABOVE the silhouette, short edge to
-  // its RIGHT. Reuses the existing ANSI dim helpers.
-  drawDimH(doc, rx, rx + drawW, ry - 8, fmtDim(longMm, opt.units));
-  drawDimV(doc, ry, ry + drawH, rx + drawW + 8, fmtDim(shortMm, opt.units));
-
-  // Caption row: name + thickness
-  doc.setFont('helvetica', 'normal');
-  doc.setFontSize(10);
-  doc.setTextColor(80);
-  const nameY = y + h - captionH + 12;
-  const name = p.name.length > 48 ? p.name.slice(0, 45) + '…' : p.name;
-  doc.text(name, x + 14, nameY);
-  doc.setFont('helvetica', 'bold');
-  doc.setFontSize(11);
-  doc.setTextColor(30);
-  doc.text(
-    `${fmtDim(p.thickness, opt.units)} thick`,
-    x + w - 14, nameY, { align: 'right' },
-  );
-  doc.setTextColor(0);
 }
 
 // ---------------------------------------------------------------------------

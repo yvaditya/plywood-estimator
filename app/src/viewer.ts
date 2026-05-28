@@ -603,6 +603,11 @@ export class Viewer {
     visibleIds: Set<number>,
     directions: Map<number, [number, number, number]> | null,
     distance: number,
+    /** When provided, frame the camera to THESE bodies instead of `visibleIds`.
+     *  Used for IKEA-style step snapshots so every step in a sequence shares
+     *  one consistent camera (frameIds = the full cabinet, even when only a
+     *  subset is visible this step). */
+    frameIds?: Set<number>,
   ): { dataUrl: string; width: number; height: number } {
     // 1. Snapshot current visibility + positions
     const visBackup = new Map<number, boolean>();
@@ -626,7 +631,8 @@ export class Viewer {
       far: this.camera.far,
     };
     const box = new THREE.Box3();
-    for (const b of this.bodies) if (visibleIds.has(b.id)) box.expandByObject(b.mesh);
+    const fids = frameIds ?? visibleIds;
+    for (const b of this.bodies) if (fids.has(b.id)) box.expandByObject(b.mesh);
     if (!box.isEmpty()) {
       const size = new THREE.Vector3(); box.getSize(size);
       const center = new THREE.Vector3(); box.getCenter(center);

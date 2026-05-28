@@ -1294,7 +1294,32 @@ downloadPdfBtn.addEventListener('click', () => {
       const panels = ids
         .map((id) => panelById.get(id))
         .filter((p): p is import('./pdf').CabinetPanel => p !== undefined);
-      cabinets.push({ name: tag, partIds: ids, panels, assembled, exploded });
+
+      // IKEA-style per-step snapshots: install one body at a time. For step i
+      // we render bodies[0..i] visible, with body i alone floating along its
+      // face-normal so the user sees where it's being installed. All steps
+      // share one camera (frameIds = the full cabinet) so the scale doesn't
+      // jump between steps.
+      const stepDist = explodeDist * 0.55;
+      const steps: import('./pdf').SnapshotImage[] = [];
+      const stepPanelIds: string[] = [];
+      for (let i = 0; i < bodies.length; i++) {
+        const installed = new Set<number>();
+        for (let j = 0; j <= i; j++) installed.add(bodies[j].id);
+        const stepDirs = new Map<number, [number, number, number]>();
+        const dir = directions.get(bodies[i].id);
+        if (dir) stepDirs.set(bodies[i].id, dir);
+        const img = viewer.snapshotFiltered(installed, stepDirs, stepDist, visibleIds);
+        steps.push(img);
+        const arr = idByBodyPartId.get(String(bodies[i].id)) ?? [];
+        stepPanelIds.push(arr[0] ?? `body ${bodies[i].id}`);
+      }
+
+      cabinets.push({
+        name: tag, partIds: ids, panels,
+        assembled, exploded,
+        steps, stepPanelIds,
+      });
     }
     // Backwards-compat fallback: combined all-cabinet snapshots (used
     // when a future caller doesn't populate `cabinets`).
