@@ -811,17 +811,17 @@ export function packOne(job: PackJob, heur: Heuristic, order: PackInput[]): Mult
     return true;
   });
 
-  // When the user asked for 'guillotine' (Min cuts), we sort by height
-  // descending and pre-place into a SHELF bin — FFDH. The pipeline still
-  // honours `heur` for the MaxRects path; for the shelf path heur is ignored.
-  const sortedRemaining = job.cutStrategy === 'guillotine'
-    ? remaining.slice().sort((a, b) => {
-        const ha = Math.max(a.h, a.w);
-        const hb = Math.max(b.h, b.w);
-        return hb - ha;
-      })
-    : remaining;
-  remaining = sortedRemaining;
+  // The shelf packer (guillotine / Min cuts) places parts in the ORDER given
+  // and ignores `heur`, so its layout is fully determined by insertion order.
+  // We therefore let the multi-restart wrapper explore orders here too. This
+  // was previously force-sorted to one fixed longest-side-descending order,
+  // which made every restart identical — the optimiser was a no-op for Min
+  // cuts (256 trials, one unique result, a flat convergence chart). That same
+  // First-Fit-Decreasing-Height order is still always tried (it's the `bySide`
+  // order in packMulti/packMultiAnimated), so the FFDH-quality candidate is
+  // preserved while shuffles hunt for layouts with fewer cuts; the min-cuts
+  // objective in isBetter keeps the best, so this can only match or improve.
+  // (MaxRects 'free'/'save-last' already honoured the passed order.)
 
   while (remaining.length > 0) {
     const bin: BinPacker = job.cutStrategy === 'guillotine'

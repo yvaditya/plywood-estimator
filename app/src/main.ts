@@ -824,9 +824,6 @@ nestBtn.addEventListener('click', async () => {
   // during the estimate (the user gets a fast 'final state' on completion).
   state.lastTrialFrames = [];
   state.lastTrialMetrics = [];
-  let bestCutsSoFar = Infinity;
-  let bestSheetsSoFar = Infinity;
-  let bestYieldSoFar = 0;
 
   try {
     const result = await runNestAnimated(parts, {
@@ -851,26 +848,21 @@ nestBtn.addEventListener('click', async () => {
         total: info.totalTrials,
         isNewBest: info.isNewBest,
       });
-      // Per-trial metrics for the convergence chart. Every strategy records a
-      // cut tree now (MaxRects layouts get one recovered post-pack), so we use
-      // its real cut count; the edge-line estimate stays only as a defensive
-      // fallback for the (shouldn't-happen) empty-cuts case.
-      const tCuts = info.current.reduce((a, s) => a + (s.cuts?.length ? s.cuts.length : estimateCutsFromLayout(s)), 0);
-      const tSheets = info.current.length;
-      const tUsed = info.current.reduce((a, s) => a + s.usedArea, 0);
-      const tTotal = info.current.reduce((a, s) => a + s.sheetW * s.sheetL, 0);
-      const tYield = tTotal > 0 ? (tUsed / tTotal) * 100 : 0;
-      bestCutsSoFar = Math.min(bestCutsSoFar, tCuts);
-      bestSheetsSoFar = Math.min(bestSheetsSoFar, tSheets);
-      bestYieldSoFar = Math.max(bestYieldSoFar, tYield);
+      // Per-trial metrics for the convergence chart. The "best" series is the
+      // ACTUALLY-SELECTED layout so far (info.best), NOT an independent running
+      // min/max per metric — the latter showed a phantom solution no single
+      // layout achieved (e.g. "2 cuts" borrowed from a sparse, discarded
+      // trial). Cut counts use the real recorded tree plus the two margin-trim
+      // cuts, so the chart, the metrics panel, and the PDF all agree for every
+      // optimisation method.
       state.lastTrialMetrics.push({
         i: info.trial,
-        cuts: tCuts,
-        sheets: tSheets,
-        yieldPct: tYield,
-        bestCuts: bestCutsSoFar,
-        bestSheets: bestSheetsSoFar,
-        bestYield: bestYieldSoFar,
+        cuts: info.current.reduce((a, s) => a + sheetCutTotal(s, margin), 0),
+        sheets: info.current.length,
+        yieldPct: sumYield(info.current) * 100,
+        bestCuts: info.best.reduce((a, s) => a + sheetCutTotal(s, margin), 0),
+        bestSheets: info.best.length,
+        bestYield: sumYield(info.best) * 100,
       });
     });
 
@@ -1001,23 +993,14 @@ function renderConvergenceChart() {
     </svg>`;
 }
 
-/** Estimate total cut count for a sheet by counting distinct interior X
- *  and Y edge lines from the placed parts. Used for the convergence chart
- *  when the cut strategy (free / MaxRects) doesn't produce a guillotine
- *  tree. Rounds positions to the nearest 0.5mm so float-noise duplicates
- *  collapse. Each interior line counts as one cut; the +4 covers the
- *  margin-trim cuts when there's a sheet margin. */
-function estimateCutsFromLayout(sheet: NestSheet): number {
-  const xs = new Set<string>();
-  const ys = new Set<string>();
-  const snap = (v: number) => (Math.round(v * 2) / 2).toFixed(1);
-  for (const p of sheet.parts) {
-    if (p.x > 0.5) xs.add(snap(p.x));
-    if (p.x + p.w < sheet.sheetW - 0.5) xs.add(snap(p.x + p.w));
-    if (p.y > 0.5) ys.add(snap(p.y));
-    if (p.y + p.h < sheet.sheetL - 0.5) ys.add(snap(p.y + p.h));
-  }
-  return xs.size + ys.size;
+/** True number of physical cuts for one sheet — its recorded guillotine cut
+ *  tree (recovered post-pack for MaxRects 'free'/'save-last' layouts, native
+ *  for the shelf packer) plus the two margin-trim cuts when there's a sheet
+ *  margin. This is exactly the per-sheet count printed on the PDF
+ *  cut-sequence cards, so the on-screen metrics, the convergence chart, and
+ *  the document agree across every cut strategy. */
+function sheetCutTotal(sheet: NestSheet, margin: number): number {
+  return (sheet.cuts?.length ?? 0) + (margin > 0 ? 2 : 0);
 }
 
 function sumYield(sheets: NestSheet[]): number {
@@ -1154,24 +1137,14 @@ function renderJobMetrics() {
     });
   });
 
-  // Cut-count estimate: count unique X edges + unique Y edges across all
-  // placed parts on each sheet. Snaps coords to 0.5mm so float wobble
-  // doesn't inflate the count.
+  // Total physical cuts across the job — the real recorded cut tree per
+  // sheet plus margin trims, the same count shown on the PDF cut cards.
+  // (Previously an interior-edge estimate that overcounted and ignored the
+  // guillotine tree, so it disagreed with the document.)
+  const margin = state.lastSheet?.margin ?? 0;
   let totalCuts = 0;
   for (const g of result.groups) {
-    for (const s of g.sheets) {
-      const xs = new Set<number>();
-      const ys = new Set<number>();
-      const snap = (n: number) => Math.round(n * 2) / 2;
-      for (const p of s.parts) {
-        // Skip the outer sheet edges — those aren't "cuts" the user makes.
-        if (p.x > 0.5)         xs.add(snap(p.x));
-        if (p.x + p.w < s.sheetW - 0.5) xs.add(snap(p.x + p.w));
-        if (p.y > 0.5)         ys.add(snap(p.y));
-        if (p.y + p.h < s.sheetL - 0.5) ys.add(snap(p.y + p.h));
-      }
-      totalCuts += xs.size + ys.size;
-    }
+    for (const s of g.sheets) totalCuts += sheetCutTotal(s, margin);
   }
 
   detailMetrics.innerHTML = `
