@@ -851,8 +851,12 @@ nestBtn.addEventListener('click', async () => {
         total: info.totalTrials,
         isNewBest: info.isNewBest,
       });
-      // Per-trial metrics for the convergence chart.
-      const tCuts = info.current.reduce((a, s) => a + (s.cuts?.length ?? 0), 0);
+      // Per-trial metrics for the convergence chart. MaxRects packing
+      // doesn't emit a guillotine cut tree (sh.cuts is empty), so when
+      // sh.cuts is empty we estimate cut count by counting distinct
+      // interior X and Y edge lines across the sheet — a faithful proxy
+      // even when no guillotine tree was recorded.
+      const tCuts = info.current.reduce((a, s) => a + (s.cuts?.length ? s.cuts.length : estimateCutsFromLayout(s)), 0);
       const tSheets = info.current.length;
       const tUsed = info.current.reduce((a, s) => a + s.usedArea, 0);
       const tTotal = info.current.reduce((a, s) => a + s.sheetW * s.sheetL, 0);
@@ -996,6 +1000,25 @@ function renderConvergenceChart() {
       <text x="${PAD_L}" y="${H - 6}" class="conv-label">trial 1</text>
       <text x="${PAD_L + plotW}" y="${H - 6}" class="conv-label" text-anchor="end">trial ${trialLabel(N - 1)}</text>
     </svg>`;
+}
+
+/** Estimate total cut count for a sheet by counting distinct interior X
+ *  and Y edge lines from the placed parts. Used for the convergence chart
+ *  when the cut strategy (free / MaxRects) doesn't produce a guillotine
+ *  tree. Rounds positions to the nearest 0.5mm so float-noise duplicates
+ *  collapse. Each interior line counts as one cut; the +4 covers the
+ *  margin-trim cuts when there's a sheet margin. */
+function estimateCutsFromLayout(sheet: NestSheet): number {
+  const xs = new Set<string>();
+  const ys = new Set<string>();
+  const snap = (v: number) => (Math.round(v * 2) / 2).toFixed(1);
+  for (const p of sheet.parts) {
+    if (p.x > 0.5) xs.add(snap(p.x));
+    if (p.x + p.w < sheet.sheetW - 0.5) xs.add(snap(p.x + p.w));
+    if (p.y > 0.5) ys.add(snap(p.y));
+    if (p.y + p.h < sheet.sheetL - 0.5) ys.add(snap(p.y + p.h));
+  }
+  return xs.size + ys.size;
 }
 
 function sumYield(sheets: NestSheet[]): number {
