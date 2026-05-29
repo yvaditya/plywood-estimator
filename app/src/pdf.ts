@@ -1725,7 +1725,7 @@ function drawCutCard(
   let edgeRef: string;
   if (cur.isTrim) {
     label = 'Trim margin';
-    edgeRef = '(square the sheet)';
+    edgeRef = '(reference edge)';
   } else {
     label = cur.axis === 'rip' ? 'Rip' : 'Crosscut';
     edgeRef = cur.axis === 'rip' ? 'from L edge' : 'from B edge';

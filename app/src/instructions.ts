@@ -127,31 +127,24 @@ export function cutStepsForSheet(
   const L = sheet.sheetL;
   const lengthIsY = L >= W;
 
-  // Margin trim cuts come first when margin > 0 — strip the perimeter so the
-  // remaining stock matches the bin space the packer used. Four cuts (L, R,
-  // B, T), each on the piece left after the previous trim.
+  // Margin trim cuts come first when margin > 0. We only need TWO trim cuts
+  // to establish a reference corner — one along a long edge and one
+  // perpendicular to it. The remaining margins (right + top) get absorbed
+  // naturally by the per-part separating cuts and the leftover strips fall
+  // off as waste; the user doesn't need to "square" all four edges.
   const trimSteps: CutStep[] = [];
   if (margin > 0) {
     const m = margin;
-    // After "trim L" the active piece starts at x=m.
-    // After "trim R" it ends at x=W-m, so width = W-2m.
-    // After "trim B" it starts at y=m.
-    // After "trim T" it ends at y=L-m, so height = L-2m.
+    // Trim 1 — long edge along the sheet's LENGTH axis (rip).
     trimSteps.push({
       index: 1, axis: lengthIsY ? 'rip' : 'cross', distance: m,
       parentX: 0, parentY: 0, parentW: W, parentH: L, depth: 0, isTrim: true,
     });
+    // Trim 2 — perpendicular short edge (crosscut), on the piece left
+    // after trim 1.
     trimSteps.push({
-      index: 2, axis: lengthIsY ? 'rip' : 'cross', distance: W - 2 * m,
+      index: 2, axis: lengthIsY ? 'cross' : 'rip', distance: m,
       parentX: m, parentY: 0, parentW: W - m, parentH: L, depth: 0, isTrim: true,
-    });
-    trimSteps.push({
-      index: 3, axis: lengthIsY ? 'cross' : 'rip', distance: m,
-      parentX: m, parentY: 0, parentW: W - 2 * m, parentH: L, depth: 0, isTrim: true,
-    });
-    trimSteps.push({
-      index: 4, axis: lengthIsY ? 'cross' : 'rip', distance: L - 2 * m,
-      parentX: m, parentY: m, parentW: W - 2 * m, parentH: L - m, depth: 0, isTrim: true,
     });
   }
   const offset = trimSteps.length;
