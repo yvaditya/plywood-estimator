@@ -851,11 +851,10 @@ nestBtn.addEventListener('click', async () => {
         total: info.totalTrials,
         isNewBest: info.isNewBest,
       });
-      // Per-trial metrics for the convergence chart. MaxRects packing
-      // doesn't emit a guillotine cut tree (sh.cuts is empty), so when
-      // sh.cuts is empty we estimate cut count by counting distinct
-      // interior X and Y edge lines across the sheet — a faithful proxy
-      // even when no guillotine tree was recorded.
+      // Per-trial metrics for the convergence chart. Every strategy records a
+      // cut tree now (MaxRects layouts get one recovered post-pack), so we use
+      // its real cut count; the edge-line estimate stays only as a defensive
+      // fallback for the (shouldn't-happen) empty-cuts case.
       const tCuts = info.current.reduce((a, s) => a + (s.cuts?.length ? s.cuts.length : estimateCutsFromLayout(s)), 0);
       const tSheets = info.current.length;
       const tUsed = info.current.reduce((a, s) => a + s.usedArea, 0);

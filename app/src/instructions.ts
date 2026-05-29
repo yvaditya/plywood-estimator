@@ -110,12 +110,16 @@ export function indexToLetters(i: number): string {
 /**
  * Cut steps for a single sheet.
  *
- *   - GUILLOTINE mode: walks the real cut tree captured by the packer.
- *     Each step references its parent piece and the cut's local distance.
- *     Already ordered "biggest cuts first" by depth.
- *   - MaxRects mode (no tree): falls back to unique interior X/Y edges as
- *     an APPROXIMATION. These cuts may not be physically realizable as
- *     edge-to-edge in one pass, but they describe the cut LINES.
+ *   - CUT-TREE path: walks the real cut tree on the sheet. Every strategy
+ *     now carries one — the shelf packer builds it directly, and MaxRects
+ *     ('free' / 'save-last') layouts get one recovered by deriveGuillotineCuts
+ *     (see packRect.ts). Each step references its parent SUB-PIECE and the
+ *     cut's local distance, ordered "biggest cuts first" by depth, so a cut
+ *     never spans more than the piece it acts on.
+ *   - FALLBACK path: only if a sheet somehow has no recorded cuts, infer
+ *     unique interior X/Y edges as full-sheet lines. This is an
+ *     APPROXIMATION — such lines may cross neighbouring panels — kept solely
+ *     as a defensive last resort.
  */
 export function cutStepsForSheet(
   sheet: NestSheet,
@@ -149,7 +153,8 @@ export function cutStepsForSheet(
   }
   const offset = trimSteps.length;
 
-  // Path 1: guillotine cut tree available — translate Cut → CutStep.
+  // Cut-tree path: a recorded tree exists (shelf packer, or recovered from a
+  // MaxRects layout) — translate each Cut → CutStep within its sub-piece.
   if (sheet.cuts && sheet.cuts.length > 0) {
     const steps: CutStep[] = sheet.cuts.map((c: Cut, i) => {
       // Axis mapping → user-facing rip/cross terminology.
@@ -180,8 +185,9 @@ export function cutStepsForSheet(
     };
   }
 
-  // Path 2 (fallback): infer unique interior edges. The "parent piece" for
-  // these synthetic steps is just the whole sheet.
+  // Fallback (defensive only — every strategy now records a cut tree): infer
+  // unique interior edges as full-sheet lines. The "parent piece" for these
+  // synthetic steps is the whole sheet, so they may cross panels.
   const xs = new Set<number>();
   const ys = new Set<number>();
   const snap = (n: number) => Math.round(n * 2) / 2;

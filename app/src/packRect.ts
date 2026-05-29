@@ -481,6 +481,171 @@ function guillotineSplit(f: FreeRect, w: number, h: number, childDepth: number):
   return out;
 }
 
+/**
+ * Recover a guillotine cut tree from an ARBITRARY set of non-overlapping
+ * placed rectangles — i.e. a MaxRects ('free' / 'save-last') layout, which
+ * maximises yield but tracks no cut tree of its own. Most such layouts are
+ * still fully guillotine-cuttable; we just have to FIND the cut sequence.
+ *
+ * Why this exists: without it the cut sequence for non-guillotine strategies
+ * fell back to "one full-sheet line per unique part edge", which slices
+ * straight through any neighbouring panel that doesn't share that edge.
+ * Here every cut is edge-to-edge across its OWN sub-piece, so it never
+ * crosses a panel (for guillotine-separable layouts — the common case).
+ *
+ * Algorithm — recursive edge-to-edge decomposition. In each region, pick a
+ * full-span line lying on an existing part edge that splits the region in
+ * two, then recurse on each half. The line is chosen to
+ *   (1) not slice through any part (a "clean" line),
+ *   (2) prefer separating two part groups over merely trimming waste,
+ *   (3) split as evenly as possible, then sit nearest the reference edge.
+ * A region holding a single part that fills it needs no cut — recursion ends.
+ *
+ * Cuts are ONLY ever placed where they cross no part — so a cut never slices
+ * an adjacent panel. Non-guillotine arrangements (e.g. a 4-part pinwheel)
+ * have no clean line in some sub-region; we make every clean cut that IS
+ * possible (which still peels off everything separable) and stop at the
+ * irreducible block, leaving its few interlocked parts joined rather than
+ * sawing through one. This is rare for rectangular sheet-good layouts, and
+ * 'free' mode is explicitly "any cuts / max yield" — users wanting a fully
+ * edge-to-edge sequence pick the 'guillotine' (min-cuts) strategy.
+ *
+ * `rects` and the returned cuts are in the bin's native (kerf-inflated)
+ * frame — the same frame GuillotineBin/ShelfBin use — so callers downstream
+ * (margin shift in nest.ts, cutStepsForSheet) treat all strategies alike.
+ */
+function deriveGuillotineCuts(rects: Rect[], binW: number, binH: number): Cut[] {
+  const cuts: Cut[] = [];
+  const EPS = 0.5; // mm — tolerant of STEP-tessellation float noise on edges
+  // A clean tree needs < 2·N cuts; cap well above that so a pathological
+  // input can never spin (every cut is expected to make progress anyway).
+  const maxCuts = rects.length * 6 + 16;
+
+  interface Line {
+    axis: 'H' | 'V';
+    coord: number;     // absolute cut coordinate (X for V, Y for H)
+    separates: boolean; // whole parts on BOTH sides (vs. trimming waste)
+    balance: number;   // |partsOnOneSide − partsOnOther|, lower = more even
+    dist: number;      // distance from the region's reference edge
+  }
+
+  const betterLine = (a: Line, b: Line): boolean => {
+    if (a.separates !== b.separates) return a.separates;               // real splits before trims
+    if (Math.abs(a.balance - b.balance) > EPS) return a.balance < b.balance; // even split
+    return a.dist < b.dist;                                            // then nearest reference edge
+  };
+
+  // Best CLEAN full-span line for one region (one that slices no part), or
+  // null if none exists — meaning the region is either a single part that
+  // fills it, or an irreducible non-guillotine block we leave intact.
+  const pickLine = (rx: number, ry: number, rw: number, rh: number, items: Rect[]): Line | null => {
+    const vSet = new Set<number>(); // candidate X coords (vertical cuts)
+    const hSet = new Set<number>(); // candidate Y coords (horizontal cuts)
+    for (const it of items) {
+      if (it.x       > rx + EPS && it.x       < rx + rw - EPS) vSet.add(it.x);
+      if (it.x + it.w > rx + EPS && it.x + it.w < rx + rw - EPS) vSet.add(it.x + it.w);
+      if (it.y       > ry + EPS && it.y       < ry + rh - EPS) hSet.add(it.y);
+      if (it.y + it.h > ry + EPS && it.y + it.h < ry + rh - EPS) hSet.add(it.y + it.h);
+    }
+    let best: Line | null = null;
+    const consider = (axis: 'H' | 'V', coord: number) => {
+      let lo = 0, hi = 0;
+      for (const it of items) {
+        const a = axis === 'V' ? it.x : it.y;
+        const b = axis === 'V' ? it.x + it.w : it.y + it.h;
+        if (b <= coord + EPS) lo++;        // wholly below/left of the line
+        else if (a >= coord - EPS) hi++;   // wholly above/right of the line
+        else return;                       // a part straddles → not a clean cut
+      }
+      const line: Line = {
+        axis, coord,
+        separates: lo > 0 && hi > 0,
+        balance: Math.abs(lo - hi),
+        dist: axis === 'V' ? coord - rx : coord - ry,
+      };
+      if (!best || betterLine(line, best)) best = line;
+    };
+    vSet.forEach((c) => consider('V', c));
+    hSet.forEach((c) => consider('H', c));
+    return best;
+  };
+
+  const decompose = (rx: number, ry: number, rw: number, rh: number, items: Rect[], depth: number) => {
+    if (items.length === 0 || cuts.length >= maxCuts) return;
+    const line = pickLine(rx, ry, rw, rh, items);
+    // null → a single part fills this region (done), or ≥2 parts interlock
+    // with no clean line (irreducible non-guillotine block) — leave intact.
+    if (!line) return;
+    if (line.axis === 'V') {
+      const xc = line.coord;
+      cuts.push({ parentX: rx, parentY: ry, parentW: rw, parentH: rh, axis: 'V', distance: xc - rx, depth });
+      // No straddlers (the line is clean), so an edge test partitions exactly.
+      const left: Rect[] = [], right: Rect[] = [];
+      for (const it of items) (it.x + it.w <= xc + EPS ? left : right).push(it);
+      decompose(rx, ry, xc - rx, rh, left, depth + 1);
+      decompose(xc, ry, rx + rw - xc, rh, right, depth + 1);
+    } else {
+      const yc = line.coord;
+      cuts.push({ parentX: rx, parentY: ry, parentW: rw, parentH: rh, axis: 'H', distance: yc - ry, depth });
+      const bottom: Rect[] = [], top: Rect[] = [];
+      for (const it of items) (it.y + it.h <= yc + EPS ? bottom : top).push(it);
+      decompose(rx, ry, rw, yc - ry, bottom, depth + 1);
+      decompose(rx, yc, rw, ry + rh - yc, top, depth + 1);
+    }
+  };
+
+  decompose(0, 0, binW, binH, rects.slice(), 0);
+
+  // Order "biggest cuts first" — all full-sheet (depth 0) cuts, then cuts
+  // within strips, etc. Matches the depth-sort packOne applies to the
+  // guillotine path, so a downstream re-sort is a no-op.
+  cuts.sort((a, b) => {
+    if (a.depth !== b.depth) return a.depth - b.depth;
+    if (a.parentY !== b.parentY) return a.parentY - b.parentY;
+    return a.parentX - b.parentX;
+  });
+  return cuts;
+}
+
+/**
+ * Replay a (depth-ordered) cut tree over the bin and count parts that end up
+ * ALONE in a final piece — i.e. fully freed by the cuts. Equals the part
+ * count for a fully guillotine-cuttable layout; lower when parts interlock
+ * in a non-guillotine block. Works for any tree (shelf or recovered), so it
+ * lets the optimiser compare strategies on a common "cuttability" axis.
+ */
+function countFreedParts(cuts: Cut[], rects: Rect[], binW: number, binH: number): number {
+  const EPS = 0.5;
+  interface Reg { x: number; y: number; w: number; h: number; items: number[] }
+  let regions: Reg[] = [{ x: 0, y: 0, w: binW, h: binH, items: rects.map((_, i) => i) }];
+  for (const c of cuts) {
+    const next: Reg[] = [];
+    for (const r of regions) {
+      // Does this cut act on THIS region? (parent rect matches)
+      const hit = Math.abs(r.x - c.parentX) < 1 && Math.abs(r.y - c.parentY) < 1 &&
+                  Math.abs(r.w - c.parentW) < 1 && Math.abs(r.h - c.parentH) < 1;
+      if (!hit) { next.push(r); continue; }
+      if (c.axis === 'V') {
+        const xc = c.parentX + c.distance;
+        next.push(
+          { x: r.x, y: r.y, w: xc - r.x, h: r.h, items: r.items.filter((i) => rects[i].x + rects[i].w <= xc + EPS) },
+          { x: xc, y: r.y, w: r.x + r.w - xc, h: r.h, items: r.items.filter((i) => rects[i].x + rects[i].w > xc + EPS) },
+        );
+      } else {
+        const yc = c.parentY + c.distance;
+        next.push(
+          { x: r.x, y: r.y, w: r.w, h: yc - r.y, items: r.items.filter((i) => rects[i].y + rects[i].h <= yc + EPS) },
+          { x: r.x, y: yc, w: r.w, h: r.y + r.h - yc, items: r.items.filter((i) => rects[i].y + rects[i].h > yc + EPS) },
+        );
+      }
+    }
+    regions = next;
+  }
+  let freed = 0;
+  for (const r of regions) if (r.items.length === 1) freed++;
+  return freed;
+}
+
 // ---------------------------------------------------------------------------
 // Heuristics
 // ---------------------------------------------------------------------------
@@ -593,9 +758,15 @@ export interface PackedSheet {
    *  "what could I cut from the leftover" for the user. */
   largestFree: { w: number; h: number } | null;
   /** Physical cuts that produced this layout, in dependency order
-   *  (depth-sorted: full-sheet cuts first, then sub-piece cuts).
-   *  Empty for MaxRects packing (which isn't guaranteed guillotine). */
+   *  (depth-sorted: full-sheet cuts first, then sub-piece cuts). Every
+   *  strategy records a tree now — MaxRects ('free'/'save-last') gets one
+   *  recovered by deriveGuillotineCuts. */
   cuts: Cut[];
+  /** How many parts the cut tree fully frees (each alone in a final piece).
+   *  Equals placements.length for a fully guillotine-cuttable layout; lower
+   *  when some parts interlock in a non-guillotine block. Used as a safe
+   *  tiebreaker so 'free' prefers cleanly-cuttable layouts at equal yield. */
+  fullySeparated: number;
 }
 
 export interface MultiSheetResult {
@@ -656,9 +827,12 @@ export function packOne(job: PackJob, heur: Heuristic, order: PackInput[]): Mult
     const bin: BinPacker = job.cutStrategy === 'guillotine'
       ? new ShelfBin(job.sheetW, job.sheetH)
       : new MaxRectsBin(job.sheetW, job.sheetH);
-    const cur: PackedSheet = { placements: [], usedArea: 0, largestFree: null, cuts: [] };
+    const cur: PackedSheet = { placements: [], usedArea: 0, largestFree: null, cuts: [], fullySeparated: 0 };
     const carry: PackInput[] = []; // didn't fit on THIS bin → try next bin
     let anyPlacedThisBin = false;
+    // Kerf-inflated footprints in bin coords — fed to the MaxRects cut-tree
+    // recovery so its cuts land in the same frame as the guillotine path.
+    const placedInflated: Rect[] = [];
 
     for (const item of remaining) {
       const w = item.w + job.kerf;
@@ -679,13 +853,21 @@ export function packOne(job: PackJob, heur: Heuristic, order: PackInput[]): Mult
         h: actualH,
         rotated: placed.rotated,
       });
+      placedInflated.push({ x: placed.x, y: placed.y, w: placed.w, h: placed.h });
       cur.usedArea += actualW * actualH;
       anyPlacedThisBin = true;
     }
 
     if (anyPlacedThisBin) {
-      // ShelfBin defers cut + free-rect computation until all parts are placed.
-      if (bin instanceof ShelfBin) bin.finalize();
+      if (bin instanceof ShelfBin) {
+        // ShelfBin defers cut + free-rect computation until all parts placed.
+        bin.finalize();
+      } else {
+        // MaxRects records no cut tree — recover a guillotine one from the
+        // placements so the cut sequence shows real edge-to-edge cuts within
+        // each sub-piece instead of full-sheet lines that cross panels.
+        bin.cuts = deriveGuillotineCuts(placedInflated, job.sheetW, job.sheetH);
+      }
       // Snapshot the largest remaining free rectangle (by area).
       let best: { w: number; h: number; a: number } | null = null;
       for (const f of bin.free) {
@@ -702,6 +884,7 @@ export function packOne(job: PackJob, heur: Heuristic, order: PackInput[]): Mult
         if (a.parentY !== b.parentY) return a.parentY - b.parentY;
         return a.parentX - b.parentX;
       });
+      cur.fullySeparated = countFreedParts(cur.cuts, placedInflated, job.sheetW, job.sheetH);
       sheets.push(cur);
       totalUsed += cur.usedArea;
     } else {
@@ -741,6 +924,7 @@ function repackLastSheetCorner(
 
   const bin = new MaxRectsBin(job.sheetW, job.sheetH);
   const placements: PackPlacement[] = [];
+  const placedInflated: Rect[] = [];
   let usedArea = 0;
   for (const item of items) {
     const w = item.w + job.kerf;
@@ -758,6 +942,7 @@ function repackLastSheetCorner(
       h: actualH,
       rotated: placed.rotated,
     });
+    placedInflated.push({ x: placed.x, y: placed.y, w: placed.w, h: placed.h });
     usedArea += actualW * actualH;
   }
   let best: { w: number; h: number; a: number } | null = null;
@@ -765,11 +950,15 @@ function repackLastSheetCorner(
     const a = f.w * f.h;
     if (!best || a > best.a) best = { w: f.w, h: f.h, a };
   }
+  // Recover a guillotine cut tree from the corner-clustered layout so its
+  // cut sequence is edge-to-edge per sub-piece (not full-sheet lines).
+  const cuts = deriveGuillotineCuts(placedInflated, job.sheetW, job.sheetH);
   return {
     placements,
     usedArea,
     largestFree: best ? { w: best.w, h: best.h } : null,
-    cuts: [], // MaxRects doesn't carry a guillotine cut tree
+    cuts,
+    fullySeparated: countFreedParts(cuts, placedInflated, job.sheetW, job.sheetH),
   };
 }
 
@@ -922,6 +1111,9 @@ function isBetter(a: MultiSheetResult, b: MultiSheetResult, strategy: CutStrateg
   const totalUsed = (r: MultiSheetResult) => r.sheets.reduce((s, sh) => s + sh.usedArea, 0);
   const lastUsed = (r: MultiSheetResult) => (r.sheets.length ? r.sheets[r.sheets.length - 1].usedArea : 0);
   const totalCuts = (r: MultiSheetResult) => r.sheets.reduce((s, sh) => s + (sh.cuts?.length ?? 0), 0);
+  // Parts the cut tree fully frees, job-wide. Higher = more cleanly
+  // guillotine-cuttable (fewer parts left joined in a non-guillotine block).
+  const freed = (r: MultiSheetResult) => r.sheets.reduce((s, sh) => s + (sh.fullySeparated ?? 0), 0);
 
   switch (strategy) {
     case 'guillotine': {
@@ -932,17 +1124,26 @@ function isBetter(a: MultiSheetResult, b: MultiSheetResult, strategy: CutStrateg
     }
     case 'save-last': {
       // Save last: prefer LOWER fill on the last sheet (so the remnant is
-      // bigger and reusable). Tie-break on higher overall yield.
+      // bigger and reusable). Then higher overall yield, then — at equal
+      // yield — the more cleanly cuttable layout.
       const al = lastUsed(a), bl = lastUsed(b);
       if (al !== bl) return al < bl;
-      return totalUsed(a) > totalUsed(b);
+      const at = totalUsed(a), bt = totalUsed(b);
+      if (at !== bt) return at > bt;
+      return freed(a) > freed(b);
     }
     case 'free':
     default: {
       // Max yield: prefer HIGHER total used area (= highest overall fill).
       const at = totalUsed(a), bt = totalUsed(b);
       if (at !== bt) return at > bt;
-      // Tie: more on the last sheet = packing parts as early as possible.
+      // At equal yield (the common case when everything fits), prefer the
+      // layout that's most cleanly guillotine-cuttable — this steers 'free'
+      // away from pinwheel/staircase nests whose cut sequence can't separate
+      // every panel, at ZERO cost to yield or sheet count.
+      const af = freed(a), bf = freed(b);
+      if (af !== bf) return af > bf;
+      // Then: more on the last sheet = packing parts as early as possible.
       return lastUsed(a) > lastUsed(b);
     }
   }
