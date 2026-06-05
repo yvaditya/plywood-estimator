@@ -347,11 +347,7 @@ export function analyzeBody(mesh: OcctMesh): BodyAnalysis | null {
     worldThickness >= SHEET_THICKNESS_MIN_MM &&
     worldThickness <= SHEET_THICKNESS_MAX_MM;
 
-  if (worldIsSheet) {
-    return analyzeAxisAligned(positions, indices, aabb, ext, thinIdx, bigIdx, midIdx);
-  }
-
-  // World axes don't show a sheet — try PCA-OBB (handles tilted panels).
+  // Always compute the PCA-OBB so we can sanity-check the world thickness.
   const obb = computeObb(positions);
   const obbIdxs = [0, 1, 2].sort((a, b) => obb.extents[a] - obb.extents[b]) as [number, number, number];
   const obbThin = obb.extents[obbIdxs[0]] * 2;
@@ -362,6 +358,24 @@ export function analyzeBody(mesh: OcctMesh): BodyAnalysis | null {
     obbThin >= SHEET_THICKNESS_MIN_MM &&
     obbThin <= SHEET_THICKNESS_MAX_MM;
 
+  // Tilt correction. The world AABB measures thickness along a world axis, so a
+  // panel that leans even a couple of degrees has its thin extent inflated by a
+  // slice of its own length/width (e.g. a 1/2" panel reads as 7/8" and gets
+  // split onto its own sheet). The OBB's least-variance axis stays perpendicular
+  // to the panel face regardless of tilt, so it recovers the true thickness.
+  // When the OBB finds a meaningfully thinner — and still sheet-valid —
+  // thickness, trust it over the (inflated) world reading.
+  //
+  // For a genuinely axis-aligned panel obbThin === worldThickness, so this never
+  // fires; the 0.9 guard also absorbs minor PCA/numerical wobble.
+  const tiltInflated = obbIsSheet && obbThin < worldThickness * 0.9;
+
+  if (worldIsSheet && !tiltInflated) {
+    return analyzeAxisAligned(positions, indices, aabb, ext, thinIdx, bigIdx, midIdx);
+  }
+
+  // Either the world axes don't show a sheet, or they over-report a tilted
+  // panel's thickness — use the OBB (handles tilted panels correctly).
   if (obbIsSheet) {
     return analyzeObb(positions, indices);
   }
