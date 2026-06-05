@@ -30,6 +30,7 @@ import {
   isCncStrategy,
 } from './nest';
 import { sheetToDxf, downloadDxf } from './dxf';
+import { buildStep, type StepPart } from './stepExport';
 import { buildPdf, downloadPdf, type InventoryCheck } from './pdf';
 import {
   buildShoppingList,
@@ -79,9 +80,6 @@ const state: {
   /** Per-fileTag UI state: collapsed (true) hides the bodies inside this
    *  file group. Defaults to expanded when a new file is loaded. */
   collapsedFiles: Set<string>;
-  /** Original uploaded STEP bytes, keyed by fileTag, so unplaced parts can be
-   *  re-downloaded as their source STEP file(s). */
-  sourceFiles: Map<string, { name: string; bytes: Uint8Array }>;
   /** Last optimisation's per-trial captured layouts (current and final).
    *  Replayed on demand via the play button beside the Cut layout title.
    *  Cleared each time a new estimate kicks off. */
@@ -104,7 +102,6 @@ const state: {
   partLabels: new Map(),
   nonSheetCount: 0,
   collapsedFiles: new Set<string>(),
-  sourceFiles: new Map<string, { name: string; bytes: Uint8Array }>(),
   lastTrialFrames: [],
   lastTrialMetrics: [],
 };
@@ -379,9 +376,6 @@ async function handleFiles(files: FileList | File[]) {
 
       // Strip path/extension for display.
       const tag = file.name.replace(/\.(step|stp)$/i, '');
-      // Keep the original bytes so unplaced parts can be re-downloaded as the
-      // source STEP file they came from.
-      state.sourceFiles.set(tag, { name: file.name, bytes: new Uint8Array(buf) });
       // Use the next-color slot per body so each new file's colors continue.
       const colorBase = state.bodies.length;
       // Bodies list starts COLLAPSED at the file level — opens on a click.
@@ -453,7 +447,6 @@ function clearAll() {
   state.result = null;
   state.nonSheetCount = 0;
   state.partLabels = new Map();
-  state.sourceFiles = new Map();
   nextBodyId = 0;
   cumulativeRightX = 0;
   viewer.clear();
@@ -1292,59 +1285,49 @@ function renderUnplaced() {
   label.textContent = `Could not place: ${all.join(', ')}`;
   unplacedList.appendChild(label);
 
-  // Offer the source STEP file(s) the unplaced parts came from, so the user can
-  // re-machine or re-nest them elsewhere.
-  const tags = unplacedSourceTags();
-  if (tags.length > 0) {
+  // Offer a STEP file containing ONLY the unplaced bodies, so the user can
+  // re-machine or re-nest just those parts elsewhere.
+  if (unplacedStepParts().length > 0) {
     const btn = document.createElement('button');
     btn.className = 'ghost unplaced-dl';
-    btn.textContent = tags.length > 1 ? `Download STEP (${tags.length} files)` : 'Download STEP';
-    btn.title = 'Download the source STEP file(s) containing the unplaced parts';
+    btn.textContent = 'Download STEP';
+    btn.title = 'Download a STEP file containing only the unplaced parts';
     btn.addEventListener('click', downloadUnplacedSteps);
     unplacedList.appendChild(btn);
   }
 }
 
-/** Unique source-file tags that have at least one unplaced part AND retained
- *  STEP bytes. */
-function unplacedSourceTags(): string[] {
+/** One StepPart per unplaced INSTANCE, resolved back to its body geometry. */
+function unplacedStepParts(): StepPart[] {
   const result = state.lastNest;
   if (!result) return [];
-  const tags = new Set<string>();
+  const parts: StepPart[] = [];
   for (const g of result.groups) {
     for (const u of g.unplaced) {
       const body = state.bodies.find((b) => String(b.id) === u.partId);
-      if (body && state.sourceFiles.has(body.fileTag)) tags.add(body.fileTag);
+      if (!body) continue;
+      const o = body.analysis.outline;
+      if (!o.outer || o.outer.length < 3) continue;
+      parts.push({
+        name: `${u.partName} #${u.instance}`,
+        outer: o.outer,
+        holes: o.holes,
+        thickness: body.analysis.thickness,
+      });
     }
   }
-  return Array.from(tags);
+  return parts;
 }
 
-async function downloadUnplacedSteps() {
-  const tags = unplacedSourceTags();
-  if (tags.length === 0) return;
-  if (tags.length === 1) {
-    const src = state.sourceFiles.get(tags[0])!;
-    downloadBytes(src.name, src.bytes, 'application/step');
-    return;
-  }
-  // Multiple source files → bundle into one zip.
-  const { zipSync } = await import('fflate');
-  const entries: Record<string, Uint8Array> = {};
-  for (const tag of tags) {
-    const src = state.sourceFiles.get(tag)!;
-    entries[src.name] = src.bytes;
-  }
-  const zipped = zipSync(entries, { level: 0 });
-  downloadBytes('unplaced-parts.zip', zipped, 'application/zip');
-}
-
-function downloadBytes(filename: string, bytes: Uint8Array, mime: string) {
-  const blob = new Blob([bytes as BlobPart], { type: mime });
+function downloadUnplacedSteps() {
+  const parts = unplacedStepParts();
+  if (parts.length === 0) return;
+  const step = buildStep(parts, new Date().toISOString());
+  const blob = new Blob([step], { type: 'application/step' });
   const url = URL.createObjectURL(blob);
   const a = document.createElement('a');
   a.href = url;
-  a.download = filename;
+  a.download = 'unplaced-parts.step';
   document.body.appendChild(a);
   a.click();
   a.remove();
