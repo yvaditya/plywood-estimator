@@ -149,4 +149,14 @@ pipeline documentation.
 ---
 
 ## License
-MIT — see [LICENSE](./LICENSE).
+Source-available — see [LICENSE](./LICENSE).
+
+Short version:
+- Free for personal, non-profit, and educational use, and for evaluation.
+- For-profit shops may use it internally for their own work.
+- No reselling, sublicensing, or offering it as a paid product/service.
+- No using this repo or its code as training/eval data for any AI or ML
+  model.
+
+For any other commercial use, contact the copyright holder for a separate
+license.

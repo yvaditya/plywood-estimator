@@ -1,21 +1,85 @@
-MIT License
-
+Plywood Estimator — Source-Available License
 Copyright (c) 2026
 
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
+The source code in this repository is made available to the public to read,
+run, modify, and share, subject to the terms below. This is a
+source-available license, not an OSI-approved open source license.
 
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
 
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
+1. Permitted use
+
+   You may download, run, copy, modify, and redistribute this software,
+   including modified versions, for any of the following purposes:
+
+   (a) Personal use.
+   (b) Internal use by a registered non-profit organization in furtherance
+       of that organization's non-profit activities.
+   (c) Educational use (teaching, learning, academic research).
+   (d) Evaluation of the software.
+
+   Redistribution must include this LICENSE file unchanged and must retain
+   the copyright notice above.
+
+
+2. Prohibited use
+
+   Without prior written permission from the copyright holder, you may NOT:
+
+   (a) Sell, resell, sublicense, or otherwise commercially distribute this
+       software or any substantial portion of it, whether modified or
+       unmodified, whether standalone or bundled with other software or
+       services.
+
+   (b) Offer this software (or a derivative work) as a paid product, paid
+       service, paid subscription, or paid hosted service.
+
+   (c) Use this software or its source code, in whole or in part, as
+       training data, fine-tuning data, evaluation data, retrieval-augmented
+       generation context, or any other input to train, fine-tune, distill,
+       align, or otherwise develop, evaluate, or improve any machine
+       learning model, large language model, or AI system. Automated
+       scraping or ingestion of this repository for such purposes is
+       likewise prohibited.
+
+
+3. For-profit and commercial use
+
+   For-profit organizations and individuals acting in a commercial capacity
+   may use this software internally for their own cabinet, millwork, or
+   woodworking work, but may not redistribute, resell, or offer it as a
+   product or service to third parties. Any other commercial use requires
+   a separate written license from the copyright holder.
+
+
+4. No warranty
+
+   THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
+   OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+   MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE, ACCURACY, AND
+   NONINFRINGEMENT. CUT LISTS, MATERIAL ESTIMATES, AND COST FIGURES
+   PRODUCED BY THIS SOFTWARE ARE INFORMATIONAL ONLY AND MUST BE
+   INDEPENDENTLY VERIFIED BEFORE PURCHASING MATERIAL OR MAKING CUTS.
+
+
+5. No liability
+
+   IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+   CLAIM, DAMAGES, OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,
+   TORT, OR OTHERWISE, ARISING FROM, OUT OF, OR IN CONNECTION WITH THE
+   SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+
+6. Termination
+
+   Any use of the software in violation of these terms automatically
+   terminates the rights granted by this license. Sections 4 and 5 survive
+   termination.
+
+
+7. Third-party components
+
+   This software depends on third-party libraries (e.g. Three.js,
+   OpenCascade / occt-import-js, jsPDF, MaxRects bin-packing algorithm,
+   etc.) that are distributed under their own respective licenses. Those
+   licenses continue to govern those components and are not changed by
+   this LICENSE.
