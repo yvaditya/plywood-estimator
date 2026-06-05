@@ -1,5 +1,6 @@
 Plywood Estimator — Source-Available License
-Copyright (c) 2026
+Copyright (c) 2026 Aditya Yerra <vyerra@icloud.com>
+All rights reserved.
 
 The source code in this repository is made available to the public to read,
 run, modify, and share, subject to the terms below. This is a
@@ -32,6 +33,9 @@ source-available license, not an OSI-approved open source license.
 
    (b) Offer this software (or a derivative work) as a paid product, paid
        service, paid subscription, or paid hosted service.
+
+       For commercial licensing inquiries, contact:
+       Aditya Yerra <vyerra@icloud.com>
 
    (c) Use this software or its source code, in whole or in part, as
        training data, fine-tuning data, evaluation data, retrieval-augmented

@@ -149,6 +149,8 @@ pipeline documentation.
 ---
 
 ## License
+Copyright (c) 2026 Aditya Yerra <vyerra@icloud.com>. All rights reserved.
+
 Source-available — see [LICENSE](./LICENSE).
 
 Short version:
@@ -158,5 +160,5 @@ Short version:
 - No using this repo or its code as training/eval data for any AI or ML
   model.
 
-For any other commercial use, contact the copyright holder for a separate
-license.
+For any other commercial use, contact Aditya Yerra <vyerra@icloud.com>
+for a separate license.
