@@ -44,6 +44,13 @@ Quick orientation for a fresh session working on this repo.
 - **`save-last`** — MaxRects everywhere except the last sheet, which is
   re-packed Bottom-Left so parts cluster in one corner and the remnant is
   a clean usable rectangle.
+- **`cnc`** / **`cnc-save-last`** — true-shape any-angle nesting handled
+  by `cncNest.ts`, NOT this rectangle packer. `nest.ts` dispatches both via
+  `isCncStrategy()` before the rectangle path. `cnc-save-last` adds the
+  save-last behaviour to the raster nester: the pass objective
+  (`passBetter`, `saveLast` flag) tie-breaks equal-sheet layouts toward the
+  emptiest least-filled sheet, and a final `compactLastSheet` re-packs that
+  sheet's parts bottom-left so the remnant is one clean offcut.
 
 The multi-restart optimiser objective is strategy-aware (`isBetter` in
 `packRect.ts`):
@@ -103,6 +110,12 @@ the expand state across renders.
   fractional inches at 1/16" precision.
 - **Per-body IDs are globally unique** (`nextBodyId` counter in
   `main.ts`). Multi-file imports rely on this so collisions don't occur.
+- **Original STEP bytes are retained** in `state.sourceFiles` (keyed by
+  `fileTag`) so the **Download STEP** button beside the unplaced count can
+  re-download the source file(s) the unplaced parts came from (single file →
+  direct download; multiple → zipped via `fflate`). Cleared in `clearAll()`.
+  We download the whole source file, not a per-part extract — there is no
+  STEP writer; the per-body `OcctMesh` isn't retained either.
 - **Per-sheet `sheetW`/`sheetL`** is the source of truth for cut-sheet
   rendering; don't pull from `state.lastSheet.w/l` which is the original
   config and can mislead.

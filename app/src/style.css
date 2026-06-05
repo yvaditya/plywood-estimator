@@ -1083,8 +1083,19 @@ input[type="checkbox"]:focus-visible { box-shadow: 0 0 0 2px var(--accent-ring);
   background: var(--bad-soft);
   border: 1px solid rgba(224, 62, 62, 0.25);
   border-radius: 6px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
 }
 .unplaced:empty { display: none; }
+.unplaced .unplaced-dl {
+  flex: none;
+  margin-left: auto;
+  padding: 4px 10px;
+  font-size: 12px;
+  white-space: nowrap;
+}
 
 /* ===========================================================================
    Thumbnail strip

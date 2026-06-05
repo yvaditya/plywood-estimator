@@ -27,6 +27,7 @@ import {
   type NestResult,
   type PlacedPart,
   type CutStrategy,
+  isCncStrategy,
 } from './nest';
 import { sheetToDxf, downloadDxf } from './dxf';
 import { buildPdf, downloadPdf, type InventoryCheck } from './pdf';
@@ -78,6 +79,9 @@ const state: {
   /** Per-fileTag UI state: collapsed (true) hides the bodies inside this
    *  file group. Defaults to expanded when a new file is loaded. */
   collapsedFiles: Set<string>;
+  /** Original uploaded STEP bytes, keyed by fileTag, so unplaced parts can be
+   *  re-downloaded as their source STEP file(s). */
+  sourceFiles: Map<string, { name: string; bytes: Uint8Array }>;
   /** Last optimisation's per-trial captured layouts (current and final).
    *  Replayed on demand via the play button beside the Cut layout title.
    *  Cleared each time a new estimate kicks off. */
@@ -100,6 +104,7 @@ const state: {
   partLabels: new Map(),
   nonSheetCount: 0,
   collapsedFiles: new Set<string>(),
+  sourceFiles: new Map<string, { name: string; bytes: Uint8Array }>(),
   lastTrialFrames: [],
   lastTrialMetrics: [],
 };
@@ -374,6 +379,9 @@ async function handleFiles(files: FileList | File[]) {
 
       // Strip path/extension for display.
       const tag = file.name.replace(/\.(step|stp)$/i, '');
+      // Keep the original bytes so unplaced parts can be re-downloaded as the
+      // source STEP file they came from.
+      state.sourceFiles.set(tag, { name: file.name, bytes: new Uint8Array(buf) });
       // Use the next-color slot per body so each new file's colors continue.
       const colorBase = state.bodies.length;
       // Bodies list starts COLLAPSED at the file level — opens on a click.
@@ -445,6 +453,7 @@ function clearAll() {
   state.result = null;
   state.nonSheetCount = 0;
   state.partLabels = new Map();
+  state.sourceFiles = new Map();
   nextBodyId = 0;
   cumulativeRightX = 0;
   viewer.clear();
@@ -914,7 +923,7 @@ nestBtn.addEventListener('click', async () => {
 
   const strategy = (cutStrategySelect.value as CutStrategy) || 'free';
   state.lastStrategy = strategy;
-  const isCnc = strategy === 'cnc';
+  const isCnc = isCncStrategy(strategy);
 
   try {
     const result = await runNestAnimated(parts, {
@@ -1040,7 +1049,7 @@ function renderConvergenceChart() {
   const data = state.lastTrialMetrics;
   if (data.length === 0) { convergenceChart.hidden = true; return; }
   // CNC has no discrete cut count — drop the cuts series for it.
-  const showCuts = state.lastStrategy !== 'cnc';
+  const showCuts = !isCncStrategy(state.lastStrategy);
   convergenceChart.hidden = false;
   const W = 880, H = 140, PAD_L = 36, PAD_R = 12, PAD_T = 18, PAD_B = 22;
   const plotW = W - PAD_L - PAD_R;
@@ -1069,7 +1078,7 @@ function renderConvergenceChart() {
   // Final values for legend
   const last = data[data.length - 1];
   const trialLabel = (i: number) => String(i + 1);
-  const title = state.lastStrategy === 'cnc'
+  const title = isCncStrategy(state.lastStrategy)
     ? `Nesting convergence (${N} passes)`
     : `Optimiser convergence (${N} trials)`;
 
@@ -1251,7 +1260,7 @@ function renderJobMetrics() {
 
   // CNC cuts a continuous contour — a discrete "cuts" count is meaningless, so
   // show the cut method instead.
-  const cutsMetric = state.lastStrategy === 'cnc'
+  const cutsMetric = isCncStrategy(state.lastStrategy)
     ? `<div class="metric"><div class="k">Cut method</div><div class="v">CNC contour</div></div>`
     : `<div class="metric"><div class="k">Cuts</div><div class="v">${totalCuts}</div></div>`;
 
@@ -1275,12 +1284,71 @@ function renderInventoryCheckPlaceholder() {
 
 function renderUnplaced() {
   const result = state.lastNest!;
+  unplacedList.textContent = '';
   const all = result.groups.flatMap((g) => g.unplaced.map((u) => `${u.partName} #${u.instance} (${fmtDim(g.thickness, state.units)})`));
-  if (all.length === 0) {
-    unplacedList.textContent = '';
+  if (all.length === 0) return;
+
+  const label = document.createElement('span');
+  label.textContent = `Could not place: ${all.join(', ')}`;
+  unplacedList.appendChild(label);
+
+  // Offer the source STEP file(s) the unplaced parts came from, so the user can
+  // re-machine or re-nest them elsewhere.
+  const tags = unplacedSourceTags();
+  if (tags.length > 0) {
+    const btn = document.createElement('button');
+    btn.className = 'ghost unplaced-dl';
+    btn.textContent = tags.length > 1 ? `Download STEP (${tags.length} files)` : 'Download STEP';
+    btn.title = 'Download the source STEP file(s) containing the unplaced parts';
+    btn.addEventListener('click', downloadUnplacedSteps);
+    unplacedList.appendChild(btn);
+  }
+}
+
+/** Unique source-file tags that have at least one unplaced part AND retained
+ *  STEP bytes. */
+function unplacedSourceTags(): string[] {
+  const result = state.lastNest;
+  if (!result) return [];
+  const tags = new Set<string>();
+  for (const g of result.groups) {
+    for (const u of g.unplaced) {
+      const body = state.bodies.find((b) => String(b.id) === u.partId);
+      if (body && state.sourceFiles.has(body.fileTag)) tags.add(body.fileTag);
+    }
+  }
+  return Array.from(tags);
+}
+
+async function downloadUnplacedSteps() {
+  const tags = unplacedSourceTags();
+  if (tags.length === 0) return;
+  if (tags.length === 1) {
+    const src = state.sourceFiles.get(tags[0])!;
+    downloadBytes(src.name, src.bytes, 'application/step');
     return;
   }
-  unplacedList.textContent = `Could not place: ${all.join(', ')}`;
+  // Multiple source files → bundle into one zip.
+  const { zipSync } = await import('fflate');
+  const entries: Record<string, Uint8Array> = {};
+  for (const tag of tags) {
+    const src = state.sourceFiles.get(tag)!;
+    entries[src.name] = src.bytes;
+  }
+  const zipped = zipSync(entries, { level: 0 });
+  downloadBytes('unplaced-parts.zip', zipped, 'application/zip');
+}
+
+function downloadBytes(filename: string, bytes: Uint8Array, mime: string) {
+  const blob = new Blob([bytes as BlobPart], { type: mime });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(url);
 }
 
 // --------------------------------------------------------------------------
