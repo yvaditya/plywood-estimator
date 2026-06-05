@@ -9,7 +9,6 @@
     "preview": "vite preview"
   },
   "dependencies": {
-    "fflate": "^0.8.3",
     "jspdf": "^4.2.1",
     "occt-import-js": "^0.0.23",
     "polygon-clipping": "^0.15.7",

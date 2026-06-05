@@ -110,12 +110,15 @@ the expand state across renders.
   fractional inches at 1/16" precision.
 - **Per-body IDs are globally unique** (`nextBodyId` counter in
   `main.ts`). Multi-file imports rely on this so collisions don't occur.
-- **Original STEP bytes are retained** in `state.sourceFiles` (keyed by
-  `fileTag`) so the **Download STEP** button beside the unplaced count can
-  re-download the source file(s) the unplaced parts came from (single file →
-  direct download; multiple → zipped via `fflate`). Cleared in `clearAll()`.
-  We download the whole source file, not a per-part extract — there is no
-  STEP writer; the per-body `OcctMesh` isn't retained either.
+- **Unplaced parts export as a generated STEP**, not the source file. The
+  **Download STEP** button beside the unplaced count calls `buildStep()`
+  (`stepExport.ts`), which writes one extruded-prism `MANIFOLD_SOLID_BREP`
+  per unplaced INSTANCE from its footprint outline (`analysis.outline`) +
+  `thickness`, spread along X. So the file contains ONLY the parts that
+  didn't nest. The outline is the auto-oriented footprint (rotated from the
+  original), which is fine for re-cutting a flat panel. Validated by
+  round-tripping through occt-import-js (OpenCascade reads it; dims exact;
+  holes preserved). AP214 boilerplate is hand-rolled — keep it valid.
 - **Per-sheet `sheetW`/`sheetL`** is the source of truth for cut-sheet
   rendering; don't pull from `state.lastSheet.w/l` which is the original
   config and can mislead.
