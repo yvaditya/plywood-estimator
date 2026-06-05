@@ -23,10 +23,11 @@
  */
 
 import type { Vec2 } from './geometry';
-import { packMulti, packMultiAnimated, type PackInput, type PackPlacement, type CutStrategy, type Cut, type PackProgress } from './packRect';
+import { packMulti, packMultiAnimated, isCncStrategy, type PackInput, type PackPlacement, type CutStrategy, type Cut, type PackProgress } from './packRect';
 import { packCnc, packCncAnimated, polyArea, type CncInput, type CncSheet } from './cncNest';
 
 export type { CutStrategy, Cut, PackProgress };
+export { isCncStrategy };
 
 export type GrainLock = 'free' | 'length' | 'width';
 export type RotationMode = 'lock' | 'flip90' | 'any';
@@ -201,7 +202,7 @@ interface InstanceMeta {
 }
 
 export function runNest(parts: NestPart[], config: NestConfig): NestResult {
-  if (config.cutStrategy === 'cnc') return runCncNest(parts, config);
+  if (isCncStrategy(config.cutStrategy ?? 'free')) return runCncNest(parts, config);
   const { sheetW, sheetL, margin, kerf } = config;
   const usableW = sheetW - 2 * margin;
   const usableL = sheetL - 2 * margin;
@@ -347,7 +348,7 @@ export async function runNestAnimated(
     sheetL: number;
   }) => void | Promise<void>,
 ): Promise<NestResult> {
-  if (config.cutStrategy === 'cnc') return runCncNestAnimated(parts, config, onTrial);
+  if (isCncStrategy(config.cutStrategy ?? 'free')) return runCncNestAnimated(parts, config, onTrial);
   const { sheetW, sheetL, margin, kerf } = config;
   const usableW = sheetW - 2 * margin;
   const usableL = sheetL - 2 * margin;
@@ -687,7 +688,10 @@ export function runCncNest(parts: NestPart[], config: NestConfig): NestResult {
 
   for (const t of thicknesses) {
     const { items, meta } = buildCncItems(buckets.get(t)!);
-    const res = packCnc(items, usableL, usableW, kerf, { restarts: config.restarts });
+    const res = packCnc(items, usableL, usableW, kerf, {
+      restarts: config.restarts,
+      saveLast: config.cutStrategy === 'cnc-save-last',
+    });
     const sheets = res.sheets.map((cs, idx) =>
       cncSheetToNest(cs, idx, t, margin, winnerSheetW, winnerSheetL, meta));
     const unplaced = res.unplaced.map((id) => {
@@ -754,7 +758,7 @@ export async function runCncNestAnimated(
         sheetW: winnerSheetW,
         sheetL: winnerSheetL,
       });
-    }, { restarts: config.restarts });
+    }, { restarts: config.restarts, saveLast: config.cutStrategy === 'cnc-save-last' });
 
     const sheets = res.sheets.map((cs, idx) =>
       cncSheetToNest(cs, idx, t, margin, winnerSheetW, winnerSheetL, meta));

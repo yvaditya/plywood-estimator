@@ -36,8 +36,17 @@ export type Heuristic = 'BSSF' | 'BLSF' | 'BAF' | 'BL';
  *                  (handled by cncNest.ts, NOT this rectangle packer). Listed
  *                  here so the strategy type is shared; nest.ts dispatches it
  *                  before the rectangle path runs.
+ * 'cnc-save-last'= same any-angle CNC nest, but the optimiser concentrates the
+ *                  leftover parts so the least-filled (last) sheet is as empty
+ *                  as possible and its parts cluster in one corner — leaving a
+ *                  clean offcut to save for another job.
  */
-export type CutStrategy = 'free' | 'guillotine' | 'save-last' | 'cnc';
+export type CutStrategy = 'free' | 'guillotine' | 'save-last' | 'cnc' | 'cnc-save-last';
+
+/** True for any CNC (true-shape) strategy — dispatched to cncNest.ts. */
+export function isCncStrategy(s: CutStrategy): boolean {
+  return s === 'cnc' || s === 'cnc-save-last';
+}
 
 export interface PackInput {
   /** Stable identifier; opaque to the packer. */

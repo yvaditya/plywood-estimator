@@ -430,6 +430,12 @@ export interface CncOptions {
   maxCells?: number;
   /** Optimiser effort — drives how many orderings/placements are tried. */
   restarts?: number;
+  /**
+   * "Save last sheet": after minimising sheet count, prefer layouts whose
+   * least-filled sheet is as empty as possible, and compact that sheet's parts
+   * into one corner so the remaining material is a clean reusable offcut.
+   */
+  saveLast?: boolean;
 }
 
 function chooseResolution(sheetW: number, sheetH: number, opt: CncOptions): number {
@@ -512,10 +518,27 @@ function runPass(order: CncInput[], gw: number, gh: number, getMask: MaskFn, res
   return { lives, unplaced };
 }
 
-/** Fewer unplaced → fewer sheets → more material used. */
-function passBetter(a: PassResult, b: PassResult): boolean {
+/** Used area of the least-filled sheet (the "last" / remnant sheet), or 0. */
+function leastFilledArea(lives: LiveSheet[]): number {
+  if (lives.length === 0) return 0;
+  let min = Infinity;
+  for (const l of lives) if (l.usedArea < min) min = l.usedArea;
+  return min;
+}
+
+/**
+ * Fewer unplaced → fewer sheets → more material used.
+ * Under `saveLast`, once sheet count ties, prefer the layout whose least-filled
+ * sheet holds the LEAST material — concentrating leftovers so the final sheet's
+ * remnant is the largest, cleanest reusable offcut.
+ */
+function passBetter(a: PassResult, b: PassResult, saveLast = false): boolean {
   if (a.unplaced.length !== b.unplaced.length) return a.unplaced.length < b.unplaced.length;
   if (a.lives.length !== b.lives.length) return a.lives.length < b.lives.length;
+  if (saveLast && a.lives.length > 1) {
+    const la = leastFilledArea(a.lives), lb = leastFilledArea(b.lives);
+    if (Math.abs(la - lb) > 1e-6) return la < lb;
+  }
   const ua = a.lives.reduce((s, l) => s + l.usedArea, 0);
   const ub = b.lives.reduce((s, l) => s + l.usedArea, 0);
   return ua > ub;
@@ -553,6 +576,29 @@ function consolidate(lives: LiveSheet[], getMask: MaskFn, res: number, byId: Map
     if (allFit) { working = clones; improved = true; }
   }
   return working;
+}
+
+/**
+ * Compact the least-filled ("last") sheet: re-pack its parts from scratch with
+ * a bottom-left fill (largest first) so they cluster in one corner, leaving the
+ * remaining material as a single clean offcut. Only mutates that one sheet and
+ * only if every part still fits; otherwise the original layout is kept.
+ */
+function compactLastSheet(
+  lives: LiveSheet[], gw: number, gh: number, getMask: MaskFn, res: number, byId: Map<string, CncInput>,
+): LiveSheet[] {
+  if (lives.length === 0) return lives;
+  let vi = 0;
+  for (let i = 1; i < lives.length; i++) if (lives[i].usedArea < lives[vi].usedArea) vi = i;
+  const victim = lives[vi];
+  const parts = victim.placements.slice().sort((a, b) => b.area - a.area);
+  const fresh: LiveSheet = { grid: new SheetGrid(gw, gh), placements: [], usedArea: 0 };
+  for (const p of parts) {
+    const it = byId.get(p.id);
+    if (!it) return lives; // can't recover geometry — leave as-is
+    if (!placeOnSheet(fresh, it, getMask, res, false)) return lives; // didn't fit — bail
+  }
+  return lives.map((l, i) => (i === vi ? fresh : l));
 }
 
 function bbox0(outer: Vec2[]): { w: number; h: number } {
@@ -649,11 +695,12 @@ export function* packCncGen(
   const startMs = Date.now();
   const budgetMs = 15000;
 
+  const saveLast = opt.saveLast ?? false;
   let best: PassResult | null = null;
   for (let i = 0; i < orderings.length; i++) {
     const { order, leftFirst } = orderings[i];
     const result = runPass(order, gw, gh, getMask, res, leftFirst);
-    const isNewBest = !best || passBetter(result, best);
+    const isNewBest = !best || passBetter(result, best, saveLast);
     if (isNewBest) best = result;
     yield {
       trial: i,
@@ -668,7 +715,10 @@ export function* packCncGen(
   }
 
   // Final squeeze: try to eliminate under-filled sheets.
-  const consolidated = consolidate(best!.lives, getMask, res, byId);
+  let consolidated = consolidate(best!.lives, getMask, res, byId);
+  // Save-last: pack the least-filled sheet into one corner so its remnant is a
+  // clean, reusable offcut.
+  if (saveLast) consolidated = compactLastSheet(consolidated, gw, gh, getMask, res, byId);
   const finalSheets = livesToSheets(consolidated, res, true);
   yield {
     trial: orderings.length,
