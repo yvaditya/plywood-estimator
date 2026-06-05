@@ -2,88 +2,238 @@ Plywood Estimator — Source-Available License
 Copyright (c) 2026 Aditya Yerra <vyerra@icloud.com>
 All rights reserved.
 
-The source code in this repository is made available to the public to read,
-run, modify, and share, subject to the terms below. This is a
-source-available license, not an OSI-approved open source license.
+This is a source-available license, not an OSI-approved open source
+license. All rights not expressly granted below are reserved by the
+copyright holder.
+
+
+0. Definitions
+
+   "Software"  means the source code, compiled artifacts, assets,
+                documentation, and any other files contained in this
+                repository, in whole or in part, and any Derivative Work
+                of any of the foregoing.
+
+   "Derivative Work"
+                means any work that is based on, derived from,
+                translated from, ported from, transpiled from, recompiled
+                from, decompiled from, reverse-engineered from, obfuscated
+                from, minified from, refactored from, or that
+                incorporates any portion of the Software, in any form or
+                medium, in any language, and on any platform — including
+                forks, partial copies, code snippets above a de minimis
+                amount, and re-implementations whose primary purpose is
+                to substitute for the Software.
+
+   "You"        means the individual or legal entity exercising rights
+                under this license, including all affiliates, employees,
+                agents, contractors, successors, and assigns.
+
+   "Commercial Distribution"
+                means making the Software (or a Derivative Work)
+                available to any third party in exchange for any direct
+                or indirect monetary or non-monetary consideration,
+                including but not limited to: sale, resale, license fee,
+                subscription fee, hosting fee, advertising revenue,
+                lead-generation, bundling with a paid product or service,
+                offering it as a paid or ad-supported hosted service
+                (SaaS), inclusion in an app store as a paid or free
+                listing, or any arrangement whose effect is that a third
+                party pays (in money, data, attention, or anything of
+                value) to access or use the Software.
+
+   "AI/ML System"
+                means any machine learning model, neural network,
+                statistical learning system, large language model,
+                generative model, embedding model, retrieval system, or
+                similar automated system whose behavior is determined,
+                in whole or in part, by training, fine-tuning, alignment,
+                evaluation, or context-augmentation on data.
 
 
 1. Permitted use
 
-   You may download, run, copy, modify, and redistribute this software,
-   including modified versions, for any of the following purposes:
+   Subject to compliance with every term of this license, You may
+   download, install, run, study, copy, and modify the Software for the
+   following purposes only:
 
-   (a) Personal use.
-   (b) Internal use by a registered non-profit organization in furtherance
-       of that organization's non-profit activities.
+   (a) Personal, private use by a natural person.
+   (b) Internal use by a registered non-profit organization in
+       furtherance of that organization's non-profit activities.
    (c) Educational use (teaching, learning, academic research).
-   (d) Evaluation of the software.
-
-   Redistribution must include this LICENSE file unchanged and must retain
-   the copyright notice above.
+   (d) Time-limited evaluation by any party for the sole purpose of
+       deciding whether to obtain a separate commercial license.
+   (e) Internal use by a for-profit individual or organization within
+       its own cabinet-making, millwork, woodworking, fabrication, or
+       construction work — including jobs performed for paying
+       customers — provided that the Software itself is not distributed,
+       resold, rebranded, sublicensed, hosted, exposed via an API, or
+       otherwise offered to any third party.
 
 
 2. Prohibited use
 
-   Without prior written permission from the copyright holder, you may NOT:
+   The following are prohibited without prior written permission signed
+   by the copyright holder. Each prohibition stands on its own; an act
+   that falls within any one of them is a breach, even if not covered by
+   the others.
 
-   (a) Sell, resell, sublicense, or otherwise commercially distribute this
-       software or any substantial portion of it, whether modified or
-       unmodified, whether standalone or bundled with other software or
-       services.
+   (a) Commercial Distribution of the Software or any Derivative Work,
+       in any form, modified or unmodified, standalone or bundled.
 
-   (b) Offer this software (or a derivative work) as a paid product, paid
-       service, paid subscription, or paid hosted service.
+   (b) Offering the Software (or any Derivative Work) as a paid,
+       freemium, ad-supported, lead-generating, or
+       data-collection-monetized product, service, subscription, hosted
+       service, web service, mobile app, desktop app, plug-in, or
+       extension.
 
-       For commercial licensing inquiries, contact:
+   (c) Sublicensing, relicensing, or purporting to relicense the
+       Software under any other license, including any open-source,
+       source-available, or proprietary license.
+
+   (d) Rebranding, white-labeling, or removing or obscuring the
+       copyright notice, license file, or attribution, with the effect
+       of presenting the Software (or a Derivative Work) as Your own or
+       a third party's original work.
+
+   (e) Using the Software, its source code, its assets, its
+       documentation, or any Derivative Work, in whole or in part, as
+       training data, fine-tuning data, alignment data, evaluation data,
+       benchmark data, distillation source, retrieval-augmented
+       generation context, embedding source, or any other input,
+       reference, or signal used to create, train, fine-tune, align,
+       evaluate, distill, or improve any AI/ML System. This prohibition
+       includes scraping, crawling, ingesting, mirroring, or otherwise
+       collecting the Software by automated means for any of the
+       foregoing purposes, whether performed by You directly or by any
+       third party on Your behalf or with Your data.
+
+   (f) Circumvention: re-implementing, paraphrasing, porting, or
+       otherwise reproducing the Software's functionality with the
+       purpose or effect of evading any term of this license; bundling
+       trivial wrappers around the Software to make a Commercial
+       Distribution; or splitting the Software into pieces to argue that
+       no single piece is the Software.
+
+   (g) Any use that violates applicable law, infringes third-party
+       rights, or breaches a separate written agreement with the
+       copyright holder.
+
+
+3. Conditions on permitted use
+
+   Every copy, fork, and Derivative Work — including a private one —
+   must:
+
+   (a) retain this LICENSE file unmodified;
+   (b) retain the copyright notice "Copyright (c) 2026 Aditya Yerra
+       <vyerra@icloud.com>" prominently in the source;
+   (c) clearly mark any modifications and identify the modifier; and
+   (d) carry this same license forward (any further distribution
+       permitted by Section 1 must be on these same terms — You may not
+       add additional restrictions or remove any).
+
+
+4. Reservation of rights
+
+   All rights not expressly granted in Section 1 are reserved. No
+   license is granted, by implication, estoppel, exhaustion, or
+   otherwise, to any patent, trademark, trade secret, or other
+   intellectual property right of the copyright holder. The name
+   "Plywood Estimator" and any associated marks may not be used to
+   endorse or promote any product or service without prior written
+   permission.
+
+
+5. Commercial licensing
+
+   For any use that falls outside Section 1, including Commercial
+   Distribution, hosting as a paid service, OEM/white-label
+   arrangements, AI/ML training, or any other use not permitted above,
+   You must obtain a separate written license from:
+
        Aditya Yerra <vyerra@icloud.com>
 
-   (c) Use this software or its source code, in whole or in part, as
-       training data, fine-tuning data, evaluation data, retrieval-augmented
-       generation context, or any other input to train, fine-tune, distill,
-       align, or otherwise develop, evaluate, or improve any machine
-       learning model, large language model, or AI system. Automated
-       scraping or ingestion of this repository for such purposes is
-       likewise prohibited.
-
-
-3. For-profit and commercial use
-
-   For-profit organizations and individuals acting in a commercial capacity
-   may use this software internally for their own cabinet, millwork, or
-   woodworking work, but may not redistribute, resell, or offer it as a
-   product or service to third parties. Any other commercial use requires
-   a separate written license from the copyright holder.
-
-
-4. No warranty
-
-   THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
-   OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
-   MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE, ACCURACY, AND
-   NONINFRINGEMENT. CUT LISTS, MATERIAL ESTIMATES, AND COST FIGURES
-   PRODUCED BY THIS SOFTWARE ARE INFORMATIONAL ONLY AND MUST BE
-   INDEPENDENTLY VERIFIED BEFORE PURCHASING MATERIAL OR MAKING CUTS.
-
-
-5. No liability
-
-   IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
-   CLAIM, DAMAGES, OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,
-   TORT, OR OTHERWISE, ARISING FROM, OUT OF, OR IN CONNECTION WITH THE
-   SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+   Until that written license is signed, no such use is authorized,
+   regardless of any course of dealing, silence, or partial enforcement.
 
 
 6. Termination
 
-   Any use of the software in violation of these terms automatically
-   terminates the rights granted by this license. Sections 4 and 5 survive
-   termination.
+   Any breach of this license automatically terminates all rights
+   granted to You under Section 1, immediately and without notice. Upon
+   termination You must cease all use of the Software and destroy all
+   copies in Your possession or control. Sections 0, 2, 4, 6, 7, 8, 9,
+   10, 11, and 12 survive termination.
 
 
-7. Third-party components
+7. No warranty
 
-   This software depends on third-party libraries (e.g. Three.js,
-   OpenCascade / occt-import-js, jsPDF, MaxRects bin-packing algorithm,
-   etc.) that are distributed under their own respective licenses. Those
-   licenses continue to govern those components and are not changed by
-   this LICENSE.
+   THE SOFTWARE IS PROVIDED "AS IS" AND "AS AVAILABLE", WITHOUT WARRANTY
+   OF ANY KIND, EXPRESS, IMPLIED, OR STATUTORY, INCLUDING WITHOUT
+   LIMITATION ANY WARRANTY OF MERCHANTABILITY, FITNESS FOR A PARTICULAR
+   PURPOSE, ACCURACY, COMPLETENESS, TITLE, OR NONINFRINGEMENT. CUT
+   LISTS, MATERIAL ESTIMATES, COST FIGURES, DXF FILES, AND ANY OTHER
+   OUTPUTS PRODUCED BY THE SOFTWARE ARE INFORMATIONAL ONLY AND MUST BE
+   INDEPENDENTLY VERIFIED BEFORE PURCHASING MATERIAL OR MAKING CUTS. YOU
+   ASSUME ALL RISK ARISING FROM YOUR USE OF THE SOFTWARE AND ITS
+   OUTPUTS.
+
+
+8. Limitation of liability
+
+   TO THE FULLEST EXTENT PERMITTED BY APPLICABLE LAW, IN NO EVENT SHALL
+   THE COPYRIGHT HOLDER BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
+   SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING LOST PROFITS,
+   LOST DATA, WASTED MATERIAL, MIS-CUT PANELS, BUSINESS INTERRUPTION,
+   OR PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES) ARISING IN ANY WAY
+   OUT OF THE USE OF, OR INABILITY TO USE, THE SOFTWARE OR ITS OUTPUTS,
+   WHETHER IN CONTRACT, TORT, STRICT LIABILITY, OR OTHERWISE, EVEN IF
+   ADVISED OF THE POSSIBILITY OF SUCH DAMAGES.
+
+
+9. Equitable relief
+
+   You acknowledge that breach of Section 2 may cause irreparable harm
+   for which monetary damages would be inadequate, and that the
+   copyright holder shall be entitled to seek injunctive and other
+   equitable relief in addition to any other remedies available at law
+   or in equity, without the requirement of posting a bond.
+
+
+10. Enforcement and waiver
+
+    Failure or delay by the copyright holder to enforce any provision of
+    this license is not a waiver of that provision or of any other
+    provision. No waiver is effective unless in writing and signed by
+    the copyright holder. A waiver of one breach is not a waiver of any
+    other breach.
+
+
+11. Severability
+
+    If any provision of this license is held unenforceable, that
+    provision shall be modified only to the minimum extent necessary to
+    make it enforceable, and the remaining provisions shall continue in
+    full force and effect.
+
+
+12. Entire agreement
+
+    This license is the entire agreement between You and the copyright
+    holder concerning the Software, and supersedes any prior or
+    contemporaneous understandings. It may be modified only by a writing
+    signed by the copyright holder. No purchase order, click-wrap, or
+    other form supplied by You has any effect on the terms of this
+    license.
+
+
+13. Third-party components
+
+    The Software depends on third-party libraries (e.g. Three.js,
+    OpenCascade / occt-import-js, jsPDF, the MaxRects bin-packing
+    algorithm, and others) that are distributed under their own
+    respective licenses. Those licenses continue to govern those
+    components and are not changed by this LICENSE; nothing in this
+    LICENSE grants You any rights in those components beyond what their
+    own licenses grant.

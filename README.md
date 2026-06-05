@@ -151,14 +151,24 @@ pipeline documentation.
 ## License
 Copyright (c) 2026 Aditya Yerra <vyerra@icloud.com>. All rights reserved.
 
-Source-available — see [LICENSE](./LICENSE).
+Source-available — see [LICENSE](./LICENSE) for the full, controlling
+terms. The summary below is for convenience only and does not modify the
+license.
 
-Short version:
-- Free for personal, non-profit, and educational use, and for evaluation.
-- For-profit shops may use it internally for their own work.
-- No reselling, sublicensing, or offering it as a paid product/service.
-- No using this repo or its code as training/eval data for any AI or ML
-  model.
+You **may**:
+- use it for personal, non-profit, or educational purposes;
+- evaluate it before licensing;
+- use it internally inside Your own cabinet/woodworking/fabrication
+  business, including for paying customer jobs.
 
-For any other commercial use, contact Aditya Yerra <vyerra@icloud.com>
-for a separate license.
+You **may not**, without a separate written license from the copyright
+holder:
+- sell, resell, sublicense, relicense, rebrand, or white-label the app
+  or any derivative of it;
+- host it as a paid, freemium, ad-supported, or data-monetized service;
+- bundle it into any paid product or service;
+- use this repo, its code, its assets, or any derivative — in whole or
+  in part — to train, fine-tune, evaluate, distill, or otherwise build
+  an AI/ML system, or scrape it for that purpose.
+
+For any commercial license, contact Aditya Yerra <vyerra@icloud.com>.
