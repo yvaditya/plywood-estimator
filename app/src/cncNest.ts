@@ -75,12 +75,16 @@ export interface CncResult {
 }
 
 export interface CncProgress {
-  /** Parts placed so far (this pack call). */
-  placed: number;
-  /** Total parts to place. */
+  /** Restart index (0-based). */
+  trial: number;
+  /** Total restarts that will run. */
   total: number;
-  /** Snapshot of sheets built so far (safe to keep — placements are copied). */
-  sheets: CncSheet[];
+  /** Sheets produced by THIS restart (placements copied — safe to keep). */
+  current: CncSheet[];
+  /** Best (fewest-sheets) layout seen so far. */
+  best: CncSheet[];
+  /** True iff this restart became the new best. */
+  isNewBest: boolean;
 }
 
 // ---------------------------------------------------------------------------
@@ -133,12 +137,16 @@ export function polyArea(outer: Vec2[], holes: Vec2[][]): number {
 // Rasterisation
 // ---------------------------------------------------------------------------
 interface Mask {
-  /** Cell offsets (dx,dy interleaved) that are occupied, within [0,mw)×[0,mh). */
+  /** SOLID cell offsets (dx,dy interleaved) in [0,mw)×[0,mh) — the part itself.
+   *  Used for collision tests and placement, so a part as large as the sheet
+   *  still fits (kerf spacing is NOT enforced against the sheet edge). */
   cells: Int32Array;
   mw: number;
   mh: number;
-  /** Halo padding (cells) added around the shape to enforce kerf spacing. */
-  pad: number;
+  /** DILATED (solid ⊕ kerf) cell offsets, relative to the solid origin (may be
+   *  negative). Marked occupied when the part is placed so the NEXT part keeps
+   *  a kerf gap; clipped at the sheet edge by the grid. */
+  markCells: Int32Array;
   /** Rotated+anchored polygon for this angle (origin at 0,0). */
   outer: Vec2[];
   holes: Vec2[][];
@@ -147,80 +155,98 @@ interface Mask {
   h: number;
 }
 
+/** Even-odd scanline: sorted x-intersections of (rings) at height py. */
+function scanlineX(rings: Vec2[][], py: number): number[] {
+  const xs: number[] = [];
+  for (const ring of rings) {
+    for (let i = 0; i < ring.length; i++) {
+      const [x1, y1] = ring[i];
+      const [x2, y2] = ring[(i + 1) % ring.length];
+      // Half-open edge test avoids double-counting shared vertices.
+      if ((y1 <= py && y2 > py) || (y2 <= py && y1 > py)) {
+        const t = (py - y1) / (y2 - y1);
+        xs.push(x1 + t * (x2 - x1));
+      }
+    }
+  }
+  xs.sort((a, b) => a - b);
+  return xs;
+}
+
 /**
- * Rasterise a rotated polygon (outer − holes) into an occupancy mask.
- * The shape is sampled at cell centres via even-odd scanline fill (holes are
- * carved out automatically because their edges flip the in/out parity), then
- * dilated by `pad` cells so neighbours keep a kerf gap. The shape sits `pad`
- * cells in from the mask's lower-left corner.
+ * CONSERVATIVE rasterisation of (outer − holes) into a sw×sh-cell grid: a cell
+ * is marked if the polygon overlaps ANY of it. We sample several scanlines
+ * across each cell's height and mark every cell the resulting x-spans touch.
+ *
+ * Why conservative (over-approximate) rather than centre-sampling: a rotated
+ * edge can poke a thin sliver into a cell whose CENTRE is outside the polygon;
+ * if that cell is left free, two parts' slivers can interpenetrate (a real
+ * overlap the cell test misses). Marking every overlapped cell prevents that.
+ * For grid-aligned parts whose dimensions are multiples of the cell size this
+ * is still exact, so perfect tilings (e.g. identical rectangles) are preserved.
+ */
+function rasterSolid(outer: Vec2[], holes: Vec2[][], res: number, sw: number, sh: number): Uint8Array {
+  const grid = new Uint8Array(sw * sh);
+  const rings = [outer, ...holes];
+  const SUB = 3; // scanlines per cell height (bottom, thirds, top)
+  for (let cy = 0; cy < sh; cy++) {
+    const yBase = cy * res;
+    const row = cy * sw;
+    for (let s = 0; s <= SUB; s++) {
+      const py = yBase + (res * s) / SUB;
+      const xs = scanlineX(rings, py);
+      for (let k = 0; k + 1 < xs.length; k += 2) {
+        const cxa = Math.max(0, Math.floor(xs[k] / res));
+        const cxb = Math.min(sw - 1, Math.ceil(xs[k + 1] / res) - 1);
+        for (let cx = cxa; cx <= cxb; cx++) grid[row + cx] = 1;
+      }
+    }
+  }
+  return grid;
+}
+
+/**
+ * Build a placement mask for a rotated polygon. The SOLID (used for collision)
+ * is the rasterised silhouette; the MARK set is the solid dilated by `pad`
+ * cells (≈ kerf) and is what we stamp into the sheet so the next part keeps a
+ * gap. Keeping these separate means a full-sheet-sized part still fits — the
+ * kerf halo only applies between parts, not against the sheet edge.
  */
 function buildMask(outer: Vec2[], holes: Vec2[][], w: number, h: number, res: number, pad: number): Mask {
-  const inW = Math.max(1, Math.ceil(w / res));
-  const inH = Math.max(1, Math.ceil(h / res));
-  const mw = inW + 2 * pad;
-  const mh = inH + 2 * pad;
-  const grid = new Uint8Array(mw * mh);
-  const rings = [outer, ...holes];
+  const sw = Math.max(1, Math.ceil(w / res));
+  const sh = Math.max(1, Math.ceil(h / res));
+  const solid = rasterSolid(outer, holes, res, sw, sh);
 
-  // Even-odd scanline fill. Row cy maps to polygon y = (cy - pad + 0.5)*res.
-  for (let cy = 0; cy < mh; cy++) {
-    const py = (cy - pad + 0.5) * res;
-    const xs: number[] = [];
-    for (const ring of rings) {
-      for (let i = 0; i < ring.length; i++) {
-        const [x1, y1] = ring[i];
-        const [x2, y2] = ring[(i + 1) % ring.length];
-        // Half-open edge test avoids double-counting shared vertices.
-        if ((y1 <= py && y2 > py) || (y2 <= py && y1 > py)) {
-          const t = (py - y1) / (y2 - y1);
-          xs.push(x1 + t * (x2 - x1));
-        }
-      }
+  // Solid offsets (collision/placement).
+  const cells: number[] = [];
+  for (let cy = 0; cy < sh; cy++)
+    for (let cx = 0; cx < sw; cx++)
+      if (solid[cy * sw + cx]) cells.push(cx, cy);
+
+  // Mark offsets (solid dilated by the kerf halo), relative to the solid origin.
+  let markCells: number[];
+  if (pad > 0) {
+    const pw = sw + 2 * pad, ph = sh + 2 * pad;
+    const padded = new Uint8Array(pw * ph);
+    for (let i = 0; i < cells.length; i += 2) {
+      padded[(cells[i + 1] + pad) * pw + (cells[i] + pad)] = 1;
     }
-    if (xs.length < 2) continue;
-    xs.sort((a, b) => a - b);
-    for (let k = 0; k + 1 < xs.length; k += 2) {
-      const xa = xs[k];
-      const xb = xs[k + 1];
-      const cxa = Math.max(0, Math.floor(xa / res) + pad);
-      const cxb = Math.min(mw - 1, Math.ceil(xb / res) + pad);
-      for (let cx = cxa; cx <= cxb; cx++) {
-        const px = (cx - pad + 0.5) * res;
-        if (px >= xa && px < xb) grid[cy * mw + cx] = 1;
-      }
-    }
+    const dil = dilate(padded, pw, ph, pad);
+    markCells = [];
+    for (let cy = 0; cy < ph; cy++)
+      for (let cx = 0; cx < pw; cx++)
+        if (dil[cy * pw + cx]) markCells.push(cx - pad, cy - pad);
+  } else {
+    markCells = cells;
   }
 
-  const filled = pad > 0 ? dilate(grid, mw, mh, pad) : grid;
-
-  // Collect occupied offsets and the actual occupied bounds. We TRIM the mask
-  // to those bounds: ceil(w/res) can round the mask up to one cell wider than
-  // the grid's floor(sheet/res), which would spuriously reject a part that is
-  // the full sheet size. Trimming the trailing empty columns/rows fixes that
-  // while leaving the kerf halo (which is occupied after dilation) intact.
-  let count = 0, maxCx = 0, maxCy = 0;
-  for (let cy = 0; cy < mh; cy++) {
-    for (let cx = 0; cx < mw; cx++) {
-      if (filled[cy * mw + cx]) {
-        count++;
-        if (cx > maxCx) maxCx = cx;
-        if (cy > maxCy) maxCy = cy;
-      }
-    }
-  }
-  const cells = new Int32Array(count * 2);
-  let j = 0;
-  for (let cy = 0; cy < mh; cy++) {
-    for (let cx = 0; cx < mw; cx++) {
-      if (filled[cy * mw + cx]) {
-        cells[j++] = cx;
-        cells[j++] = cy;
-      }
-    }
-  }
-  const trimW = count > 0 ? maxCx + 1 : 1;
-  const trimH = count > 0 ? maxCy + 1 : 1;
-  return { cells, mw: trimW, mh: trimH, pad, outer, holes, w, h };
+  return {
+    cells: Int32Array.from(cells),
+    mw: sw,
+    mh: sh,
+    markCells: markCells === cells ? Int32Array.from(cells) : Int32Array.from(markCells),
+    outer, holes, w, h,
+  };
 }
 
 /** Square morphological dilation by radius `r` (separable max filter). */
@@ -259,6 +285,8 @@ class SheetGrid {
   gw: number;
   gh: number;
   occ: Uint8Array;
+  /** Number of occupied cells — lets callers cheaply reject obviously-full sheets. */
+  occupiedCount = 0;
   private sat: Int32Array;
   private satW: number;
   private dirty = false;
@@ -269,6 +297,18 @@ class SheetGrid {
     this.occ = new Uint8Array(gw * gh);
     this.satW = gw + 1;
     this.sat = new Int32Array(this.satW * (gh + 1));
+  }
+
+  /** Free cell count. */
+  freeCells(): number { return this.gw * this.gh - this.occupiedCount; }
+
+  /** Deep copy (occupancy only; SAT is rebuilt lazily on first query). */
+  clone(): SheetGrid {
+    const g = new SheetGrid(this.gw, this.gh);
+    g.occ.set(this.occ);
+    g.occupiedCount = this.occupiedCount;
+    g.dirty = true;
+    return g;
   }
 
   private rebuildSat() {
@@ -299,38 +339,52 @@ class SheetGrid {
   }
 
   /**
-   * Bottom-left search for a mask. Returns the lowest-then-leftmost cell
-   * (gx,gy) where every occupied mask cell lands on a free grid cell, or null.
+   * Bottom-left search for a mask. Returns the first feasible cell (gx,gy)
+   * where every occupied mask cell lands on a free grid cell, or null.
+   * Scan order: bottom-first (lowest gy, then gx) by default, or left-first
+   * (lowest gx, then gy) when `leftFirst` — the two orders produce different
+   * layouts, which the multi-restart optimiser exploits.
    */
-  findBottomLeft(mask: Mask): { gx: number; gy: number } | null {
+  findBottomLeft(mask: Mask, leftFirst = false): { gx: number; gy: number } | null {
     const { gw, gh, occ } = this;
     const { mw, mh, cells } = mask;
     if (mw > gw || mh > gh) return null;
     const maxY = gh - mh;
     const maxX = gw - mw;
-    for (let gy = 0; gy <= maxY; gy++) {
+    const fits = (gx: number, gy: number): boolean => {
+      // O(1) accept: if the whole window is empty, the mask fits.
+      if (this.windowSum(gx, gy, gx + mw, gy + mh) === 0) return true;
+      for (let i = 0; i < cells.length; i += 2) {
+        if (occ[(gy + cells[i + 1]) * gw + (gx + cells[i])]) return false;
+      }
+      return true;
+    };
+    if (leftFirst) {
       for (let gx = 0; gx <= maxX; gx++) {
-        // O(1) reject/accept: if the whole window is empty, the mask fits.
-        if (this.windowSum(gx, gy, gx + mw, gy + mh) === 0) {
-          return { gx, gy };
+        for (let gy = 0; gy <= maxY; gy++) {
+          if (fits(gx, gy)) return { gx, gy };
         }
-        // Window has some occupancy — test the exact mask cells.
-        let ok = true;
-        for (let i = 0; i < cells.length; i += 2) {
-          if (occ[(gy + cells[i + 1]) * gw + (gx + cells[i])]) { ok = false; break; }
+      }
+    } else {
+      for (let gy = 0; gy <= maxY; gy++) {
+        for (let gx = 0; gx <= maxX; gx++) {
+          if (fits(gx, gy)) return { gx, gy };
         }
-        if (ok) return { gx, gy };
       }
     }
     return null;
   }
 
-  /** Mark a placed mask as occupied. */
+  /** Mark a placed part (solid + kerf halo) as occupied, clipped at the edges. */
   commit(mask: Mask, gx: number, gy: number) {
-    const { gw, occ } = this;
-    const { cells } = mask;
-    for (let i = 0; i < cells.length; i += 2) {
-      occ[(gy + cells[i + 1]) * gw + (gx + cells[i])] = 1;
+    const { gw, gh, occ } = this;
+    const { markCells } = mask;
+    for (let i = 0; i < markCells.length; i += 2) {
+      const x = gx + markCells[i];
+      const y = gy + markCells[i + 1];
+      if (x < 0 || x >= gw || y < 0 || y >= gh) continue; // halo past the sheet edge
+      const idx = y * gw + x;
+      if (!occ[idx]) { occ[idx] = 1; this.occupiedCount++; }
     }
     this.dirty = true;
   }
@@ -374,13 +428,18 @@ export interface CncOptions {
   targetCells?: number;
   /** Hard cap on total grid cells (perf guard). */
   maxCells?: number;
+  /** Optimiser effort — drives how many orderings/placements are tried. */
+  restarts?: number;
 }
 
 function chooseResolution(sheetW: number, sheetH: number, opt: CncOptions): number {
   const long = Math.max(sheetW, sheetH);
-  const target = opt.targetCells ?? 280;
-  let res = Math.min(25, Math.max(2, long / target));
-  const cap = opt.maxCells ?? 90000;
+  // Finer grid = tighter nesting (less quantisation waste, fewer sheets) at the
+  // cost of speed. ~300 cells on the long edge (~8 mm on a 4×8) balances the
+  // two; the cell cap keeps the worst case bounded.
+  const target = opt.targetCells ?? 300;
+  let res = Math.min(25, Math.max(1.5, long / target));
+  const cap = opt.maxCells ?? 120000;
   // Bump resolution until the grid fits under the cell cap.
   while ((Math.ceil(sheetW / res) + 1) * (Math.ceil(sheetH / res) + 1) > cap) {
     res *= 1.15;
@@ -388,10 +447,167 @@ function chooseResolution(sheetW: number, sheetH: number, opt: CncOptions): numb
   return res;
 }
 
+// ---------------------------------------------------------------------------
+// Multi-restart packing with a fewest-sheets objective
+//
+// A single greedy pass leaves sheets under-filled and uses more stock than
+// necessary. We instead try several part orderings + two scan directions and
+// keep the layout with the FEWEST sheets, then run a consolidation pass that
+// dissolves the least-filled sheet by redistributing its parts onto the
+// others — directly minimising sheet count (the goal here).
+// ---------------------------------------------------------------------------
+interface LiveSheet { grid: SheetGrid; placements: CncPlaced[]; usedArea: number; }
+type MaskFn = (it: CncInput, deg: number) => Mask;
+interface PassResult { lives: LiveSheet[]; unplaced: string[] }
+
+function cloneLive(s: LiveSheet): LiveSheet {
+  return { grid: s.grid.clone(), placements: s.placements.slice(), usedArea: s.usedArea };
+}
+
+/** Place one item on a sheet at its best (lowest) feasible angle + position. */
+function placeOnSheet(live: LiveSheet, it: CncInput, getMask: MaskFn, res: number, leftFirst: boolean): boolean {
+  let best: { mask: Mask; gx: number; gy: number; deg: number } | null = null;
+  const free = live.grid.freeCells();
+  for (const deg of it.angles) {
+    const mask = getMask(it, deg);
+    if (mask.cells.length / 2 > free) continue; // can't possibly fit — skip cheaply
+    const spot = live.grid.findBottomLeft(mask, leftFirst);
+    if (!spot) continue;
+    const better = !best || (leftFirst
+      ? (spot.gx < best.gx || (spot.gx === best.gx && spot.gy < best.gy))
+      : (spot.gy < best.gy || (spot.gy === best.gy && spot.gx < best.gx)));
+    if (better) {
+      best = { mask, gx: spot.gx, gy: spot.gy, deg };
+      if (spot.gx === 0 && spot.gy === 0) break; // origin — can't do better
+    }
+  }
+  if (!best) return false;
+  live.grid.commit(best.mask, best.gx, best.gy);
+  const m = best.mask;
+  live.placements.push({
+    id: it.id, angleDeg: best.deg,
+    x: best.gx * res, y: best.gy * res,
+    w: m.w, h: m.h, outer: m.outer, holes: m.holes, area: it.area,
+  });
+  live.usedArea += it.area;
+  return true;
+}
+
+/** One full greedy pass over a given order. First-fit across existing sheets
+ *  (oldest first, so earlier sheets fill before new stock opens). */
+function runPass(order: CncInput[], gw: number, gh: number, getMask: MaskFn, res: number, leftFirst: boolean): PassResult {
+  const lives: LiveSheet[] = [];
+  const unplaced: string[] = [];
+  for (const it of order) {
+    let done = false;
+    for (const live of lives) {
+      if (placeOnSheet(live, it, getMask, res, leftFirst)) { done = true; break; }
+    }
+    if (!done) {
+      const live: LiveSheet = { grid: new SheetGrid(gw, gh), placements: [], usedArea: 0 };
+      if (placeOnSheet(live, it, getMask, res, leftFirst)) lives.push(live);
+      else unplaced.push(it.id);
+    }
+  }
+  return { lives, unplaced };
+}
+
+/** Fewer unplaced → fewer sheets → more material used. */
+function passBetter(a: PassResult, b: PassResult): boolean {
+  if (a.unplaced.length !== b.unplaced.length) return a.unplaced.length < b.unplaced.length;
+  if (a.lives.length !== b.lives.length) return a.lives.length < b.lives.length;
+  const ua = a.lives.reduce((s, l) => s + l.usedArea, 0);
+  const ub = b.lives.reduce((s, l) => s + l.usedArea, 0);
+  return ua > ub;
+}
+
 /**
- * Core packer as a generator so the sync and animated drivers share one
- * implementation. Yields a CncProgress snapshot after each placement and
- * returns the final CncResult.
+ * Dissolve sheets: repeatedly take the least-filled sheet and try to re-place
+ * ALL of its parts onto the other sheets (on cloned grids, so a failure rolls
+ * back). If they all fit, drop that sheet. This is what catches "this part
+ * could go on another sheet" and lowers the sheet count.
+ */
+function consolidate(lives: LiveSheet[], getMask: MaskFn, res: number, byId: Map<string, CncInput>): LiveSheet[] {
+  let working = lives;
+  let improved = true;
+  let guard = 0;
+  while (improved && working.length > 1 && guard++ < working.length + 4) {
+    improved = false;
+    // Victim = least-used sheet (cheapest to absorb).
+    let vi = 0;
+    for (let i = 1; i < working.length; i++) if (working[i].usedArea < working[vi].usedArea) vi = i;
+    const victim = working[vi];
+    const clones = working.filter((_, i) => i !== vi).map(cloneLive);
+    // Largest victim parts first — harder pieces placed while space is freest.
+    const parts = victim.placements.slice().sort((a, b) => b.area - a.area);
+    let allFit = true;
+    for (const p of parts) {
+      const it = byId.get(p.id);
+      if (!it) { allFit = false; break; }
+      let placed = false;
+      for (const c of clones) {
+        if (placeOnSheet(c, it, getMask, res, false)) { placed = true; break; }
+      }
+      if (!placed) { allFit = false; break; }
+    }
+    if (allFit) { working = clones; improved = true; }
+  }
+  return working;
+}
+
+function bbox0(outer: Vec2[]): { w: number; h: number } {
+  let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+  for (const [x, y] of outer) {
+    if (x < minX) minX = x; if (y < minY) minY = y;
+    if (x > maxX) maxX = x; if (y > maxY) maxY = y;
+  }
+  return { w: maxX - minX, h: maxY - minY };
+}
+
+/** Candidate (ordering × scan-direction) restarts, capped to `passes`. */
+function buildOrderings(items: CncInput[], passes: number): { order: CncInput[]; leftFirst: boolean }[] {
+  const dims = new Map<string, { w: number; h: number }>();
+  for (const it of items) if (!dims.has(it.geoKey)) dims.set(it.geoKey, bbox0(it.outer));
+  const d = (it: CncInput) => dims.get(it.geoKey)!;
+  const sorted = (cmp: (a: CncInput, b: CncInput) => number) => items.slice().sort(cmp);
+  const byArea = (a: CncInput, b: CncInput) => b.area - a.area;
+  const byLong = (a: CncInput, b: CncInput) => Math.max(d(b).w, d(b).h) - Math.max(d(a).w, d(a).h);
+  const byShort = (a: CncInput, b: CncInput) => Math.min(d(b).w, d(b).h) - Math.min(d(a).w, d(a).h);
+  const byPerim = (a: CncInput, b: CncInput) => (d(b).w + d(b).h) - (d(a).w + d(a).h);
+
+  const out: { order: CncInput[]; leftFirst: boolean }[] = [
+    { order: sorted(byArea), leftFirst: false },
+    { order: sorted(byArea), leftFirst: true },
+    { order: sorted(byLong), leftFirst: false },
+    { order: sorted(byShort), leftFirst: false },
+    { order: sorted(byPerim), leftFirst: false },
+    { order: sorted(byLong), leftFirst: true },
+  ];
+  // Deterministic shuffles fill any remaining budget (reproducible runs).
+  let seed = 0x9e3779b1;
+  const rand = () => { seed = (seed * 1664525 + 1013904223) >>> 0; return seed / 0xffffffff; };
+  while (out.length < passes) {
+    const sh = sorted(byArea);
+    for (let k = sh.length - 1; k > 0; k--) { const j = Math.floor(rand() * (k + 1)); [sh[k], sh[j]] = [sh[j], sh[k]]; }
+    out.push({ order: sh, leftFirst: out.length % 2 === 1 });
+  }
+  return out.slice(0, Math.max(1, passes));
+}
+
+function livesToSheets(lives: LiveSheet[], res: number, withFree: boolean): CncSheet[] {
+  return lives.map((l) => {
+    let largestFree: { w: number; h: number } | null = null;
+    if (withFree) {
+      const r = l.grid.largestEmptyRect();
+      largestFree = r ? { w: r.w * res, h: r.h * res } : null;
+    }
+    return { placements: l.placements.slice(), usedArea: l.usedArea, largestFree };
+  });
+}
+
+/**
+ * Multi-restart packer as a generator (yields once per restart, then once
+ * after consolidation) so the sync and animated drivers share one body.
  */
 export function* packCncGen(
   items: CncInput[],
@@ -405,12 +621,10 @@ export function* packCncGen(
   const gw = Math.floor(sheetW / res);
   const gh = Math.floor(sheetH / res);
 
-  // Largest parts first — the standard first-fit-decreasing heuristic.
-  const order = items.slice().sort((a, b) => b.area - a.area);
-
-  // Mask cache keyed by geometry + angle (instances of a part share geometry).
+  // Mask cache shared across ALL restarts (masks depend only on geometry,
+  // angle, resolution + kerf) — the big perf win that makes restarts affordable.
   const maskCache = new Map<string, Mask>();
-  const getMask = (it: CncInput, deg: number): Mask => {
+  const getMask: MaskFn = (it, deg) => {
     const key = `${it.geoKey}@${deg}`;
     let m = maskCache.get(key);
     if (!m) {
@@ -420,89 +634,50 @@ export function* packCncGen(
     }
     return m;
   };
+  const byId = new Map(items.map((it) => [it.id, it] as const));
 
-  const grids: SheetGrid[] = [];
-  const sheets: CncSheet[] = [];
-  const unplaced: string[] = [];
-  const total = items.length;
-  let placed = 0;
-  // Cap the number of progress snapshots so replay frames / snapshot copies
-  // stay O(total) rather than O(total²) on very large jobs.
-  const yieldStep = Math.max(1, Math.floor(total / 120));
+  // The optimiser tries this many orderings, keeping the fewest-sheets result.
+  // It follows the "Optimize tries" setting, but each pass is a full raster
+  // re-pack (far heavier than a rectangle trial), so the count is capped by
+  // part count to keep wall-clock time sane, and a hard time budget backs that.
+  const restarts = opt.restarts ?? 8;
+  const n = items.length;
+  const cap = n <= 12 ? 24 : n <= 25 ? 14 : n <= 50 ? 8 : 4;
+  const attempts = Math.max(1, Math.min(restarts, cap));
+  const orderings = buildOrderings(items, attempts);
+  const totalSteps = orderings.length + 1; // +1 = the consolidation step
+  const startMs = Date.now();
+  const budgetMs = 15000;
 
-  const snapshot = (): CncSheet[] =>
-    sheets.map((s) => ({
-      placements: s.placements.slice(),
-      usedArea: s.usedArea,
-      largestFree: s.largestFree,
-    }));
+  let best: PassResult | null = null;
+  for (let i = 0; i < orderings.length; i++) {
+    const { order, leftFirst } = orderings[i];
+    const result = runPass(order, gw, gh, getMask, res, leftFirst);
+    const isNewBest = !best || passBetter(result, best);
+    if (isNewBest) best = result;
+    yield {
+      trial: i,
+      total: totalSteps,
+      current: livesToSheets(result.lives, res, false),
+      best: livesToSheets(best!.lives, res, false),
+      isNewBest,
+    };
+    // Safety: bail out of the restart loop if we've blown the time budget.
+    // The consolidation step below still runs, so the bar still completes.
+    if (Date.now() - startMs > budgetMs) break;
+  }
 
-  const tryPlaceOnSheet = (grid: SheetGrid, sheet: CncSheet, it: CncInput): boolean => {
-    // Across candidate angles, keep the lowest (then leftmost) placement.
-    let best: { mask: Mask; gx: number; gy: number; deg: number } | null = null;
-    for (const deg of it.angles) {
-      const mask = getMask(it, deg);
-      const spot = grid.findBottomLeft(mask);
-      if (!spot) continue;
-      if (
-        !best ||
-        spot.gy < best.gy ||
-        (spot.gy === best.gy && spot.gx < best.gx)
-      ) {
-        best = { mask, gx: spot.gx, gy: spot.gy, deg };
-        if (spot.gy === 0 && spot.gx === 0) break; // can't beat origin
-      }
-    }
-    if (!best) return false;
-    grid.commit(best.mask, best.gx, best.gy);
-    const m = best.mask;
-    sheet.placements.push({
-      id: it.id,
-      angleDeg: best.deg,
-      x: (best.gx + m.pad) * res,
-      y: (best.gy + m.pad) * res,
-      w: m.w,
-      h: m.h,
-      outer: m.outer,
-      holes: m.holes,
-      area: it.area,
-    });
-    sheet.usedArea += it.area;
-    return true;
+  // Final squeeze: try to eliminate under-filled sheets.
+  const consolidated = consolidate(best!.lives, getMask, res, byId);
+  const finalSheets = livesToSheets(consolidated, res, true);
+  yield {
+    trial: orderings.length,
+    total: totalSteps,
+    current: finalSheets,
+    best: finalSheets,
+    isNewBest: consolidated.length < best!.lives.length,
   };
-
-  for (const it of order) {
-    let done = false;
-    // First-fit across existing sheets (oldest first) so holes / leftover
-    // pockets on earlier sheets get reused before opening fresh stock.
-    for (let s = 0; s < grids.length; s++) {
-      if (tryPlaceOnSheet(grids[s], sheets[s], it)) { done = true; break; }
-    }
-    if (!done) {
-      const grid = new SheetGrid(gw, gh);
-      const sheet: CncSheet = { placements: [], usedArea: 0, largestFree: null };
-      if (tryPlaceOnSheet(grid, sheet, it)) {
-        grids.push(grid);
-        sheets.push(sheet);
-        done = true;
-      } else {
-        // Doesn't fit even an empty sheet (too big at every angle).
-        unplaced.push(it.id);
-      }
-    }
-    if (done) placed++;
-    if (placed % yieldStep === 0 || placed === total) {
-      yield { placed, total, sheets: snapshot() };
-    }
-  }
-
-  // Finalise per-sheet largest offcut (in mm).
-  for (let s = 0; s < grids.length; s++) {
-    const r = grids[s].largestEmptyRect();
-    sheets[s].largestFree = r ? { w: r.w * res, h: r.h * res } : null;
-  }
-
-  return { sheets, unplaced };
+  return { sheets: finalSheets, unplaced: best!.unplaced };
 }
 
 /** Synchronous driver — drains the generator. */
@@ -530,7 +705,7 @@ export async function packCncAnimated(
   kerf: number,
   onProgress: (p: CncProgress) => void | Promise<void>,
   opt: CncOptions = {},
-  yieldEvery = 3,
+  yieldEvery = 1, // restarts are coarse-grained — repaint after each
 ): Promise<CncResult> {
   const gen = packCncGen(items, sheetW, sheetH, kerf, opt);
   let step = gen.next();

@@ -687,7 +687,7 @@ export function runCncNest(parts: NestPart[], config: NestConfig): NestResult {
 
   for (const t of thicknesses) {
     const { items, meta } = buildCncItems(buckets.get(t)!);
-    const res = packCnc(items, usableL, usableW, kerf);
+    const res = packCnc(items, usableL, usableW, kerf, { restarts: config.restarts });
     const sheets = res.sheets.map((cs, idx) =>
       cncSheetToNest(cs, idx, t, margin, winnerSheetW, winnerSheetL, meta));
     const unplaced = res.unplaced.map((id) => {
@@ -727,16 +727,12 @@ export async function runCncNestAnimated(
   const totalGroups = thicknesses.length;
   const winnerSheetW = sheetL;
   const winnerSheetL = sheetW;
-  const totalParts = parts.reduce((a, p) => a + p.qty, 0);
-
   const groups: ThicknessGroup[] = [];
   let totalPartArea = 0, totalSheetArea = 0, totalSheets = 0;
-  let placedBefore = 0;
 
   for (let gi = 0; gi < totalGroups; gi++) {
     const t = thicknesses[gi];
     const { items, meta } = buildCncItems(buckets.get(t)!);
-    const groupBase = placedBefore;
 
     const toSheets = (css: CncSheet[]): NestSheet[] => {
       const sheets = css.map((cs, idx) =>
@@ -747,21 +743,19 @@ export async function runCncNestAnimated(
     };
 
     const res = await packCncAnimated(items, usableL, usableW, kerf, async (p) => {
-      const sheets = toSheets(p.sheets);
       await onTrial({
         groupIdx: gi,
         totalGroups,
-        trial: Math.max(0, groupBase + p.placed - 1),
-        totalTrials: Math.max(1, totalParts),
-        current: sheets,
-        best: sheets,
-        isNewBest: true,
+        trial: p.trial,
+        totalTrials: p.total,
+        current: toSheets(p.current),
+        best: toSheets(p.best),
+        isNewBest: p.isNewBest,
         sheetW: winnerSheetW,
         sheetL: winnerSheetL,
       });
-    });
+    }, { restarts: config.restarts });
 
-    placedBefore = groupBase + items.length;
     const sheets = res.sheets.map((cs, idx) =>
       cncSheetToNest(cs, idx, t, margin, winnerSheetW, winnerSheetL, meta));
     const unplaced = res.unplaced.map((id) => {

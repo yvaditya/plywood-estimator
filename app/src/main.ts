@@ -924,15 +924,14 @@ nestBtn.addEventListener('click', async () => {
       cutStrategy: strategy,
     }, async (info) => {
       const pct = ((info.trial + 1) / info.totalTrials) * 100;
-      // CNC is a single greedy nest (no restarts) — report it as parts placed
-      // rather than optimiser trials.
+      // CNC reports optimiser passes (orderings + consolidation), not saw trials.
       nestBtn.textContent = isCnc
-        ? `Nesting ${info.trial + 1}/${info.totalTrials} · ${pct.toFixed(0)}%`
+        ? `Nesting · pass ${info.trial + 1}/${info.totalTrials} · ${pct.toFixed(0)}%`
         : `Trial ${info.trial + 1}/${info.totalTrials} · ${pct.toFixed(0)}%`;
       const yieldNow = sumYield(info.best);
       resultsEmpty.textContent = isCnc
-        ? `Nesting · ${info.trial + 1} of ${info.totalTrials} parts · ` +
-          `${info.best.length} sheet${info.best.length === 1 ? '' : 's'} · ${(yieldNow * 100).toFixed(1)}% yield`
+        ? `Nesting · pass ${info.trial + 1} of ${info.totalTrials} · ` +
+          `best ${info.best.length} sheet${info.best.length === 1 ? '' : 's'} · ${(yieldNow * 100).toFixed(1)}% yield`
         : `Optimising · trial ${info.trial + 1} of ${info.totalTrials} · ` +
           `best ${info.best.length} sheet${info.best.length === 1 ? '' : 's'} · ${(yieldNow * 100).toFixed(1)}% yield`;
       // Record this trial for later replay.
@@ -1039,10 +1038,9 @@ function paintTrialPreview(sheets: NestSheet[], sheetW: number, sheetL: number, 
  */
 function renderConvergenceChart() {
   const data = state.lastTrialMetrics;
-  // CNC is a single greedy nest, not a multi-trial optimiser — the
-  // convergence plot (yield/sheets/cuts over trials) doesn't apply.
-  if (state.lastStrategy === 'cnc') { convergenceChart.hidden = true; return; }
   if (data.length === 0) { convergenceChart.hidden = true; return; }
+  // CNC has no discrete cut count — drop the cuts series for it.
+  const showCuts = state.lastStrategy !== 'cnc';
   convergenceChart.hidden = false;
   const W = 880, H = 140, PAD_L = 36, PAD_R = 12, PAD_T = 18, PAD_B = 22;
   const plotW = W - PAD_L - PAD_R;
@@ -1066,19 +1064,22 @@ function renderConvergenceChart() {
   // Series — best-so-far (monotonic improvement)
   const yieldPath = path(data.map((d) => d.bestYield), 0, 100);
   const sheetsPath = path(data.map((d) => d.bestSheets), 0, maxSheets);
-  const cutsPath = path(data.map((d) => d.bestCuts), 0, maxCuts);
+  const cutsPath = showCuts ? path(data.map((d) => d.bestCuts), 0, maxCuts) : '';
 
   // Final values for legend
   const last = data[data.length - 1];
   const trialLabel = (i: number) => String(i + 1);
+  const title = state.lastStrategy === 'cnc'
+    ? `Nesting convergence (${N} passes)`
+    : `Optimiser convergence (${N} trials)`;
 
   convergenceChart.innerHTML = `
     <div class="conv-header">
-      <span class="conv-title">Optimiser convergence (${N} trials)</span>
+      <span class="conv-title">${title}</span>
       <span class="conv-legend">
         <span class="ll yield">Yield ${last.bestYield.toFixed(1)}%</span>
         <span class="ll sheets">Sheets ${last.bestSheets}</span>
-        <span class="ll cuts">Cuts ${last.bestCuts}</span>
+        ${showCuts ? `<span class="ll cuts">Cuts ${last.bestCuts}</span>` : ''}
       </span>
     </div>
     <svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="xMidYMid meet" class="conv-svg">
