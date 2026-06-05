@@ -135,6 +135,12 @@ the expand state across renders.
   `snapshotFiltered` toggles that group off before each PDF snapshot.
 - **Thickness bucket = 0.5 mm**. Tighter values split float-noise copies
   of the same panel into separate sheet stacks. Don't tighten.
+- **Thickness comes from the OBB when a panel is tilted**. The world-axis
+  AABB over-reports thickness for a leaning panel (a 1/2" panel tilted ~2°
+  reads ~7/8" and lands on its own sheet). `analyzeBody` always computes
+  the PCA-OBB and prefers its thin extent when meaningfully thinner
+  (`obbThin < worldThickness * 0.9`). Axis-aligned panels are untouched
+  (`obbThin === worldThickness`). Don't revert to a world-only reading.
 - **`packOne` skip-on-fail** in `packRect.ts` is critical: when a part
   doesn't fit on the current bin, **skip and try the next part**, not
   close the bin. Reverting that policy doubles sheet counts.

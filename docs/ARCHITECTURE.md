@@ -66,6 +66,17 @@ Per mesh:
    `viewer.addNonSheetMesh()` for visual representation (red dashed) and
    are excluded from the body list and the nester.
 
+   **Tilt correction.** The world-axis AABB measures thickness along a
+   world axis, so a panel that leans even a couple of degrees has its
+   thin extent inflated by a slice of its own length/width (a 1/2" panel
+   can read as 7/8" and split onto its own sheet). The PCA-OBB is
+   therefore *always* computed: when its least-variance axis — which
+   stays perpendicular to the panel face regardless of tilt — finds a
+   meaningfully thinner *and still sheet-valid* thickness
+   (`obbThin < worldThickness × 0.9`), `analyzeBody` trusts the OBB over
+   the inflated world reading. For a genuinely axis-aligned panel
+   `obbThin === worldThickness`, so the world path is unchanged.
+
 3. **Axis-aligned analysis** (`analyzeAxisAligned`):
    - thinIdx = thinnest axis → `thickness`;
    - bigIdx / midIdx → `length` / `width`;
