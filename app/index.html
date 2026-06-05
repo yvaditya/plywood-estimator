@@ -64,12 +64,19 @@
             <label>Preset
               <select id="preset">
                 <option value="">— preset —</option>
-                <option value="1220x2440">4×8 ft</option>
-                <option value="1525x1525">5×5 ft (Baltic birch)</option>
-                <option value="1525x3050">5×10 ft</option>
-                <option value="2440x1220">8×4 (rotated)</option>
+                <optgroup label="Standard">
+                  <option value="1220x2440">4×8 ft</option>
+                  <option value="1525x1525">5×5 ft (Baltic birch)</option>
+                  <option value="1525x3050">5×10 ft</option>
+                  <option value="2440x1220">8×4 (rotated)</option>
+                </optgroup>
+                <optgroup label="My presets" id="presetCustomGroup" hidden></optgroup>
               </select>
             </label>
+            <div class="preset-actions" style="grid-column: 1 / -1; display: flex; gap: 6px; flex-wrap: wrap;">
+              <button type="button" id="savePresetBtn" class="ghost">+ Save current size</button>
+              <button type="button" id="deletePresetBtn" class="ghost" disabled>Delete preset</button>
+            </div>
             <label>Optimize tries
               <select id="restarts">
                 <option value="1">1 (fastest)</option>
@@ -88,6 +95,7 @@
                 <option value="free">Max yield (any cuts)</option>
                 <option value="guillotine" selected>Min cuts (track saw / panel saw)</option>
                 <option value="save-last">Max yield, save last sheet</option>
+                <option value="cnc">CNC nest (any angle · router / waterjet)</option>
               </select>
             </label>
           </div>
@@ -187,11 +195,19 @@
                 <span class="panel-dot" aria-hidden="true"></span>
                 3D model
               </span>
-              <button id="viewerMaxBtn" class="pane-max" title="Maximize / restore">
-                <svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-                  <path d="M4 10V4h6M20 14v6h-6M14 4h6v6M10 20H4v-6" />
-                </svg>
-              </button>
+              <div class="row-gap">
+                <button id="recenterBtn" class="pane-max" title="Recenter view on model" disabled>
+                  <svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                    <circle cx="12" cy="12" r="3" />
+                    <path d="M12 2v3M12 19v3M2 12h3M19 12h3" />
+                  </svg>
+                </button>
+                <button id="viewerMaxBtn" class="pane-max" title="Maximize / restore">
+                  <svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                    <path d="M4 10V4h6M20 14v6h-6M14 4h6v6M10 20H4v-6" />
+                  </svg>
+                </button>
+              </div>
             </header>
             <div id="viewerWrap">
               <div id="viewer"></div>
@@ -220,13 +236,20 @@
                     <path d="M8 5v14l11-7z" />
                   </svg>
                 </button>
-                <button id="downloadDxfBtn" class="ghost" disabled>
+                <button id="downloadDxfBtn" class="ghost" disabled title="DXF with part labels and dimensions">
                   <svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
                     <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
                     <path d="m7 10 5 5 5-5" />
                     <path d="M12 15V3" />
                   </svg>
                   DXF
+                </button>
+                <button id="downloadCutDxfBtn" class="ghost" disabled title="Outlines + sheet boundary only — no labels or dimensions, ready for CNC router / waterjet">
+                  <svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                    <path d="M6 3a3 3 0 1 0 0 6 3 3 0 0 0 0-6zM6 9l12 9M18 6 9 12.75" />
+                    <circle cx="6" cy="18" r="3" />
+                  </svg>
+                  Cut DXF
                 </button>
                 <button id="downloadPdfBtn" class="ghost" disabled>
                   <svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">

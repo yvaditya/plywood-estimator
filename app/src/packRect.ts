@@ -32,8 +32,12 @@ export type Heuristic = 'BSSF' | 'BLSF' | 'BAF' | 'BL';
  *                  in one corner and the remaining material on the last
  *                  sheet is a clean rectangle the user can save for
  *                  another job.
+ * 'cnc'         = true-shape any-angle nesting for CNC router / waterjet
+ *                  (handled by cncNest.ts, NOT this rectangle packer). Listed
+ *                  here so the strategy type is shared; nest.ts dispatches it
+ *                  before the rectangle path runs.
  */
-export type CutStrategy = 'free' | 'guillotine' | 'save-last';
+export type CutStrategy = 'free' | 'guillotine' | 'save-last' | 'cnc';
 
 export interface PackInput {
   /** Stable identifier; opaque to the packer. */

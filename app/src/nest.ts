@@ -24,6 +24,7 @@
 
 import type { Vec2 } from './geometry';
 import { packMulti, packMultiAnimated, type PackInput, type PackPlacement, type CutStrategy, type Cut, type PackProgress } from './packRect';
+import { packCnc, packCncAnimated, polyArea, type CncInput, type CncSheet } from './cncNest';
 
 export type { CutStrategy, Cut, PackProgress };
 
@@ -57,7 +58,8 @@ export interface PlacedPart {
   partId: string;
   partName: string;
   instance: number;
-  rotation: number;       // 0 or 90 (degrees, CCW)
+  rotation: number;       // degrees CCW. Rectangle strategies use 0 or 90;
+                          // the 'cnc' strategy may use any angle.
   x: number;              // mm, sheet-relative (includes margin offset)
   y: number;
   w: number;              // mm — bbox width after rotation
@@ -199,6 +201,7 @@ interface InstanceMeta {
 }
 
 export function runNest(parts: NestPart[], config: NestConfig): NestResult {
+  if (config.cutStrategy === 'cnc') return runCncNest(parts, config);
   const { sheetW, sheetL, margin, kerf } = config;
   const usableW = sheetW - 2 * margin;
   const usableL = sheetL - 2 * margin;
@@ -344,6 +347,7 @@ export async function runNestAnimated(
     sheetL: number;
   }) => void | Promise<void>,
 ): Promise<NestResult> {
+  if (config.cutStrategy === 'cnc') return runCncNestAnimated(parts, config, onTrial);
   const { sheetW, sheetL, margin, kerf } = config;
   const usableW = sheetW - 2 * margin;
   const usableL = sheetL - 2 * margin;
@@ -552,4 +556,228 @@ function compareTries(
   const aLast = a.sheets.length ? a.sheets[a.sheets.length - 1].usedArea : 0;
   const bLast = b.sheets.length ? b.sheets[b.sheets.length - 1].usedArea : 0;
   return aLast >= bLast;
+}
+
+// ---------------------------------------------------------------------------
+// CNC / waterjet true-shape nesting path
+//
+// Bypasses the rectangle packer entirely (see cncNest.ts). Parts may rotate to
+// ANY angle and nest inside each other's concavities and holes; there is no
+// guillotine cut tree (a router/waterjet cuts continuous contours), so
+// NestSheet.cuts is left empty. We keep the same thickness grouping, landscape
+// orientation lock, and margin frame as the rectangle path so every downstream
+// renderer (SVG / DXF / PDF) treats CNC sheets like any other.
+// ---------------------------------------------------------------------------
+
+/** Candidate rotation angles (deg, CCW) for a part under the CNC strategy. */
+const CNC_ANGLE_STEP = 15;
+
+function cncAnglesFor(grain: GrainLock, w0: number, h0: number): number[] {
+  if (grain === 'free') {
+    const out: number[] = [];
+    for (let a = 0; a < 360; a += CNC_ANGLE_STEP) out.push(a);
+    return out;
+  }
+  // Respect an explicit grain lock: keep the part's length (grain) axis aligned
+  // to the chosen sheet axis. Only the grain-preserving 180° flip is allowed.
+  const isLandscape = w0 >= h0;
+  if (grain === 'length') {
+    const base = isLandscape ? 0 : 90;
+    return [base, base + 180];
+  }
+  // grain === 'width'
+  const base = isLandscape ? 90 : 0;
+  return [base, base + 180];
+}
+
+function ringBbox(ring: Vec2[]): { w: number; h: number } {
+  let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+  for (const [x, y] of ring) {
+    if (x < minX) minX = x;
+    if (y < minY) minY = y;
+    if (x > maxX) maxX = x;
+    if (y > maxY) maxY = y;
+  }
+  return { w: maxX - minX, h: maxY - minY };
+}
+
+function bucketByThickness(parts: NestPart[]): Map<number, NestPart[]> {
+  const buckets = new Map<number, NestPart[]>();
+  for (const p of parts) {
+    const k = Math.round(p.thickness * 2) / 2;
+    if (!buckets.has(k)) buckets.set(k, []);
+    buckets.get(k)!.push(p);
+  }
+  return buckets;
+}
+
+interface CncMeta { part: NestPart; instance: number; }
+
+function buildCncItems(bucket: NestPart[]): { items: CncInput[]; meta: Map<string, CncMeta> } {
+  const items: CncInput[] = [];
+  const meta = new Map<string, CncMeta>();
+  for (const p of bucket) {
+    const bb = ringBbox(p.outer);
+    const angles = cncAnglesFor(p.grain, bb.w, bb.h);
+    const area = polyArea(p.outer, p.holes);
+    for (let inst = 1; inst <= p.qty; inst++) {
+      const id = `${p.id}#${inst}`;
+      items.push({ id, geoKey: p.id, outer: p.outer, holes: p.holes, angles, area });
+      meta.set(id, { part: p, instance: inst });
+    }
+  }
+  return { items, meta };
+}
+
+function cncSheetToNest(
+  cs: CncSheet,
+  idx: number,
+  thickness: number,
+  margin: number,
+  sheetW: number,
+  sheetL: number,
+  meta: Map<string, CncMeta>,
+): NestSheet {
+  const sh: NestSheet = {
+    index: idx + 1,
+    globalIndex: 0,
+    thickness,
+    parts: cs.placements.map((pl) => {
+      const m = meta.get(pl.id)!;
+      return {
+        partId: m.part.id,
+        partName: m.part.name,
+        instance: m.instance,
+        rotation: pl.angleDeg,
+        x: pl.x + margin,
+        y: pl.y + margin,
+        w: pl.w,
+        h: pl.h,
+        color: m.part.color,
+        outer: pl.outer,
+        holes: pl.holes,
+        panelLabel: '',
+        separatedAt: 0,
+      };
+    }),
+    usedArea: cs.usedArea,
+    largestFree: cs.largestFree,
+    sheetW,
+    sheetL,
+    cuts: [], // CNC = continuous contour cutting, no guillotine cut tree
+  };
+  annotatePlacedParts(sh);
+  return sh;
+}
+
+export function runCncNest(parts: NestPart[], config: NestConfig): NestResult {
+  const { sheetW, sheetL, margin, kerf } = config;
+  const usableW = sheetW - 2 * margin;
+  const usableL = sheetL - 2 * margin;
+  if (usableW <= 0 || usableL <= 0) throw new Error('Sheet margin leaves no usable area.');
+
+  const buckets = bucketByThickness(parts);
+  const thicknesses = Array.from(buckets.keys()).sort((a, b) => a - b);
+  // Landscape lock (matches the rectangle path): bin X = sheet length.
+  const winnerSheetW = sheetL;
+  const winnerSheetL = sheetW;
+
+  const groups: ThicknessGroup[] = [];
+  let totalPartArea = 0, totalSheetArea = 0, totalSheets = 0;
+
+  for (const t of thicknesses) {
+    const { items, meta } = buildCncItems(buckets.get(t)!);
+    const res = packCnc(items, usableL, usableW, kerf);
+    const sheets = res.sheets.map((cs, idx) =>
+      cncSheetToNest(cs, idx, t, margin, winnerSheetW, winnerSheetL, meta));
+    const unplaced = res.unplaced.map((id) => {
+      const m = meta.get(id)!;
+      return { partId: m.part.id, partName: m.part.name, instance: m.instance };
+    });
+    totalSheetArea += sheets.length * winnerSheetW * winnerSheetL;
+    totalPartArea += sheets.reduce((a, s) => a + s.usedArea, 0);
+    totalSheets += sheets.length;
+    groups.push({ thickness: t, sheets, unplaced });
+  }
+
+  let gIdx = 1;
+  for (const g of groups) for (const s of g.sheets) s.globalIndex = gIdx++;
+  return {
+    groups, totalSheets, totalPartArea, totalSheetArea,
+    yield: totalSheetArea > 0 ? totalPartArea / totalSheetArea : 0,
+  };
+}
+
+export async function runCncNestAnimated(
+  parts: NestPart[],
+  config: NestConfig,
+  onTrial: (info: {
+    groupIdx: number; totalGroups: number; trial: number; totalTrials: number;
+    current: NestSheet[]; best: NestSheet[]; isNewBest: boolean;
+    sheetW: number; sheetL: number;
+  }) => void | Promise<void>,
+): Promise<NestResult> {
+  const { sheetW, sheetL, margin, kerf } = config;
+  const usableW = sheetW - 2 * margin;
+  const usableL = sheetL - 2 * margin;
+  if (usableW <= 0 || usableL <= 0) throw new Error('Sheet margin leaves no usable area.');
+
+  const buckets = bucketByThickness(parts);
+  const thicknesses = Array.from(buckets.keys()).sort((a, b) => a - b);
+  const totalGroups = thicknesses.length;
+  const winnerSheetW = sheetL;
+  const winnerSheetL = sheetW;
+  const totalParts = parts.reduce((a, p) => a + p.qty, 0);
+
+  const groups: ThicknessGroup[] = [];
+  let totalPartArea = 0, totalSheetArea = 0, totalSheets = 0;
+  let placedBefore = 0;
+
+  for (let gi = 0; gi < totalGroups; gi++) {
+    const t = thicknesses[gi];
+    const { items, meta } = buildCncItems(buckets.get(t)!);
+    const groupBase = placedBefore;
+
+    const toSheets = (css: CncSheet[]): NestSheet[] => {
+      const sheets = css.map((cs, idx) =>
+        cncSheetToNest(cs, idx, t, margin, winnerSheetW, winnerSheetL, meta));
+      let gx = 1;
+      for (const s of sheets) s.globalIndex = gx++; // provisional, for live preview
+      return sheets;
+    };
+
+    const res = await packCncAnimated(items, usableL, usableW, kerf, async (p) => {
+      const sheets = toSheets(p.sheets);
+      await onTrial({
+        groupIdx: gi,
+        totalGroups,
+        trial: Math.max(0, groupBase + p.placed - 1),
+        totalTrials: Math.max(1, totalParts),
+        current: sheets,
+        best: sheets,
+        isNewBest: true,
+        sheetW: winnerSheetW,
+        sheetL: winnerSheetL,
+      });
+    });
+
+    placedBefore = groupBase + items.length;
+    const sheets = res.sheets.map((cs, idx) =>
+      cncSheetToNest(cs, idx, t, margin, winnerSheetW, winnerSheetL, meta));
+    const unplaced = res.unplaced.map((id) => {
+      const m = meta.get(id)!;
+      return { partId: m.part.id, partName: m.part.name, instance: m.instance };
+    });
+    totalSheetArea += sheets.length * winnerSheetW * winnerSheetL;
+    totalPartArea += sheets.reduce((a, s) => a + s.usedArea, 0);
+    totalSheets += sheets.length;
+    groups.push({ thickness: t, sheets, unplaced });
+  }
+
+  let gIdx = 1;
+  for (const g of groups) for (const s of g.sheets) s.globalIndex = gIdx++;
+  return {
+    groups, totalSheets, totalPartArea, totalSheetArea,
+    yield: totalSheetArea > 0 ? totalPartArea / totalSheetArea : 0,
+  };
 }

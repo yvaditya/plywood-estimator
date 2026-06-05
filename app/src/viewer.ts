@@ -116,6 +116,7 @@ export class Viewer {
   private rim!: THREE.DirectionalLight;
   private hemi!: THREE.HemisphereLight;
   private shadowFloor!: THREE.Mesh;
+  private grid!: THREE.GridHelper;
   private outlinePass!: OutlinePass;
   private outlineDimPass!: OutlinePass;
   private smaaPass!: SMAAPass;
@@ -210,10 +211,12 @@ export class Viewer {
     // Floor grid on the XY plane (Z-up world). Switched to warm grays so
     // it reads as a quiet drafting grid against the light backdrop instead
     // of glowing blue.
+    // Auto-resized to wrap the loaded model's footprint in frameAll().
     const grid = new THREE.GridHelper(6000, 60, 0x9b9a97, 0xcfceca);
     grid.rotation.x = Math.PI / 2;
     (grid.material as THREE.Material).transparent = true;
     (grid.material as THREE.Material).opacity = 0.55;
+    this.grid = grid;
     this.scene.add(grid);
 
     this.scene.add(this.root);
@@ -656,6 +659,10 @@ export class Viewer {
     });
     const nonSheetVisBackup = this.nonSheetGroup.visible;
     this.nonSheetGroup.visible = false;
+    // Hide the floor grid too — assembly/exploded diagrams read cleaner
+    // without a drafting grid under the parts.
+    const gridVisBackup = this.grid.visible;
+    this.grid.visible = false;
 
     // 2. Refit camera + shadow camera to the visible bodies
     const cameraBackup = {
@@ -740,6 +747,7 @@ export class Viewer {
     }
     for (const g of grainBackup) g.obj.visible = g.vis;
     this.nonSheetGroup.visible = nonSheetVisBackup;
+    this.grid.visible = gridVisBackup;
     this.camera.position.copy(cameraBackup.pos);
     this.controls.target.copy(cameraBackup.target);
     this.camera.near = cameraBackup.near;
@@ -893,8 +901,50 @@ export class Viewer {
     // Drop the shadow floor just below the model bottom (Z is up)
     this.shadowFloor.position.z = box.min.z - maxDim * 0.001;
 
+    // Wrap the floor grid tightly around the model's footprint (+ margin).
+    this.fitGridToModel(box);
+
     // Refresh outline selection cache after the body list changed.
     this.refreshOutlines();
+  }
+
+  /**
+   * Resize + recentre the floor grid so it spans the model's XY footprint
+   * plus a margin, with tidy cell spacing. Rebuilds the GridHelper (its size
+   * is fixed at construction). Sits on the model's lowest Z so it reads as the
+   * ground the parts rest on.
+   */
+  private fitGridToModel(box: THREE.Box3) {
+    const size = new THREE.Vector3();
+    box.getSize(size);
+    const center = new THREE.Vector3();
+    box.getCenter(center);
+
+    // ~20% clear margin around the parts on every side.
+    const footprint = Math.max(size.x, size.y, 1);
+    const span = footprint * 1.4;
+
+    // Snap the cell size to a tidy number near span/20 so the grid reads as a
+    // drafting grid rather than arbitrary spacing.
+    const nice = [1, 2, 5, 10, 25, 50, 100, 250, 500, 1000, 2000];
+    const target = span / 20;
+    let cell = nice[nice.length - 1];
+    for (const n of nice) { if (n >= target) { cell = n; break; } }
+    const divisions = Math.max(2, Math.round(span / cell));
+    const realSpan = divisions * cell;
+
+    const old = this.grid;
+    this.scene.remove(old);
+    old.geometry.dispose();
+    (old.material as THREE.Material).dispose();
+
+    const grid = new THREE.GridHelper(realSpan, divisions, 0x9b9a97, 0xcfceca);
+    grid.rotation.x = Math.PI / 2; // GridHelper is XZ by default → rotate to XY (Z-up)
+    (grid.material as THREE.Material).transparent = true;
+    (grid.material as THREE.Material).opacity = 0.55;
+    grid.position.set(center.x, center.y, box.min.z);
+    this.scene.add(grid);
+    this.grid = grid;
   }
 
   toggleSelection(id: number) {

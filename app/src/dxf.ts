@@ -36,6 +36,11 @@ export interface DxfOptions {
   partDimensions: boolean;
   /** If true, draws overall sheet dimension lines */
   sheetDimensions: boolean;
+  /** "Cut file" mode for CNC routers / waterjet: emit ONLY geometry the
+   *  machine cuts — the sheet boundary plus every part outline and hole — with
+   *  no labels, no dimensions, and no margin guide. Overrides the label/dim
+   *  flags above when set. */
+  outlinesOnly?: boolean;
 }
 
 const fmtDim = (mm: number, units: Units) => fmtDimUnits(mm, units);
@@ -192,8 +197,9 @@ export function sheetToDxf(sheet: NestSheet, opt: DxfOptions): string {
     [0, opt.sheetL],
   ]));
 
-  // Margin (dashed-look — we just stroke a closed poly on its own layer)
-  if (opt.margin > 0) {
+  // Margin (dashed-look — we just stroke a closed poly on its own layer).
+  // Omitted in cut-file mode — it isn't a contour the machine cuts.
+  if (opt.margin > 0 && !opt.outlinesOnly) {
     const m = opt.margin;
     ents.push(lwpolyline('MARGIN', [
       [m, m],
@@ -209,7 +215,7 @@ export function sheetToDxf(sheet: NestSheet, opt: DxfOptions): string {
   }
 
   // Sheet dimensions
-  if (opt.sheetDimensions) {
+  if (opt.sheetDimensions && !opt.outlinesOnly) {
     ents.push(dimension(0, 0, opt.sheetW, 0, DIM_OFFSET + 5, fmtDim(opt.sheetW, opt.units)));
     ents.push(dimension(0, 0, 0, opt.sheetL, DIM_OFFSET + 5, fmtDim(opt.sheetL, opt.units)));
   }
@@ -228,6 +234,9 @@ function partEntities(p: PlacedPart, opt: DxfOptions): string {
   for (const h of p.holes) {
     out.push(lwpolyline('PARTS', h.map(([x, y]) => [x + p.x, y + p.y])));
   }
+
+  // Cut-file mode stops here — outlines + holes only, nothing else.
+  if (opt.outlinesOnly) return out.join(NL);
 
   // Label centered on AABB
   const cx = p.x + p.w / 2;

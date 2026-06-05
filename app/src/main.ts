@@ -26,6 +26,7 @@ import {
   type NestSheet,
   type NestResult,
   type PlacedPart,
+  type CutStrategy,
 } from './nest';
 import { sheetToDxf, downloadDxf } from './dxf';
 import { buildPdf, downloadPdf, type InventoryCheck } from './pdf';
@@ -66,6 +67,8 @@ const state: {
   units: Units;
   lastNest: NestResult | null;
   lastSheet: { w: number; l: number; margin: number; kerf: number } | null;
+  /** Cut strategy used for the last estimate (drives CNC-specific UI). */
+  lastStrategy: CutStrategy;
   shopping: ShoppingRow[];
   currentSheetKey: string | null;   // "g{groupIdx}-s{sheetIdx}"
   currency: string;
@@ -89,6 +92,7 @@ const state: {
   units: 'in',
   lastNest: null,
   lastSheet: null,
+  lastStrategy: 'guillotine',
   shopping: [],
   currentSheetKey: null,
   currency: 'USD',
@@ -128,6 +132,9 @@ const marginInput = $<HTMLInputElement>('margin');
 const kerfInput = $<HTMLInputElement>('kerf');
 const unitsSelect = $<HTMLSelectElement>('units');
 const presetSelect = $<HTMLSelectElement>('preset');
+const presetCustomGroup = $<HTMLOptGroupElement>('presetCustomGroup');
+const savePresetBtn = $<HTMLButtonElement>('savePresetBtn');
+const deletePresetBtn = $<HTMLButtonElement>('deletePresetBtn');
 const restartsSelect = $<HTMLSelectElement>('restarts');
 const cutStrategySelect = $<HTMLSelectElement>('cutStrategy');
 const viewerEl = $('viewer');
@@ -143,6 +150,7 @@ const detailMetrics = $('detailMetrics');
 const inventoryCheckEl = $('inventoryCheck');
 const unplacedList = $('unplacedList');
 const downloadDxfBtn = $<HTMLButtonElement>('downloadDxfBtn');
+const downloadCutDxfBtn = $<HTMLButtonElement>('downloadCutDxfBtn');
 const downloadPdfBtn = $<HTMLButtonElement>('downloadPdfBtn');
 
 const shopList = $('shoppingList');
@@ -204,6 +212,7 @@ const layoutPane = $('layoutPane');
 const paneDivider = $('paneDivider');
 const viewerMaxBtn = $('viewerMaxBtn');
 const layoutMaxBtn = $('layoutMaxBtn');
+const recenterBtn = $<HTMLButtonElement>('recenterBtn');
 
 function pokeViewerResize() {
   // Defer until next frame so the new column widths are computed.
@@ -254,6 +263,9 @@ layoutMaxBtn.addEventListener('click', () => {
   workArea.classList.toggle('layout-max');
   workArea.classList.remove('viewer-max');
   pokeViewerResize();
+});
+recenterBtn.addEventListener('click', () => {
+  viewer.frameAll();
 });
 
 // --------------------------------------------------------------------------
@@ -645,6 +657,7 @@ clearAllBtn.addEventListener('click', () => clearAll());
 
 function updateNestBtn() {
   nestBtn.disabled = !state.bodies.some((b) => b.selected);
+  recenterBtn.disabled = state.bodies.length === 0;
 }
 
 // --------------------------------------------------------------------------
@@ -656,12 +669,84 @@ const PRESETS: Record<string, [number, number]> = {
   '1525x3050': [1525, 3050],
   '2440x1220': [2440, 1220],
 };
+
+// ---- Custom (user-saved) sheet-size presets, persisted in localStorage ----
+interface CustomPreset { id: string; name: string; w: number; l: number; } // w/l in mm
+const CUSTOM_PRESETS_KEY = 'plywood.customPresets';
+
+function loadCustomPresets(): CustomPreset[] {
+  try {
+    const raw = localStorage.getItem(CUSTOM_PRESETS_KEY);
+    if (!raw) return [];
+    const arr = JSON.parse(raw);
+    return Array.isArray(arr)
+      ? arr.filter((p) => p && typeof p.w === 'number' && typeof p.l === 'number' && p.name)
+      : [];
+  } catch {
+    return [];
+  }
+}
+function persistCustomPresets() {
+  try { localStorage.setItem(CUSTOM_PRESETS_KEY, JSON.stringify(customPresets)); } catch {}
+}
+let customPresets = loadCustomPresets();
+
+/** (Re)build the "My presets" optgroup; labels reflect the current units. */
+function rebuildCustomPresetOptions() {
+  presetCustomGroup.innerHTML = '';
+  presetCustomGroup.hidden = customPresets.length === 0;
+  for (const p of customPresets) {
+    const opt = document.createElement('option');
+    opt.value = `custom:${p.id}`;
+    opt.textContent = `${p.name} · ${fmtDim(p.w, state.units)} × ${fmtDim(p.l, state.units)}`;
+    presetCustomGroup.appendChild(opt);
+  }
+}
+rebuildCustomPresetOptions();
+
 presetSelect.addEventListener('change', () => {
   const v = presetSelect.value;
-  if (!v || !PRESETS[v]) return;
-  const [w, l] = PRESETS[v];
-  sheetWInput.value = formatInput(fromMm(w, state.units));
-  sheetLInput.value = formatInput(fromMm(l, state.units));
+  let dims: [number, number] | null = null;
+  if (v && PRESETS[v]) {
+    dims = PRESETS[v];
+  } else if (v.startsWith('custom:')) {
+    const p = customPresets.find((x) => `custom:${x.id}` === v);
+    if (p) dims = [p.w, p.l];
+  }
+  deletePresetBtn.disabled = !v.startsWith('custom:');
+  if (!dims) return;
+  sheetWInput.value = formatInput(fromMm(dims[0], state.units));
+  sheetLInput.value = formatInput(fromMm(dims[1], state.units));
+});
+
+savePresetBtn.addEventListener('click', () => {
+  const wIn = parseFloat(sheetWInput.value);
+  const lIn = parseFloat(sheetLInput.value);
+  if (!Number.isFinite(wIn) || !Number.isFinite(lIn) || wIn <= 0 || lIn <= 0) {
+    setStatus('Enter a valid width and length before saving a preset.', 'error');
+    return;
+  }
+  const wMm = toMm(wIn, state.units);
+  const lMm = toMm(lIn, state.units);
+  const suggested = `${fmtDim(wMm, state.units)} × ${fmtDim(lMm, state.units)}`;
+  const name = (window.prompt('Name this sheet preset:', suggested) || '').trim();
+  if (!name) return;
+  const id = String(Date.now()) + Math.random().toString(36).slice(2, 6);
+  customPresets.push({ id, name, w: wMm, l: lMm });
+  persistCustomPresets();
+  rebuildCustomPresetOptions();
+  presetSelect.value = `custom:${id}`;
+  deletePresetBtn.disabled = false;
+});
+
+deletePresetBtn.addEventListener('click', () => {
+  const v = presetSelect.value;
+  if (!v.startsWith('custom:')) return;
+  customPresets = customPresets.filter((x) => `custom:${x.id}` !== v);
+  persistCustomPresets();
+  rebuildCustomPresetOptions();
+  presetSelect.value = '';
+  deletePresetBtn.disabled = true;
 });
 
 unitsSelect.addEventListener('change', () => {
@@ -673,6 +758,7 @@ unitsSelect.addEventListener('change', () => {
   marginInput.value = formatInput(parseFloat(marginInput.value) * factor);
   kerfInput.value = formatInput(parseFloat(kerfInput.value) * factor);
   state.units = next;
+  rebuildCustomPresetOptions(); // preset labels show dims in the new units
   renderBodyList();
   renderShoppingList();
   if (state.lastNest && state.lastSheet) renderResults();
@@ -817,6 +903,7 @@ nestBtn.addEventListener('click', async () => {
   resultsEmpty.textContent = 'Optimising layout…';
   resultsDetail.hidden = true;
   downloadDxfBtn.disabled = true;
+  downloadCutDxfBtn.disabled = true;
   downloadPdfBtn.disabled = true;
   replayBtn.disabled = true;
 
@@ -825,19 +912,29 @@ nestBtn.addEventListener('click', async () => {
   state.lastTrialFrames = [];
   state.lastTrialMetrics = [];
 
+  const strategy = (cutStrategySelect.value as CutStrategy) || 'free';
+  state.lastStrategy = strategy;
+  const isCnc = strategy === 'cnc';
+
   try {
     const result = await runNestAnimated(parts, {
       sheetW, sheetL, margin, kerf,
       resolution: estimateResolution(sheetW, sheetL),
       restarts,
-      cutStrategy: (cutStrategySelect.value as 'free' | 'guillotine' | 'save-last') || 'free',
+      cutStrategy: strategy,
     }, async (info) => {
       const pct = ((info.trial + 1) / info.totalTrials) * 100;
-      nestBtn.textContent = `Trial ${info.trial + 1}/${info.totalTrials} · ${pct.toFixed(0)}%`;
+      // CNC is a single greedy nest (no restarts) — report it as parts placed
+      // rather than optimiser trials.
+      nestBtn.textContent = isCnc
+        ? `Nesting ${info.trial + 1}/${info.totalTrials} · ${pct.toFixed(0)}%`
+        : `Trial ${info.trial + 1}/${info.totalTrials} · ${pct.toFixed(0)}%`;
       const yieldNow = sumYield(info.best);
-      resultsEmpty.textContent =
-        `Optimising · trial ${info.trial + 1} of ${info.totalTrials} · ` +
-        `best ${info.best.length} sheet${info.best.length === 1 ? '' : 's'} · ${(yieldNow * 100).toFixed(1)}% yield`;
+      resultsEmpty.textContent = isCnc
+        ? `Nesting · ${info.trial + 1} of ${info.totalTrials} parts · ` +
+          `${info.best.length} sheet${info.best.length === 1 ? '' : 's'} · ${(yieldNow * 100).toFixed(1)}% yield`
+        : `Optimising · trial ${info.trial + 1} of ${info.totalTrials} · ` +
+          `best ${info.best.length} sheet${info.best.length === 1 ? '' : 's'} · ${(yieldNow * 100).toFixed(1)}% yield`;
       // Record this trial for later replay.
       state.lastTrialFrames.push({
         sheets: info.current,
@@ -857,10 +954,10 @@ nestBtn.addEventListener('click', async () => {
       // optimisation method.
       state.lastTrialMetrics.push({
         i: info.trial,
-        cuts: info.current.reduce((a, s) => a + sheetCutTotal(s, margin), 0),
+        cuts: isCnc ? 0 : info.current.reduce((a, s) => a + sheetCutTotal(s, margin), 0),
         sheets: info.current.length,
         yieldPct: sumYield(info.current) * 100,
-        bestCuts: info.best.reduce((a, s) => a + sheetCutTotal(s, margin), 0),
+        bestCuts: isCnc ? 0 : info.best.reduce((a, s) => a + sheetCutTotal(s, margin), 0),
         bestSheets: info.best.length,
         bestYield: sumYield(info.best) * 100,
       });
@@ -942,6 +1039,9 @@ function paintTrialPreview(sheets: NestSheet[], sheetW: number, sheetL: number, 
  */
 function renderConvergenceChart() {
   const data = state.lastTrialMetrics;
+  // CNC is a single greedy nest, not a multi-trial optimiser — the
+  // convergence plot (yield/sheets/cuts over trials) doesn't apply.
+  if (state.lastStrategy === 'cnc') { convergenceChart.hidden = true; return; }
   if (data.length === 0) { convergenceChart.hidden = true; return; }
   convergenceChart.hidden = false;
   const W = 880, H = 140, PAD_L = 36, PAD_R = 12, PAD_T = 18, PAD_B = 22;
@@ -1047,6 +1147,7 @@ function renderResults() {
   resultsEmpty.hidden = true;
   resultsDetail.hidden = false;
   downloadDxfBtn.disabled = false;
+  downloadCutDxfBtn.disabled = false;
   downloadPdfBtn.disabled = false;
   const totalSheets = result.groups.reduce((a, g) => a + g.sheets.length, 0);
 
@@ -1147,13 +1248,19 @@ function renderJobMetrics() {
     for (const s of g.sheets) totalCuts += sheetCutTotal(s, margin);
   }
 
+  // CNC cuts a continuous contour — a discrete "cuts" count is meaningless, so
+  // show the cut method instead.
+  const cutsMetric = state.lastStrategy === 'cnc'
+    ? `<div class="metric"><div class="k">Cut method</div><div class="v">CNC contour</div></div>`
+    : `<div class="metric"><div class="k">Cuts</div><div class="v">${totalCuts}</div></div>`;
+
   detailMetrics.innerHTML = `
     <div class="metric"><div class="k">Total sheets</div><div class="v">${result.totalSheets}</div></div>
     <div class="metric"><div class="k">Parts placed</div><div class="v">${totalPlaced}</div></div>
     <div class="metric"><div class="k">Yield</div><div class="v">${(result.yield * 100).toFixed(1)}%</div></div>
     <div class="metric"><div class="k">Waste</div><div class="v">${fmtArea(result.totalSheetArea - result.totalPartArea, state.units)}</div></div>
     <div class="metric"><div class="k">Edge banding</div><div class="v">${fmtLinear(edgeMm, state.units)}</div></div>
-    <div class="metric"><div class="k">Cuts</div><div class="v">${totalCuts}</div></div>
+    ${cutsMetric}
     ${bigOff ? `<div class="metric"><div class="k">Biggest offcut</div><div class="v">${fmtDim((bigOff as any).w, state.units)} × ${fmtDim((bigOff as any).h, state.units)}</div></div>` : ''}
     ${totalUnplaced > 0 ? `<div class="metric bad"><div class="k">Unplaced</div><div class="v">${totalUnplaced}</div></div>` : ''}
   `;
@@ -1441,6 +1548,23 @@ downloadDxfBtn.addEventListener('click', () => {
     sheetDimensions: true,
   });
   downloadDxf(`sheet_${sel.groupIdx + 1}_${sel.sheetIdx + 1}.dxf`, dxf);
+});
+
+// "Cut DXF" — outlines + sheet boundary only (no labels/dims), for feeding
+// straight into a CNC router / waterjet program.
+downloadCutDxfBtn.addEventListener('click', () => {
+  const sel = findSheetByKey(state.currentSheetKey);
+  if (!sel || !state.lastSheet) return;
+  const dxf = sheetToDxf(sel.sheet, {
+    sheetW: sel.sheet.sheetW,
+    sheetL: sel.sheet.sheetL,
+    margin: state.lastSheet.margin,
+    units: state.units,
+    partDimensions: false,
+    sheetDimensions: false,
+    outlinesOnly: true,
+  });
+  downloadDxf(`sheet_${sel.groupIdx + 1}_${sel.sheetIdx + 1}_cut.dxf`, dxf);
 });
 
 downloadPdfBtn.addEventListener('click', async () => {
