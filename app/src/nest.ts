@@ -772,7 +772,8 @@ export async function runCncNestAnimated(
       return sheets;
     };
 
-    const res = await packCncAnimated(items, usableL, usableW, kerf, async (p) => {
+    // Multicore: raster passes fan out across a Web Worker pool.
+    const res = await packCncParallel(items, usableL, usableW, kerf, async (p) => {
       await onTrial({
         groupIdx: gi,
         totalGroups,
