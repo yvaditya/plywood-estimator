@@ -61,11 +61,21 @@ function resolveOcct(resolve: (v: any) => void, reject: (e: Error) => void) {
 export async function parseStep(buffer: ArrayBuffer): Promise<OcctResult> {
   const occt = await ensureOcct();
   const bytes = new Uint8Array(buffer);
+  // Tessellation quality. occt-import-js can only hand us triangles (the
+  // BREP's true B-spline/arc curves are not exposed), so curve fidelity is
+  // set HERE and nowhere else:
+  //   - linearDeflection 0.1 mm ABSOLUTE: max chord error of any tessellated
+  //     edge. The old bounding_box_ratio setting scaled with model size — a
+  //     2.5 m cabinet got ~2.5 mm of sag and visibly faceted curves.
+  //   - angularDeflection 0.2 rad (~11°): caps segment turn on small-radius
+  //     features (hinge-cup holes etc.) where the linear bound alone is lax.
+  // 0.1 mm is far inside any saw/router tolerance, so downstream outlines,
+  // SVG/DXF exports and CNC masks treat curves as effectively exact.
   const res = occt.ReadStepFile(bytes, {
     linearUnit: 'millimeter',
-    linearDeflectionType: 'bounding_box_ratio',
-    linearDeflection: 0.001,
-    angularDeflection: 0.5,
+    linearDeflectionType: 'absolute_value',
+    linearDeflection: 0.1,
+    angularDeflection: 0.2,
   });
   if (!res || !res.success) {
     throw new Error('STEP parse failed.');

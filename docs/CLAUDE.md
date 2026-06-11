@@ -187,6 +187,17 @@ the expand state across renders.
   (`consolidateSheets` in packRect.ts — MaxRects strategies only, never
   'guillotine'; widened `consolidate` in cncNest.ts). Removing them
   silently costs whole sheets on some jobs.
+- **Curve fidelity is set ONLY in `stepLoader.ts`** (occt exposes triangles,
+  never the BREP's true splines): `absolute_value` 0.1 mm linear deflection +
+  0.2 rad angular. Don't revert to `bounding_box_ratio` — it scaled chord
+  error with model size (2.5 mm sag on a 2.5 m cabinet, visibly faceted
+  circles).
+- **CNC PDF**: `PdfOptions.cnc` suppresses the panel-saw cut-sequence pages
+  (a router follows contours — without the flag the EMPTY cnc cut tree hits
+  the legacy full-sheet-line fallback and prints fictional cuts). Split
+  parts get a "Join split parts" section (`drawSplitJoins`, fed by
+  `buildSplitJoins()` in main.ts); split segments' panel labels carry roman
+  suffixes ('1a-i') added in `annotatePlacedParts`.
 
 ## UI rules from the user (don't violate without asking)
 - Notion-style **light theme** for the chrome; 3D viewer is intentionally
