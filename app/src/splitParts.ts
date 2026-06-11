@@ -1,0 +1,307 @@
+/**
+ * Oversize-part auto-splitting with dovetail joints (CNC strategies only).
+ *
+ * A part whose footprint cannot fit on the usable sheet at any allowed
+ * orientation is split into segments that CAN fit, and the mating edges get
+ * interlocking dovetail (puzzle-joint) geometry so the segments re-assemble
+ * into the original panel. A CNC router cuts the dovetail contour for free —
+ * this is the standard trick for batching oversized panels out of stock
+ * sheets.
+ *
+ * Splitting is "logical":
+ *   - the cut runs PERPENDICULAR to the part's longest bbox axis, so the
+ *     joint is as short as possible and segments stay as wide as the part;
+ *   - the part is divided into the MINIMUM number of equal segments such
+ *     that each segment (including its protruding tails) fits the sheet;
+ *   - a segment that still doesn't fit (both dimensions oversize) is split
+ *     again along its other axis, recursively.
+ *
+ * Dovetail layout per joint:
+ *   - the joint span is divided into (2·n + 1) equal slots; slots
+ *     1, 3, 5, … carry tails, so tails and gaps alternate with a half-slot
+ *     shoulder at each end;
+ *   - n — the number of dovetails — is a function of the joint length:
+ *     one tail per ~TAIL_PITCH of joint, minimum 1;
+ *   - tail depth scales with stock thickness (clamped), and the tail flares
+ *     wider at the tip (classic dovetail) so the joint locks in-plane and is
+ *     assembled by dropping the mating piece in from above.
+ *
+ * Geometry is computed with polygon booleans (polygon-clipping), so holes
+ * and non-rectangular outlines survive the split: each clipped fragment
+ * becomes its own segment.
+ */
+
+import type { Vec2 } from './geometry';
+import type { NestPart } from './nest';
+import * as pcNs from 'polygon-clipping';
+
+// The published .d.ts declares named exports but the ESM build ships a single
+// default-exported object — unwrap whichever shape the bundler hands us.
+const pc = ((pcNs as unknown as { default?: typeof pcNs }).default ??
+  pcNs) as typeof pcNs;
+
+type Ring = Vec2[];
+type Poly = Ring[]; // [outer, ...holes]
+
+/** Target joint length per dovetail — n = max(1, round(jointLen / PITCH)). */
+const TAIL_PITCH = 120; // mm
+/** Tail depth = thickness × this, clamped below. */
+const DEPTH_PER_THICKNESS = 1.5;
+const DEPTH_MIN = 10; // mm
+const DEPTH_MAX = 30; // mm
+/** Dovetail flare angle (how much wider the tip is than the base, per side). */
+const FLARE_DEG = 9;
+/** Clearance kept between a segment's bbox (tails included) and the bin. */
+const FIT_SLACK = 5; // mm
+/** Recursion guard — a part is never split into more than ~2^4 generations. */
+const MAX_SPLIT_DEPTH = 4;
+
+export interface SplitInfo {
+  name: string;
+  pieces: number;
+}
+
+export interface SplitResult {
+  parts: NestPart[];
+  /** Geometry of generated segments by part id (for the unplaced STEP export,
+   *  which can no longer resolve these ids back to a source body). */
+  segmentGeo: Map<string, { outer: Vec2[]; holes: Vec2[][]; thickness: number }>;
+  /** One entry per original part that was split. */
+  splits: SplitInfo[];
+}
+
+// ---------------------------------------------------------------------------
+// Small polygon utilities
+// ---------------------------------------------------------------------------
+function ringSignedArea(ring: Ring): number {
+  let a = 0;
+  for (let i = 0, n = ring.length; i < n; i++) {
+    const [x1, y1] = ring[i];
+    const [x2, y2] = ring[(i + 1) % n];
+    a += x1 * y2 - x2 * y1;
+  }
+  return a / 2;
+}
+
+/** Outer ring CCW, holes CW — the convention the rest of the app uses. */
+function normalizeWinding(poly: Poly): Poly {
+  return poly.map((ring, i) => {
+    const ccw = ringSignedArea(ring) > 0;
+    const wantCcw = i === 0;
+    return ccw === wantCcw ? ring : ring.slice().reverse();
+  });
+}
+
+/** polygon-clipping closes its rings (first point repeated) — drop the dup. */
+function openRing(ring: Ring): Ring {
+  if (ring.length > 1) {
+    const [fx, fy] = ring[0];
+    const [lx, ly] = ring[ring.length - 1];
+    if (Math.abs(fx - lx) < 1e-9 && Math.abs(fy - ly) < 1e-9) {
+      return ring.slice(0, -1);
+    }
+  }
+  return ring;
+}
+
+function bbox(rings: Ring[]): { minX: number; minY: number; maxX: number; maxY: number; w: number; h: number } {
+  let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+  for (const r of rings) for (const [x, y] of r) {
+    if (x < minX) minX = x;
+    if (y < minY) minY = y;
+    if (x > maxX) maxX = x;
+    if (y > maxY) maxY = y;
+  }
+  return { minX, minY, maxX, maxY, w: maxX - minX, h: maxY - minY };
+}
+
+function transposePoly(poly: Poly): Poly {
+  return poly.map((r) => r.map(([x, y]): Vec2 => [y, x]));
+}
+
+function anchorPoly(poly: Poly): Poly {
+  const b = bbox(poly);
+  return poly.map((r) => r.map(([x, y]): Vec2 => [x - b.minX, y - b.minY]));
+}
+
+/** Drop degenerate fragments — e.g. the tip of a dovetail flare clipped off
+ *  by a perpendicular cut through the joint. Anything smaller than ~3×3 cm is
+ *  not a panel piece worth cutting; the reassembled panel just gets a tiny
+ *  relieved corner where two joints cross. */
+function isRealPiece(poly: Poly): boolean {
+  if (poly.length === 0 || poly[0].length < 3) return false;
+  return Math.abs(ringSignedArea(poly[0])) > 1000;
+}
+
+// ---------------------------------------------------------------------------
+// Fit test
+// ---------------------------------------------------------------------------
+/**
+ * Can a (w × h) footprint sit on the usable bin (binX = sheet length axis,
+ * binY = sheet width axis)? Grain-locked parts only get their grain-preserving
+ * orientation; free parts may rotate 90°. (The CNC nester also tries
+ * intermediate angles, but the axis-aligned test is the conservative gate.)
+ */
+function fitsBin(w: number, h: number, grain: NestPart['grain'], binX: number, binY: number): boolean {
+  const long = Math.max(w, h);
+  const short = Math.min(w, h);
+  if (grain === 'length') return long <= binX && short <= binY;
+  if (grain === 'width') return long <= binY && short <= binX;
+  return (w <= binX && h <= binY) || (h <= binX && w <= binY);
+}
+
+// ---------------------------------------------------------------------------
+// Dovetail joint profile
+// ---------------------------------------------------------------------------
+/**
+ * Region polygon covering everything LEFT of a vertical dovetail cut at
+ * x = cx. Its right boundary is the joint profile: a straight line at cx
+ * interrupted by `nTails` trapezoidal tails protruding to cx + depth, flared
+ * wider at the tip so the joint interlocks. Intersecting a part with this
+ * region yields the tail side; subtracting it yields the matching socket side.
+ */
+function dovetailRegion(
+  cx: number,
+  jointY0: number,
+  jointY1: number,
+  farLeftX: number,
+  depth: number,
+  nTails: number,
+  flare: number,
+): Poly {
+  const pad = depth + 10;
+  const seg = (jointY1 - jointY0) / (2 * nTails + 1);
+  const ring: Ring = [
+    [farLeftX, jointY0 - pad],
+    [cx, jointY0 - pad],
+  ];
+  for (let i = 0; i < nTails; i++) {
+    const a = jointY0 + (2 * i + 1) * seg;
+    const b = a + seg;
+    ring.push([cx, a], [cx + depth, a - flare], [cx + depth, b + flare], [cx, b]);
+  }
+  ring.push([cx, jointY1 + pad], [farLeftX, jointY1 + pad]);
+  return [ring];
+}
+
+/** Number of dovetails for a joint of this length: one per TAIL_PITCH, min 1. */
+export function tailCountFor(jointLen: number): number {
+  return Math.max(1, Math.round(jointLen / TAIL_PITCH));
+}
+
+function tailDepthFor(thickness: number): number {
+  return Math.min(DEPTH_MAX, Math.max(DEPTH_MIN, thickness * DEPTH_PER_THICKNESS));
+}
+
+// ---------------------------------------------------------------------------
+// Recursive split
+// ---------------------------------------------------------------------------
+/**
+ * Split one polygon into segments that fit the bin, joining cut edges with
+ * dovetails. Cuts always run perpendicular to the polygon's longest bbox
+ * axis; fragments that still don't fit recurse (next call picks THEIR longest
+ * axis, so a doubly-oversize part ends up split in both directions).
+ */
+function splitPoly(
+  poly: Poly,
+  thickness: number,
+  grain: NestPart['grain'],
+  binX: number,
+  binY: number,
+  depthGuard: number,
+): Poly[] {
+  const b = bbox(poly);
+  if (fitsBin(b.w, b.h, grain, binX, binY)) return [poly];
+  if (depthGuard <= 0) return [poly]; // give up — reported as unplaced later
+
+  // Always cut across the longest axis. Transpose so the cut is vertical.
+  const vertical = b.w >= b.h;
+  const work = vertical ? poly : transposePoly(poly);
+  const wb = vertical ? b : bbox(work);
+
+  const depth = tailDepthFor(thickness);
+  // Longest bin run available to a segment given its cross dimension; if the
+  // cross dimension itself is oversize, recursion will cut it next round.
+  const cross = wb.h;
+  const limit = cross <= binY ? binX : cross <= binX ? binY : Math.max(binX, binY);
+  const maxSeg = limit - depth - FIT_SLACK;
+  const k = Math.max(2, Math.ceil(wb.w / Math.max(1, maxSeg)));
+
+  const jointLen = wb.h;
+  const nTails = tailCountFor(jointLen);
+  const seg = jointLen / (2 * nTails + 1);
+  const flare = Math.min(depth * Math.tan((FLARE_DEG * Math.PI) / 180), seg * 0.45);
+  const farLeft = wb.minX - depth - 20;
+
+  // Peel segments off left-to-right with successive boolean cuts.
+  const pieces: Poly[] = [];
+  let remaining: Poly[] = [work];
+  for (let i = 1; i < k; i++) {
+    const cx = wb.minX + (wb.w * i) / k;
+    const region = dovetailRegion(cx, wb.minY, wb.maxY, farLeft, depth, nTails, flare);
+    const left = pc.intersection(remaining as pcNs.MultiPolygon, [region] as pcNs.MultiPolygon);
+    remaining = pc.difference(remaining as pcNs.MultiPolygon, [region] as pcNs.MultiPolygon) as Poly[];
+    for (const p of left as Poly[]) pieces.push(p);
+  }
+  for (const p of remaining) pieces.push(p);
+
+  // Clean fragments, restore orientation, recurse on anything still oversize.
+  const out: Poly[] = [];
+  for (const raw of pieces) {
+    const cleaned = raw.map(openRing);
+    if (!isRealPiece(cleaned)) continue;
+    const restored = vertical ? cleaned : transposePoly(cleaned);
+    for (const sub of splitPoly(restored, thickness, grain, binX, binY, depthGuard - 1)) {
+      out.push(sub);
+    }
+  }
+  return out.length > 0 ? out : [poly];
+}
+
+// ---------------------------------------------------------------------------
+// Public entry
+// ---------------------------------------------------------------------------
+/**
+ * Map a part list through the splitter. Parts that fit pass through
+ * untouched; oversize parts are replaced by their dovetailed segments
+ * (`<id>.s1`, `<id>.s2`, … — qty/grain/rotation/color inherited).
+ */
+export function splitOversizeParts(parts: NestPart[], binX: number, binY: number): SplitResult {
+  const outParts: NestPart[] = [];
+  const segmentGeo = new Map<string, { outer: Vec2[]; holes: Vec2[][]; thickness: number }>();
+  const splits: SplitInfo[] = [];
+
+  for (const p of parts) {
+    const b = bbox([p.outer]);
+    if (fitsBin(b.w, b.h, p.grain, binX, binY)) {
+      outParts.push(p);
+      continue;
+    }
+    const segs = splitPoly([p.outer, ...p.holes], p.thickness, p.grain, binX, binY, MAX_SPLIT_DEPTH);
+    if (segs.length <= 1) {
+      outParts.push(p); // could not be split — flows through as unplaced
+      continue;
+    }
+    splits.push({ name: p.name, pieces: segs.length });
+    segs.forEach((seg, i) => {
+      const anchored = normalizeWinding(anchorPoly(seg));
+      const id = `${p.id}.s${i + 1}`;
+      const outer = anchored[0];
+      const holes = anchored.slice(1);
+      outParts.push({
+        id,
+        name: `${p.name} ${i + 1}/${segs.length}`,
+        thickness: p.thickness,
+        qty: p.qty,
+        grain: p.grain,
+        rotation: p.rotation,
+        outer,
+        holes,
+        color: p.color,
+      });
+      segmentGeo.set(id, { outer, holes, thickness: p.thickness });
+    });
+  }
+
+  return { parts: outParts, segmentGeo, splits };
+}

@@ -164,7 +164,12 @@ class MaxRectsBin implements BinPacker {
   }
 
   private commit(r: ScoredPlacement) {
-    const placedRect: Rect = { x: r.x, y: r.y, w: r.w, h: r.h };
+    this.occupy({ x: r.x, y: r.y, w: r.w, h: r.h });
+  }
+
+  /** Mark an arbitrary rect as used. Public so a finished sheet's layout can
+   *  be rebuilt into a live bin (consolidation re-inserts into its free space). */
+  occupy(placedRect: Rect) {
     const next: FreeRect[] = [];
     for (const f of this.free) {
       const splits = splitFreeRect(f, placedRect);
@@ -976,6 +981,105 @@ function repackLastSheetCorner(
 }
 
 /**
+ * Dissolve under-filled sheets in a finished MaxRects result: take the
+ * least-filled sheet and try to re-place ALL of its parts into the free
+ * space remaining on the other sheets. If everything fits, that sheet is
+ * dropped — one fewer sheet of stock to buy.
+ *
+ * Why this can succeed even though packOne is first-fit: a sheet is only
+ * "closed" against the parts remaining AT THAT TIME. A sparse sheet in the
+ * middle of the stack may hold parts that comfortably fit on a LATER sheet
+ * that opened afterwards. The multi-restart search rarely finds those
+ * layouts on its own because it never revisits a closed bin.
+ *
+ * Skipped for the 'guillotine' (shelf) strategy — inserting into arbitrary
+ * free rects would break the shelf cut structure the strategy promises.
+ */
+function consolidateSheets(result: MultiSheetResult, job: PackJob): MultiSheetResult {
+  if (job.cutStrategy === 'guillotine') return result;
+  if (result.sheets.length <= 1) return result;
+  const byId = new Map(job.items.map((it) => [it.id, it] as const));
+  const halfKerf = job.kerf / 2;
+
+  // Re-inflate a placement back to the kerf-padded rect the bin frame uses.
+  const inflate = (p: PackPlacement): Rect =>
+    ({ x: p.x - halfKerf, y: p.y - halfKerf, w: p.w + job.kerf, h: p.h + job.kerf });
+
+  // Rebuild a live MaxRects bin whose free space matches a finished sheet.
+  const rebuild = (sheet: PackedSheet): MaxRectsBin => {
+    const bin = new MaxRectsBin(job.sheetW, job.sheetH);
+    for (const p of sheet.placements) bin.occupy(inflate(p));
+    return bin;
+  };
+
+  const finalizeSheet = (placements: PackPlacement[], bin: MaxRectsBin): PackedSheet => {
+    const placedInflated = placements.map(inflate);
+    const cuts = deriveGuillotineCuts(placedInflated, job.sheetW, job.sheetH);
+    let bestFree: { w: number; h: number; a: number } | null = null;
+    for (const f of bin.free) {
+      const a = f.w * f.h;
+      if (!bestFree || a > bestFree.a) bestFree = { w: f.w, h: f.h, a };
+    }
+    return {
+      placements,
+      usedArea: placements.reduce((s, p) => s + p.w * p.h, 0),
+      largestFree: bestFree ? { w: bestFree.w, h: bestFree.h } : null,
+      cuts,
+      fullySeparated: countFreedParts(cuts, placedInflated, job.sheetW, job.sheetH),
+    };
+  };
+
+  let working = result.sheets.slice();
+  let improved = true;
+  let guard = 0;
+  while (improved && working.length > 1 && guard++ < result.sheets.length + 4) {
+    improved = false;
+    // Try victims emptiest-first — the cheapest sheet to absorb elsewhere.
+    const victims = working
+      .map((_, i) => i)
+      .sort((a, b) => working[a].usedArea - working[b].usedArea);
+    for (const vi of victims) {
+      const victim = working[vi];
+      const items = victim.placements.map((p) => byId.get(p.id));
+      if (items.some((it) => !it)) continue;
+      // Largest first — hard parts placed while the hosts' space is freest.
+      const sorted = (items as PackInput[]).slice().sort((a, b) => b.w * b.h - a.w * a.h);
+
+      const hosts = working
+        .filter((_, i) => i !== vi)
+        .map((s) => ({ placements: s.placements.slice(), bin: rebuild(s) }));
+      let allFit = true;
+      for (const item of sorted) {
+        let placed = false;
+        for (const h of hosts) {
+          const ins = h.bin.insert(item.w + job.kerf, item.h + job.kerf, item.allowRotate, 'BSSF');
+          if (ins) {
+            h.placements.push({
+              id: item.id,
+              x: ins.x + halfKerf,
+              y: ins.y + halfKerf,
+              w: ins.w - job.kerf,
+              h: ins.h - job.kerf,
+              rotated: ins.rotated,
+            });
+            placed = true;
+            break;
+          }
+        }
+        if (!placed) { allFit = false; break; }
+      }
+      if (!allFit) continue;
+      working = hosts.map((h) => finalizeSheet(h.placements, h.bin));
+      improved = true;
+      break;
+    }
+  }
+
+  if (working.length === result.sheets.length) return result;
+  return { sheets: working, unplaced: result.unplaced, totalUsed: result.totalUsed };
+}
+
+/**
  * Multi-restart optimizer: shuffles insertion order + tries different
  * heuristics, keeps the best result by (fewest unplaced → fewest sheets
  * → highest fill on last sheet).
@@ -1025,7 +1129,8 @@ export function packMulti(job: PackJob, restarts: number): MultiSheetResult {
     tryOrder(shuffled, heur);
   }
 
-  const result = best!;
+  // Final squeeze: dissolve any sheet whose parts fit in the others' leftovers.
+  const result = consolidateSheets(best!, optJob);
 
   // Save-last post-process: cluster the last sheet's parts in one corner.
   if (job.cutStrategy === 'save-last' && result.sheets.length > 0) {
@@ -1101,7 +1206,8 @@ export async function packMultiAnimated(
     if (i % yieldEvery === 0) await new Promise<void>((r) => setTimeout(r, 0));
   }
 
-  const result = best!;
+  // Final squeeze: dissolve any sheet whose parts fit in the others' leftovers.
+  const result = consolidateSheets(best!, optJob);
   if (job.cutStrategy === 'save-last' && result.sheets.length > 0) {
     const meta = new Map<string, { id: string; w: number; h: number; allowRotate: boolean }>();
     for (const it of job.items) meta.set(it.id, { id: it.id, w: it.w, h: it.h, allowRotate: it.allowRotate });

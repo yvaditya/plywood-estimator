@@ -236,6 +236,17 @@ body {
   color: var(--muted);
   text-transform: uppercase;
 }
+/* Inline checkbox option row (e.g. CNC auto-split toggle). */
+.grid2 label.check-row {
+  flex-direction: row;
+  align-items: center;
+  gap: 7px;
+  text-transform: none;
+  font-size: 12px;
+  letter-spacing: 0;
+  color: var(--text);
+  cursor: pointer;
+}
 
 input[type="number"],
 input[type="text"],
@@ -1074,6 +1085,18 @@ input[type="checkbox"]:focus-visible { box-shadow: 0 0 0 2px var(--accent-ring);
 .inv-check-row .right { text-align: right; }
 .inv-check-row .tag-ok { color: var(--good); font-weight: 600; }
 .inv-check-row .tag-short { color: var(--bad); font-weight: 600; }
+
+/* Info strip for the CNC dovetail auto-split summary. */
+.split-note {
+  margin-top: 12px;
+  color: var(--text);
+  font-size: 12.5px;
+  padding: 8px 12px;
+  background: var(--bg-input);
+  border: 1px solid var(--line-bright);
+  border-radius: 6px;
+}
+.split-note:empty { display: none; }
 
 .unplaced {
   margin-top: 12px;

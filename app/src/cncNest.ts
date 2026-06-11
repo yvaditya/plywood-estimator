@@ -554,26 +554,47 @@ function consolidate(lives: LiveSheet[], getMask: MaskFn, res: number, byId: Map
   let working = lives;
   let improved = true;
   let guard = 0;
-  while (improved && working.length > 1 && guard++ < working.length + 4) {
-    improved = false;
-    // Victim = least-used sheet (cheapest to absorb).
-    let vi = 0;
-    for (let i = 1; i < working.length; i++) if (working[i].usedArea < working[vi].usedArea) vi = i;
+  // Failed dissolve attempts are pure cost, so the widened search (several
+  // victim candidates × two scan directions) runs under a wall-clock budget.
+  const startMs = Date.now();
+  const budgetMs = 4000;
+  const VICTIM_CANDIDATES = 3;
+
+  // Try to re-place every part of `victim` onto clones of the other sheets.
+  // Returns the new sheet list on success, null when something didn't fit.
+  const tryDissolve = (vi: number, leftFirst: boolean): LiveSheet[] | null => {
     const victim = working[vi];
     const clones = working.filter((_, i) => i !== vi).map(cloneLive);
     // Largest victim parts first — harder pieces placed while space is freest.
     const parts = victim.placements.slice().sort((a, b) => b.area - a.area);
-    let allFit = true;
     for (const p of parts) {
       const it = byId.get(p.id);
-      if (!it) { allFit = false; break; }
+      if (!it) return null;
       let placed = false;
       for (const c of clones) {
-        if (placeOnSheet(c, it, getMask, res, false)) { placed = true; break; }
+        if (placeOnSheet(c, it, getMask, res, leftFirst)) { placed = true; break; }
       }
-      if (!placed) { allFit = false; break; }
+      if (!placed) return null;
     }
-    if (allFit) { working = clones; improved = true; }
+    return clones;
+  };
+
+  while (improved && working.length > 1 && guard++ < lives.length + 4) {
+    improved = false;
+    // Victim candidates in fill-ascending order — emptiest sheets are the
+    // cheapest to absorb, but a slightly fuller one sometimes dissolves when
+    // the emptiest holds one awkward part that fits nowhere else.
+    const victims = working
+      .map((_, i) => i)
+      .sort((a, b) => working[a].usedArea - working[b].usedArea)
+      .slice(0, VICTIM_CANDIDATES);
+    outer: for (const vi of victims) {
+      for (const leftFirst of [false, true]) {
+        if (Date.now() - startMs > budgetMs) break outer;
+        const dissolved = tryDissolve(vi, leftFirst);
+        if (dissolved) { working = dissolved; improved = true; break outer; }
+      }
+    }
   }
   return working;
 }

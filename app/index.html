@@ -99,6 +99,10 @@
                 <option value="cnc-save-last">CNC nest, save last sheet (any angle)</option>
               </select>
             </label>
+            <label id="splitOversizeRow" class="check-row" style="grid-column: 1 / -1" hidden>
+              <input type="checkbox" id="splitOversize" />
+              <span>Auto-split oversize parts (dovetail joints)</span>
+            </label>
           </div>
         </section>
 
@@ -290,6 +294,7 @@
                 <div class="detail-svg" id="detailSvg"></div>
                 <div class="metrics-row" id="detailMetrics"></div>
                 <div class="inv-check" id="inventoryCheck"></div>
+                <div class="split-note" id="splitNote"></div>
                 <div class="unplaced" id="unplacedList"></div>
               </div>
             </section>
