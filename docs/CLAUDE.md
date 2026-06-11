@@ -30,6 +30,7 @@ Quick orientation for a fresh session working on this repo.
 | `nest.ts` | Per-thickness bucketing wrapper. Has `runNest` (sync) + `runNestAnimated` (async, observable, used by the UI) |
 | `packRect.ts` | `MaxRectsBin` + `ShelfBin` + (legacy) `GuillotineBin` packers. Exports `packMulti` (sync) + `packMultiAnimated` (async with `onProgress`) |
 | `instructions.ts` | A/B/C letter labels + cut step generation (margin-trim cuts emitted as first 4 steps when `margin > 0`) |
+| `splitParts.ts` | CNC auto-split: parts too big for the sheet are split into dovetail-jointed segments (polygon booleans via polygon-clipping). Tail count scales with joint length; tail depth with thickness, capped at tail width |
 | `shoppingList.ts` | Buy/have rollup + CSV export, localStorage persistence |
 | `dxf.ts` | DXF R12 writer (layers SHEET / MARGIN / PARTS / LABELS / DIMS) |
 | `pdf.ts` | jsPDF report (cover → shopping → parts grouped by cabinet → per-sheet (overview + cut sequence) → per-cabinet (assembled + parts table) → IKEA-style step pages → final 'Assembled' frame) |
@@ -166,6 +167,26 @@ the expand state across renders.
 - **Replay button vs busy class**. Detect "replay running" via
   `replayBtn.classList.contains('busy')`. Don't fire a second click while
   busy — the handler interprets that as a stop request.
+- **DXF is STRICT R12 only** (`dxf.ts`). No LWPOLYLINE (R14 entity — use
+  POLYLINE/VERTEX/SEQEND), no post-R12 header vars, and `footer()` must NOT
+  emit ENDSEC (the caller closes ENTITIES; a doubled ENDSEC made several
+  waterjet CAM importers reject the file). Validate changes with ezdxf's
+  strict `readfile`, not just `recover`.
+- **Wheel pan/zoom classification is sticky per gesture stream**
+  (`viewer.handleWheelPan`). Events within 400 ms keep the stream's verdict;
+  re-classifying per event made Windows smooth-scroll wheels (sub-50px
+  deltas mid-spin) leak into the pan path and nudge the model. Don't judge
+  individual events.
+- **CNC auto-split** (`splitOversize` checkbox, CNC strategies only) runs in
+  `main.ts` BEFORE `runNestAnimated`, using bin = (sheetL−2m, sheetW−2m).
+  Segment ids are `<bodyId>.s<n>` and don't resolve to a body —
+  `state.splitSegmentGeo` carries their geometry for the unplaced STEP
+  export. Joints shorter than 24 mm get a straight cut, not a dovetail.
+- **Sheet consolidation passes**: both packers try to dissolve the
+  least-filled sheet into the others' free space after the restart search
+  (`consolidateSheets` in packRect.ts — MaxRects strategies only, never
+  'guillotine'; widened `consolidate` in cncNest.ts). Removing them
+  silently costs whole sheets on some jobs.
 
 ## UI rules from the user (don't violate without asking)
 - Notion-style **light theme** for the chrome; 3D viewer is intentionally
