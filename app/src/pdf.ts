@@ -40,6 +40,35 @@ export interface PdfOptions {
   /** One entry per unique STEP file (cabinet). Each is rendered as its
    *  own assembly page so multi-cabinet jobs don't share one snapshot. */
   cabinets?: CabinetSnapshot[];
+  /** CNC / waterjet job: the machine cuts continuous contours, so the
+   *  panel-saw cut-sequence pages are meaningless and are skipped. */
+  cnc?: boolean;
+  /** Dovetail auto-split join guide — one group per original part that was
+   *  split. Renders a section showing how the segments reassemble. */
+  splitJoins?: SplitJoinGroup[];
+}
+
+export interface SplitJoinSegment {
+  /** Roman numeral within the parent: 'i', 'ii', … */
+  roman: string;
+  /** Full sheet panel label, e.g. '1a-i', or null when the segment went
+   *  unplaced. */
+  label: string | null;
+  /** Global sheet number the segment landed on, or null when unplaced. */
+  sheetNo: number | null;
+  /** Segment outline (anchored at 0,0) + its offset within the parent's
+   *  frame — drawing all segments at their offsets reassembles the parent. */
+  outer: [number, number][];
+  holes: [number, number][][];
+  offsetX: number;
+  offsetY: number;
+  color: string;
+}
+
+export interface SplitJoinGroup {
+  parentName: string;
+  thickness: number;
+  segments: SplitJoinSegment[];
 }
 
 export interface SnapshotImage {
@@ -181,10 +210,21 @@ export function buildPdf(result: NestResult, opt: PdfOptions): jsPDF {
       addPage(sectionName);
       drawSheet(doc, sheet, opt, dims, labels);
       // The sheet's cuts come on the next page(s) — same section so they
-      // share the "Sheet 3 (2 of 3)" pagination header.
-      drawCutsForSingleSheet(doc, sheet, opt, dims,
-        () => { addPage(sectionName); });
+      // share the "Sheet 3 (2 of 3)" pagination header. CNC jobs skip the
+      // cards entirely: a router/waterjet follows the part contours, so a
+      // panel-saw cut sequence would be fiction.
+      if (!opt.cnc) {
+        drawCutsForSingleSheet(doc, sheet, opt, dims,
+          () => { addPage(sectionName); });
+      }
     }
+  }
+
+  // 4b. SPLIT-PART JOIN GUIDE — which dovetailed segments rebuild which
+  //     original oversize part.
+  if (opt.splitJoins && opt.splitJoins.length > 0) {
+    addPage('Join split parts');
+    drawSplitJoins(doc, opt.splitJoins, opt, dims, () => addPage('Join split parts'));
   }
 
   // 5. ASSEMBLY — overview page per cabinet, then step-by-step panel cards
@@ -884,6 +924,127 @@ function drawCutsForSingleSheet(
     drawCutCard(doc, sc, sheet.parts, i, x, y, cardW, cardDiagH, opt);
     col++;
     if (col >= cols) { col = 0; y += cardH + cardGutter; }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Split-part JOIN GUIDE — for parts the CNC auto-split broke into
+// dovetailed segments. One card per original part: the segments drawn at
+// their original positions (so the parent silhouette reassembles before the
+// reader's eyes), each labelled with its roman numeral + the sheet panel id
+// ('1a-i') it was cut from, plus a one-line assembly instruction.
+// ---------------------------------------------------------------------------
+function drawSplitJoins(
+  doc: jsPDF,
+  groups: SplitJoinGroup[],
+  opt: PdfOptions,
+  dims: { w: number; h: number },
+  openNewPage: () => void,
+) {
+  const innerW = dims.w - 2 * PAGE_PAD;
+  const TOP = PAGE_PAD + 14;
+  const BOTTOM = dims.h - PAGE_PAD;
+  const TITLE_H = 18;
+  const CAPTION_H = 30;
+  const MAX_DIAG_H = 170;
+
+  // Page intro (drawn once per page via the header post-pass; here we add a
+  // standfirst on the first page only).
+  doc.setFont('helvetica', 'bold');
+  doc.setFontSize(13);
+  doc.setTextColor(20);
+  doc.text('Join split parts', PAGE_PAD, PAGE_PAD + 10);
+  doc.setFont('helvetica', 'normal');
+  doc.setFontSize(9);
+  doc.setTextColor(95);
+  doc.text(
+    'These parts were larger than the sheet and were auto-split with interlocking dovetail joints. ' +
+    'Cut every piece, then glue the joints and press the pieces together flat, in order (i, ii, …).',
+    PAGE_PAD, PAGE_PAD + 24, { maxWidth: innerW },
+  );
+  let y = TOP + 28;
+
+  const segBbox = (s: SplitJoinSegment) => {
+    let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+    for (const [x, yy] of s.outer) {
+      if (x < minX) minX = x;
+      if (yy < minY) minY = yy;
+      if (x > maxX) maxX = x;
+      if (yy > maxY) maxY = yy;
+    }
+    return { w: maxX - minX, h: maxY - minY };
+  };
+
+  for (const g of groups) {
+    // Parent extent = union of segments at their offsets.
+    let pw = 0, ph = 0;
+    for (const s of g.segments) {
+      const b = segBbox(s);
+      pw = Math.max(pw, s.offsetX + b.w);
+      ph = Math.max(ph, s.offsetY + b.h);
+    }
+    if (pw <= 0 || ph <= 0) continue;
+    const scale = Math.min(innerW / pw, MAX_DIAG_H / ph);
+    const diagW = pw * scale;
+    const diagH = ph * scale;
+    const cardH = TITLE_H + diagH + CAPTION_H;
+    if (y + cardH > BOTTOM) {
+      openNewPage();
+      y = TOP;
+    }
+
+    // Card title
+    doc.setFont('helvetica', 'bold');
+    doc.setFontSize(11);
+    doc.setTextColor(20);
+    doc.text(
+      `${g.parentName}  ·  ${g.segments.length} pieces  ·  ${fmtDim(g.thickness, opt.units)}`,
+      PAGE_PAD, y + 10,
+    );
+    y += TITLE_H;
+
+    // Diagram — segments at their original offsets. Alternate the fill tint
+    // so adjacent segments (and the dovetail joint line between them) read
+    // clearly even though they share the parent's color.
+    const ox = PAGE_PAD + (innerW - diagW) / 2;
+    const [r, gg, b] = hexToRgb(g.segments[0]?.color ?? '#999999');
+    g.segments.forEach((s, i) => {
+      const tint = i % 2 === 0 ? 0 : 0.35; // mix toward white on odd segments
+      doc.setFillColor(
+        Math.round(r + (255 - r) * tint),
+        Math.round(gg + (255 - gg) * tint),
+        Math.round(b + (255 - b) * tint),
+      );
+      doc.setDrawColor(60);
+      doc.setLineWidth(0.8);
+      drawPolygon(doc, s.outer, s.offsetX, s.offsetY, ox, y, scale, 'FD');
+      for (const h of s.holes) {
+        doc.setFillColor(255, 255, 255);
+        drawPolygon(doc, h, s.offsetX, s.offsetY, ox, y, scale, 'FD');
+      }
+      // Labels at the segment's bbox centre: roman numeral + panel id.
+      const sb = segBbox(s);
+      const cx = ox + (s.offsetX + sb.w / 2) * scale;
+      const cy = y + (s.offsetY + sb.h / 2) * scale;
+      doc.setFont('helvetica', 'bold');
+      doc.setFontSize(Math.min(13, Math.max(8, diagH * 0.12)));
+      doc.setTextColor(25);
+      doc.text(s.roman, cx, cy - 1, { align: 'center' });
+      doc.setFont('helvetica', 'normal');
+      doc.setFontSize(7.5);
+      doc.setTextColor(60);
+      doc.text(s.label ? `panel ${s.label}` : 'not placed', cx, cy + 8, { align: 'center' });
+    });
+    y += diagH;
+
+    // Caption: where each piece lives.
+    const refs = g.segments.map((s) =>
+      `${s.roman} = ${s.label ? `panel ${s.label} (sheet ${s.sheetNo})` : 'NOT PLACED'}`);
+    doc.setFont('helvetica', 'normal');
+    doc.setFontSize(8.5);
+    doc.setTextColor(80);
+    doc.text(refs.join('   ·   '), PAGE_PAD + (innerW - diagW) / 2 + 0, y + 12, { maxWidth: innerW });
+    y += CAPTION_H;
   }
 }
 

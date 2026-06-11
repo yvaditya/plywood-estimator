@@ -64,11 +64,29 @@ export interface SplitInfo {
   pieces: number;
 }
 
+export interface SegmentGeo {
+  outer: Vec2[];
+  holes: Vec2[][];
+  thickness: number;
+  /** Segment's anchored-origin position within the ORIGINAL part's frame —
+   *  drawing every segment at its offset reassembles the parent silhouette
+   *  (the PDF join guide does exactly that). */
+  offsetX: number;
+  offsetY: number;
+  parentId: string;
+  parentName: string;
+  /** 1-based segment index and total count within the parent. */
+  segIndex: number;
+  segCount: number;
+  color: string;
+}
+
 export interface SplitResult {
   parts: NestPart[];
-  /** Geometry of generated segments by part id (for the unplaced STEP export,
-   *  which can no longer resolve these ids back to a source body). */
-  segmentGeo: Map<string, { outer: Vec2[]; holes: Vec2[][]; thickness: number }>;
+  /** Geometry + provenance of generated segments by part id. Used by the
+   *  unplaced STEP export (segment ids don't resolve to a source body) and
+   *  by the PDF's "join split parts" guide. */
+  segmentGeo: Map<string, SegmentGeo>;
   /** One entry per original part that was split. */
   splits: SplitInfo[];
 }
@@ -316,7 +334,7 @@ function splitPoly(
  */
 export function splitOversizeParts(parts: NestPart[], binX: number, binY: number): SplitResult {
   const outParts: NestPart[] = [];
-  const segmentGeo = new Map<string, { outer: Vec2[]; holes: Vec2[][]; thickness: number }>();
+  const segmentGeo = new Map<string, SegmentGeo>();
   const splits: SplitInfo[] = [];
 
   for (const p of parts) {
@@ -331,7 +349,14 @@ export function splitOversizeParts(parts: NestPart[], binX: number, binY: number
       continue;
     }
     splits.push({ name: p.name, pieces: segs.length });
-    segs.forEach((seg, i) => {
+    // Join order reads naturally when segments march across the parent —
+    // sort by bbox min along the parent's longer axis.
+    const pb = bbox([p.outer]);
+    const axis = pb.w >= pb.h ? 0 : 1;
+    const ordered = segs
+      .map((seg) => ({ seg, b: bbox(seg) }))
+      .sort((a, b) => (axis === 0 ? a.b.minX - b.b.minX : a.b.minY - b.b.minY));
+    ordered.forEach(({ seg, b }, i) => {
       const anchored = normalizeWinding(anchorPoly(seg));
       const id = `${p.id}.s${i + 1}`;
       const outer = anchored[0];
@@ -347,7 +372,13 @@ export function splitOversizeParts(parts: NestPart[], binX: number, binY: number
         holes,
         color: p.color,
       });
-      segmentGeo.set(id, { outer, holes, thickness: p.thickness });
+      segmentGeo.set(id, {
+        outer, holes, thickness: p.thickness,
+        offsetX: b.minX, offsetY: b.minY,
+        parentId: p.id, parentName: p.name,
+        segIndex: i + 1, segCount: segs.length,
+        color: p.color,
+      });
     });
   }
 

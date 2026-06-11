@@ -501,6 +501,10 @@ function annotatePlacedParts(sheet: NestSheet) {
   });
   sorted.forEach((p, i) => {
     p.panelLabel = positionToLetter(i);
+    // Dovetail-split segments read '1a-i', '1a-ii' so the join guide can
+    // reference fragments of the same original part unambiguously.
+    const seg = splitSegIndex(p.partId);
+    if (seg !== null) p.panelLabel += `-${toRoman(seg)}`;
   });
 
   // Map cut → absolute coord (for V cuts this is the X line; for H cuts the Y).
@@ -528,6 +532,25 @@ function annotatePlacedParts(sheet: NestSheet) {
     }
     p.separatedAt = lastIdx;
   }
+}
+
+/** 1 → 'i', 2 → 'ii', 4 → 'iv' … lowercase roman numerals. Used to suffix
+ *  the panel labels of dovetail-split segments: '1a-i', '1a-ii'. */
+export function toRoman(n: number): string {
+  const table: [number, string][] = [
+    [10, 'x'], [9, 'ix'], [5, 'v'], [4, 'iv'], [1, 'i'],
+  ];
+  let s = '';
+  for (const [v, sym] of table) {
+    while (n >= v) { s += sym; n -= v; }
+  }
+  return s || 'i';
+}
+
+/** Segment index of a dovetail-split part id ('<base>.s<n>'), or null. */
+export function splitSegIndex(partId: string): number | null {
+  const m = /\.s(\d+)$/.exec(partId);
+  return m ? parseInt(m[1], 10) : null;
 }
 
 /** 0 → 'a', 25 → 'z', 26 → 'aa', etc. */
