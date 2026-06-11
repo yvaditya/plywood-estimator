@@ -1080,42 +1080,19 @@ function consolidateSheets(result: MultiSheetResult, job: PackJob): MultiSheetRe
 }
 
 /**
- * Multi-restart optimizer: shuffles insertion order + tries different
- * heuristics, keeps the best result by (fewest unplaced → fewest sheets
- * → highest fill on last sheet).
+ * Trial schedule shared by every multi-restart driver (sync, animated and
+ * the worker pool): every heuristic × (area-desc, longest-side-desc) orders,
+ * then deterministic random shuffles up to the restarts budget.
  */
-export function packMulti(job: PackJob, restarts: number): MultiSheetResult {
-  // 'save-last' uses the 'free' (MaxRects) strategy throughout, then
-  // post-processes the last sheet to corner-cluster. From the multi-restart
-  // optimiser's perspective it's the same as 'free' until the very end.
-  const effectiveStrategy = job.cutStrategy === 'save-last' ? 'free' : job.cutStrategy;
-  const optJob: PackJob = effectiveStrategy === job.cutStrategy ? job : { ...job, cutStrategy: effectiveStrategy };
+export interface PackTrial { order: PackInput[]; heur: Heuristic }
+
+export function buildTrialSchedule(job: PackJob, restarts: number): PackTrial[] {
   const heuristics: Heuristic[] = ['BSSF', 'BLSF', 'BAF', 'BL'];
-
-  // Baseline: area-descending — the standard first-fit-decreasing order.
   const baseline = job.items.slice().sort((a, b) => b.w * b.h - a.w * a.h);
-
-  // Use the USER'S strategy for the optimiser's objective, not the effective
-  // strategy. e.g. 'save-last' should objectively prefer LOWER last-sheet
-  // fill across all restarts, then we post-process — picking by effective
-  // 'free' yield would steer the search away from save-last's actual goal.
-  const objectiveStrategy: CutStrategy = job.cutStrategy ?? 'free';
-  let best: MultiSheetResult | null = null;
-  const tryOrder = (order: PackInput[], heur: Heuristic) => {
-    const r = packOne(optJob, heur, order);
-    if (!best || isBetter(r, best, objectiveStrategy)) best = r;
-  };
-
-  // Phase 1: try every heuristic with the baseline order
-  for (const h of heuristics) tryOrder(baseline, h);
-
-  // Phase 2: also try longest-side-descending order
-  const bySide = job.items.slice().sort(
-    (a, b) => Math.max(b.w, b.h) - Math.max(a.w, a.h),
-  );
-  for (const h of heuristics) tryOrder(bySide, h);
-
-  // Phase 3: random shuffles, capped by restarts budget.
+  const bySide = job.items.slice().sort((a, b) => Math.max(b.w, b.h) - Math.max(a.w, a.h));
+  const trials: PackTrial[] = [];
+  for (const h of heuristics) trials.push({ order: baseline, heur: h });
+  for (const h of heuristics) trials.push({ order: bySide, heur: h });
   let seed = 0x9e3779b1;
   const rand = () => { seed = (seed * 1664525 + 1013904223) >>> 0; return seed / 0xffffffff; };
   const phase3 = Math.max(0, restarts - heuristics.length * 2);
@@ -1125,24 +1102,47 @@ export function packMulti(job: PackJob, restarts: number): MultiSheetResult {
       const j = Math.floor(rand() * (k + 1));
       [shuffled[k], shuffled[j]] = [shuffled[j], shuffled[k]];
     }
-    const heur = heuristics[i % heuristics.length];
-    tryOrder(shuffled, heur);
+    trials.push({ order: shuffled, heur: heuristics[i % heuristics.length] });
   }
+  return trials;
+}
 
-  // Final squeeze: dissolve any sheet whose parts fit in the others' leftovers.
-  const result = consolidateSheets(best!, optJob);
+/** 'save-last' packs as 'free' and post-processes — the optimiser job uses
+ *  the effective strategy while the OBJECTIVE keeps the user's strategy. */
+export function effectiveJob(job: PackJob): PackJob {
+  const effectiveStrategy = job.cutStrategy === 'save-last' ? 'free' : job.cutStrategy;
+  return effectiveStrategy === job.cutStrategy ? job : { ...job, cutStrategy: effectiveStrategy };
+}
 
-  // Save-last post-process: cluster the last sheet's parts in one corner.
+/**
+ * Post-search finishing shared by all drivers: dissolve consolidatable
+ * sheets, then (save-last) corner-cluster the last sheet.
+ */
+export function finishPack(job: PackJob, best: MultiSheetResult): MultiSheetResult {
+  const result = consolidateSheets(best, effectiveJob(job));
   if (job.cutStrategy === 'save-last' && result.sheets.length > 0) {
     const meta = new Map<string, { id: string; w: number; h: number; allowRotate: boolean }>();
     for (const it of job.items) meta.set(it.id, { id: it.id, w: it.w, h: it.h, allowRotate: it.allowRotate });
     const repacked = repackLastSheetCorner(result.sheets[result.sheets.length - 1], job, meta);
-    if (repacked) {
-      result.sheets[result.sheets.length - 1] = repacked;
-    }
+    if (repacked) result.sheets[result.sheets.length - 1] = repacked;
   }
-
   return result;
+}
+
+/**
+ * Multi-restart optimizer: shuffles insertion order + tries different
+ * heuristics, keeps the best result by (fewest unplaced → fewest sheets
+ * → highest fill on last sheet).
+ */
+export function packMulti(job: PackJob, restarts: number): MultiSheetResult {
+  const optJob = effectiveJob(job);
+  const objectiveStrategy: CutStrategy = job.cutStrategy ?? 'free';
+  let best: MultiSheetResult | null = null;
+  for (const t of buildTrialSchedule(job, restarts)) {
+    const r = packOne(optJob, t.heur, t.order);
+    if (!best || isBetter(r, best, objectiveStrategy)) best = r;
+  }
+  return finishPack(job, best!);
 }
 
 export interface PackProgress {
@@ -1170,30 +1170,9 @@ export async function packMultiAnimated(
   onProgress: (p: PackProgress) => void | Promise<void>,
   yieldEvery = 4,
 ): Promise<MultiSheetResult> {
-  const effectiveStrategy = job.cutStrategy === 'save-last' ? 'free' : job.cutStrategy;
-  const optJob: PackJob = effectiveStrategy === job.cutStrategy ? job : { ...job, cutStrategy: effectiveStrategy };
-  const heuristics: Heuristic[] = ['BSSF', 'BLSF', 'BAF', 'BL'];
-  const baseline = job.items.slice().sort((a, b) => b.w * b.h - a.w * a.h);
-  const bySide = job.items.slice().sort((a, b) => Math.max(b.w, b.h) - Math.max(a.w, a.h));
+  const optJob = effectiveJob(job);
   const objectiveStrategy: CutStrategy = job.cutStrategy ?? 'free';
-
-  // Build the trial schedule eagerly so we know `total` for progress reports.
-  type Trial = { order: PackInput[]; heur: Heuristic };
-  const trials: Trial[] = [];
-  for (const h of heuristics) trials.push({ order: baseline, heur: h });
-  for (const h of heuristics) trials.push({ order: bySide,  heur: h });
-  // Phase 3: random shuffles (deterministic seed for reproducibility).
-  let seed = 0x9e3779b1;
-  const rand = () => { seed = (seed * 1664525 + 1013904223) >>> 0; return seed / 0xffffffff; };
-  const phase3 = Math.max(0, restarts - heuristics.length * 2);
-  for (let i = 0; i < phase3; i++) {
-    const shuffled = baseline.slice();
-    for (let k = shuffled.length - 1; k > 0; k--) {
-      const j = Math.floor(rand() * (k + 1));
-      [shuffled[k], shuffled[j]] = [shuffled[j], shuffled[k]];
-    }
-    trials.push({ order: shuffled, heur: heuristics[i % heuristics.length] });
-  }
+  const trials = buildTrialSchedule(job, restarts);
 
   const total = trials.length;
   let best: MultiSheetResult | null = null;
@@ -1206,15 +1185,7 @@ export async function packMultiAnimated(
     if (i % yieldEvery === 0) await new Promise<void>((r) => setTimeout(r, 0));
   }
 
-  // Final squeeze: dissolve any sheet whose parts fit in the others' leftovers.
-  const result = consolidateSheets(best!, optJob);
-  if (job.cutStrategy === 'save-last' && result.sheets.length > 0) {
-    const meta = new Map<string, { id: string; w: number; h: number; allowRotate: boolean }>();
-    for (const it of job.items) meta.set(it.id, { id: it.id, w: it.w, h: it.h, allowRotate: it.allowRotate });
-    const repacked = repackLastSheetCorner(result.sheets[result.sheets.length - 1], job, meta);
-    if (repacked) result.sheets[result.sheets.length - 1] = repacked;
-  }
-  return result;
+  return finishPack(job, best!);
 }
 
 /**
@@ -1223,7 +1194,7 @@ export async function packMultiAnimated(
  * for. Two-tier prelude is the same for all: fewer unplaced → fewer
  * sheets. The tiebreaker differs per strategy.
  */
-function isBetter(a: MultiSheetResult, b: MultiSheetResult, strategy: CutStrategy = 'free'): boolean {
+export function isBetter(a: MultiSheetResult, b: MultiSheetResult, strategy: CutStrategy = 'free'): boolean {
   if (a.unplaced.length !== b.unplaced.length) return a.unplaced.length < b.unplaced.length;
   if (a.sheets.length !== b.sheets.length) return a.sheets.length < b.sheets.length;
 

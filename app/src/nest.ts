@@ -23,8 +23,9 @@
  */
 
 import type { Vec2 } from './geometry';
-import { packMulti, packMultiAnimated, isCncStrategy, type PackInput, type PackPlacement, type CutStrategy, type Cut, type PackProgress } from './packRect';
-import { packCnc, packCncAnimated, polyArea, type CncInput, type CncSheet } from './cncNest';
+import { packMulti, isCncStrategy, type PackInput, type PackPlacement, type CutStrategy, type Cut, type PackProgress } from './packRect';
+import { packCnc, polyArea, type CncInput, type CncSheet } from './cncNest';
+import { packMultiParallel, packCncParallel } from './optPool';
 
 export type { CutStrategy, Cut, PackProgress };
 export { isCncStrategy };
@@ -417,7 +418,9 @@ export async function runNestAnimated(
         return sh;
       });
 
-    const winner = await packMultiAnimated(
+    // Multicore: trials fan out across a Web Worker pool (sequential
+    // single-core driver is the automatic fallback inside).
+    const winner = await packMultiParallel(
       { items, sheetW: usableL, sheetH: usableW, kerf, cutStrategy: config.cutStrategy },
       restarts,
       async (p) => {

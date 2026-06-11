@@ -672,6 +672,119 @@ function livesToSheets(lives: LiveSheet[], res: number, withFree: boolean): CncS
   });
 }
 
+/** Optimiser pass budget: follows "Optimize tries" but capped by part count
+ *  (each pass is a full raster re-pack). Shared by the generator and the
+ *  worker pool so both build the SAME deterministic ordering list. */
+export function cncAttemptCount(nItems: number, restarts: number): number {
+  const cap = nItems <= 12 ? 24 : nItems <= 25 ? 14 : nItems <= 50 ? 8 : 4;
+  return Math.max(1, Math.min(restarts, cap));
+}
+
+// ---------------------------------------------------------------------------
+// Worker-pool entry points. A pass result crosses the thread boundary, so it
+// is reduced to plain data (placements + usedArea per sheet); grids and masks
+// stay worker-local and are rebuilt where needed.
+// ---------------------------------------------------------------------------
+export interface CncSerialSheet { placements: CncPlaced[]; usedArea: number }
+export interface CncSerialPass { sheets: CncSerialSheet[]; unplaced: string[] }
+
+/** Mirror of passBetter for serialized passes (main-thread merge). */
+export function serialPassBetter(a: CncSerialPass, b: CncSerialPass, saveLast = false): boolean {
+  if (a.unplaced.length !== b.unplaced.length) return a.unplaced.length < b.unplaced.length;
+  if (a.sheets.length !== b.sheets.length) return a.sheets.length < b.sheets.length;
+  const least = (p: CncSerialPass) => p.sheets.reduce((m, s) => Math.min(m, s.usedArea), Infinity);
+  if (saveLast && a.sheets.length > 1) {
+    const la = least(a), lb = least(b);
+    if (Math.abs(la - lb) > 1e-6) return la < lb;
+  }
+  const used = (p: CncSerialPass) => p.sheets.reduce((s, sh) => s + sh.usedArea, 0);
+  return used(a) > used(b);
+}
+
+interface CncSetup { res: number; gw: number; gh: number; getMask: MaskFn; byId: Map<string, CncInput> }
+
+function setupCnc(items: CncInput[], sheetW: number, sheetH: number, kerf: number, opt: CncOptions): CncSetup {
+  const res = chooseResolution(sheetW, sheetH, opt);
+  const pad = kerf > 0 ? Math.max(1, Math.round(kerf / res)) : 0;
+  const maskCache = new Map<string, Mask>();
+  const getMask: MaskFn = (it, deg) => {
+    const key = `${it.geoKey}@${deg}`;
+    let m = maskCache.get(key);
+    if (!m) {
+      const r = rotateAnchor(it.outer, it.holes, deg);
+      m = buildMask(r.outer, r.holes, r.w, r.h, res, pad);
+      maskCache.set(key, m);
+    }
+    return m;
+  };
+  return {
+    res,
+    gw: Math.floor(sheetW / res),
+    gh: Math.floor(sheetH / res),
+    getMask,
+    byId: new Map(items.map((it) => [it.id, it] as const)),
+  };
+}
+
+/**
+ * Run a subset of the deterministic ordering list (chosen by index) and
+ * report each pass through `onPass`. Workers share nothing — each rebuilds
+ * its own mask cache, amortised across the passes it is assigned.
+ */
+export function cncRunPasses(
+  items: CncInput[],
+  sheetW: number,
+  sheetH: number,
+  kerf: number,
+  opt: CncOptions,
+  attempts: number,
+  orderingIdxs: number[],
+  onPass: (orderingIdx: number, pass: CncSerialPass) => void,
+): void {
+  const { res, gw, gh, getMask } = setupCnc(items, sheetW, sheetH, kerf, opt);
+  const orderings = buildOrderings(items, attempts);
+  for (const idx of orderingIdxs) {
+    const o = orderings[idx];
+    if (!o) continue;
+    const r = runPass(o.order, gw, gh, getMask, res, o.leftFirst);
+    onPass(idx, {
+      sheets: r.lives.map((l) => ({ placements: l.placements, usedArea: l.usedArea })),
+      unplaced: r.unplaced,
+    });
+  }
+}
+
+/**
+ * Final squeeze for the pool: rebuild live grids from the winning pass's
+ * placements, then run the same consolidation (+ optional save-last
+ * compaction) the generator applies, returning display-ready sheets.
+ */
+export function cncFinish(
+  items: CncInput[],
+  sheetW: number,
+  sheetH: number,
+  kerf: number,
+  opt: CncOptions,
+  winner: CncSerialPass,
+): CncResult {
+  const { res, gw, gh, getMask, byId } = setupCnc(items, sheetW, sheetH, kerf, opt);
+  const lives: LiveSheet[] = winner.sheets.map((sh) => {
+    const live: LiveSheet = { grid: new SheetGrid(gw, gh), placements: [], usedArea: 0 };
+    for (const p of sh.placements) {
+      const it = byId.get(p.id);
+      if (!it) continue;
+      const mask = getMask(it, p.angleDeg);
+      live.grid.commit(mask, Math.round(p.x / res), Math.round(p.y / res));
+      live.placements.push(p);
+      live.usedArea += p.area;
+    }
+    return live;
+  });
+  let consolidated = consolidate(lives, getMask, res, byId);
+  if (opt.saveLast) consolidated = compactLastSheet(consolidated, gw, gh, getMask, res, byId);
+  return { sheets: livesToSheets(consolidated, res, true), unplaced: winner.unplaced };
+}
+
 /**
  * Multi-restart packer as a generator (yields once per restart, then once
  * after consolidation) so the sync and animated drivers share one body.
@@ -707,10 +820,7 @@ export function* packCncGen(
   // It follows the "Optimize tries" setting, but each pass is a full raster
   // re-pack (far heavier than a rectangle trial), so the count is capped by
   // part count to keep wall-clock time sane, and a hard time budget backs that.
-  const restarts = opt.restarts ?? 8;
-  const n = items.length;
-  const cap = n <= 12 ? 24 : n <= 25 ? 14 : n <= 50 ? 8 : 4;
-  const attempts = Math.max(1, Math.min(restarts, cap));
+  const attempts = cncAttemptCount(items.length, opt.restarts ?? 8);
   const orderings = buildOrderings(items, attempts);
   const totalSteps = orderings.length + 1; // +1 = the consolidation step
   const startMs = Date.now();

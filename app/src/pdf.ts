@@ -197,9 +197,13 @@ export function buildPdf(result: NestResult, opt: PdfOptions): jsPDF {
   addPage('Shopping list');
   drawShoppingListPage(doc, opt, dims);
 
-  // 3. PARTS OVERVIEW — all panels grouped by unique part, dimensions
-  addPage('Parts');
-  drawPartsOverview(doc, labels, opt, dims, tagSection);
+  // 3. PARTS OVERVIEW — all panels grouped by unique part, dimensions.
+  //    Skipped for CNC jobs (the machine cuts straight from the sheet
+  //    contours; the saw-shop parts grid is dead weight there).
+  if (!opt.cnc) {
+    addPage('Parts');
+    drawPartsOverview(doc, labels, opt, dims, tagSection);
+  }
 
   // 4. PER SHEET — layout page first, then its cut sequence cards.
   //    Spillover pages within a sheet are tagged "Sheet N" so the
