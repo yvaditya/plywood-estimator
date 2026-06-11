@@ -146,12 +146,15 @@ function anchorPoly(poly: Poly): Poly {
 }
 
 /** Drop degenerate fragments — e.g. the tip of a dovetail flare clipped off
- *  by a perpendicular cut through the joint. Anything smaller than ~3×3 cm is
- *  not a panel piece worth cutting; the reassembled panel just gets a tiny
- *  relieved corner where two joints cross. */
+ *  by a perpendicular cut through the joint, or a thin island stranded
+ *  between a joint and a hole. Nothing smaller than a tail is a panel piece
+ *  worth cutting; the reassembled panel just gets a tiny relieved spot. */
 function isRealPiece(poly: Poly): boolean {
   if (poly.length === 0 || poly[0].length < 3) return false;
-  return Math.abs(ringSignedArea(poly[0])) > 1000;
+  const a = Math.abs(ringSignedArea(poly[0]));
+  if (a <= 1000) return false;
+  const b = bbox([poly[0]]);
+  return !(Math.min(b.w, b.h) < 35 && a < 4000);
 }
 
 // ---------------------------------------------------------------------------
@@ -221,26 +224,53 @@ function tailDepthFor(thickness: number): number {
 }
 
 /**
- * Actual material span along the cut line at x = cx: the min/max Y of the
- * part's intersection with a thin vertical band there. The part's global
- * bbox is wrong for shaped parts — an L-shaped panel cut through its narrow
- * arm would get tails laid out over empty space and clipped to fragments.
+ * Material along the cut line at x = cx: min/max Y of the part's
+ * intersection with a thin vertical band there, plus `coverage` — how much
+ * material the band actually crosses. The part's global bbox is wrong for
+ * shaped parts — an L-shaped panel cut through its narrow arm would get
+ * tails laid out over empty space and clipped to fragments. coverage <
+ * (jy1 − jy0) means the line crosses a notch / hole: a weak place to joint.
  * Returns null when the band misses the material entirely.
  */
-function jointSpanAt(material: Poly[], cx: number, y0: number, y1: number): { jy0: number; jy1: number } | null {
+function jointSpanAt(
+  material: Poly[],
+  cx: number,
+  y0: number,
+  y1: number,
+  tailDepth = 0,
+): { jy0: number; jy1: number; coverage: number } | null {
+  // The band covers the whole JOINT ZONE — the cut line plus the depth the
+  // tails will protrude into — so a notch/hole anywhere the joint touches
+  // lowers coverage, not just one exactly on the line. (A tail poking into
+  // a hole would otherwise shed small orphan islands on the socket side.)
   const band: Poly = [[
     [cx - 0.5, y0],
-    [cx + 0.5, y0],
-    [cx + 0.5, y1],
+    [cx + tailDepth + 0.5, y0],
+    [cx + tailDepth + 0.5, y1],
     [cx - 0.5, y1],
   ]];
   const hit = pc.intersection(material as pcNs.MultiPolygon, [band] as pcNs.MultiPolygon) as Poly[];
   let minY = Infinity, maxY = -Infinity;
-  for (const poly of hit) for (const ring of poly) for (const [, y] of ring) {
-    if (y < minY) minY = y;
-    if (y > maxY) maxY = y;
+  let zoneArea = 0;
+  for (const poly of hit) {
+    poly.forEach((ring, ri) => {
+      const a = Math.abs(ringSignedArea(ring));
+      zoneArea += ri === 0 ? a : -a; // holes inside the zone weaken it too
+      for (const [, y] of ring) {
+        if (y < minY) minY = y;
+        if (y > maxY) maxY = y;
+      }
+    });
   }
-  return Number.isFinite(minY) ? { jy0: minY, jy1: maxY } : null;
+  if (!Number.isFinite(minY)) return null;
+  // Coverage = material AREA in the zone normalised to joint-length units.
+  // Area (not per-island bbox extent) so an L-shaped island around a notch
+  // corner doesn't masquerade as a full-material joint.
+  let coverage = zoneArea / (tailDepth + 1);
+  // Penalize fragmentation: a zone split into several islands is weaker
+  // than one continuous run of the same total material.
+  if (hit.length > 1) coverage *= 0.8;
+  return { jy0: minY, jy1: maxY, coverage };
 }
 
 // ---------------------------------------------------------------------------
@@ -290,10 +320,34 @@ function splitPoly(
   let remaining: Poly[] = [work];
   const regY0 = wb.minY - depth - 10;
   const regY1 = wb.maxY + depth + 10;
+  let prevCx = wb.minX;
   for (let i = 1; i < k; i++) {
-    const cx = wb.minX + (wb.w * i) / k;
-    const span = jointSpanAt(remaining, cx, regY0, regY1)
-      ?? { jy0: wb.minY, jy1: wb.maxY };
+    const nominal = wb.minX + (wb.w * i) / k;
+
+    // Notch avoidance: a cut through a notch / hole crosses little material
+    // — a weak place for a joint. Probe positions around the nominal cut
+    // (within the segment-fit constraints) and take the one crossing the
+    // MOST material; ties go to the position closest to the even split.
+    // For plain rectangles every candidate ties, so nothing moves.
+    const unit = wb.w / k;
+    const maxRight = Math.min(prevCx + maxSeg, wb.maxX - (k - i) * 40); // keep later pieces real
+    const minLeft = Math.max(prevCx + 40, wb.maxX - (k - i) * maxSeg);  // keep later pieces ≤ maxSeg
+    let cx = Math.min(Math.max(nominal, minLeft), maxRight);
+    let cxSpan: { jy0: number; jy1: number; coverage: number } | null = null;
+    let bestScore = -Infinity;
+    for (const f of [0, -0.05, 0.05, -0.1, 0.1, -0.16, 0.16, -0.24, 0.24]) {
+      const cand = nominal + f * unit;
+      if (cand < minLeft || cand > maxRight) continue;
+      const s = jointSpanAt(remaining, cand, regY0, regY1, depth);
+      if (!s) continue;
+      // Coverage dominates (snapped to mm so float noise can't beat the
+      // distance tiebreak); closeness to the even split breaks ties.
+      const score = Math.round(s.coverage) * 1000 - Math.abs(cand - nominal);
+      if (score > bestScore) { bestScore = score; cx = cand; cxSpan = s; }
+    }
+    const span = cxSpan ?? jointSpanAt(remaining, cx, regY0, regY1)
+      ?? { jy0: wb.minY, jy1: wb.maxY, coverage: wb.h };
+    prevCx = cx;
     const jointLen = span.jy1 - span.jy0;
     let region: Poly;
     if (jointLen < MIN_DOVETAIL_JOINT) {

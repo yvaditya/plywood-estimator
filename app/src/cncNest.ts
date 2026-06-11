@@ -642,6 +642,21 @@ function buildOrderings(items: CncInput[], passes: number): { order: CncInput[];
   const byShort = (a: CncInput, b: CncInput) => Math.min(d(b).w, d(b).h) - Math.min(d(a).w, d(a).h);
   const byPerim = (a: CncInput, b: CncInput) => (d(b).w + d(b).h) - (d(a).w + d(a).h);
 
+  const byWide = (a: CncInput, b: CncInput) => d(b).w - d(a).w;
+  const byTall = (a: CncInput, b: CncInput) => d(b).h - d(a).h;
+
+  // Big-small interleave: largest, smallest, 2nd largest, … — small parts
+  // get placed while big neighbours still leave pockets to tuck into.
+  const interleave = (): CncInput[] => {
+    const s = sorted(byArea);
+    const mixed: CncInput[] = [];
+    for (let lo = 0, hi = s.length - 1; lo <= hi; lo++, hi--) {
+      mixed.push(s[lo]);
+      if (lo !== hi) mixed.push(s[hi]);
+    }
+    return mixed;
+  };
+
   const out: { order: CncInput[]; leftFirst: boolean }[] = [
     { order: sorted(byArea), leftFirst: false },
     { order: sorted(byArea), leftFirst: true },
@@ -649,6 +664,12 @@ function buildOrderings(items: CncInput[], passes: number): { order: CncInput[];
     { order: sorted(byShort), leftFirst: false },
     { order: sorted(byPerim), leftFirst: false },
     { order: sorted(byLong), leftFirst: true },
+    { order: sorted(byWide), leftFirst: false },
+    { order: sorted(byTall), leftFirst: true },
+    { order: interleave(), leftFirst: false },
+    { order: interleave(), leftFirst: true },
+    { order: sorted(byPerim), leftFirst: true },
+    { order: sorted(byShort), leftFirst: true },
   ];
   // Deterministic shuffles fill any remaining budget (reproducible runs).
   let seed = 0x9e3779b1;
@@ -674,9 +695,11 @@ function livesToSheets(lives: LiveSheet[], res: number, withFree: boolean): CncS
 
 /** Optimiser pass budget: follows "Optimize tries" but capped by part count
  *  (each pass is a full raster re-pack). Shared by the generator and the
- *  worker pool so both build the SAME deterministic ordering list. */
+ *  worker pool so both build the SAME deterministic ordering list. The caps
+ *  assume the multicore pool (optPool.ts) — the sequential generator also
+ *  carries a hard wall-clock budget that bails out of excess passes. */
 export function cncAttemptCount(nItems: number, restarts: number): number {
-  const cap = nItems <= 12 ? 24 : nItems <= 25 ? 14 : nItems <= 50 ? 8 : 4;
+  const cap = nItems <= 12 ? 96 : nItems <= 25 ? 48 : nItems <= 50 ? 24 : 10;
   return Math.max(1, Math.min(restarts, cap));
 }
 
@@ -743,6 +766,10 @@ export function cncRunPasses(
 ): void {
   const { res, gw, gh, getMask } = setupCnc(items, sheetW, sheetH, kerf, opt);
   const orderings = buildOrderings(items, attempts);
+  // Per-worker wall-clock budget: with the raised attempt caps a worker may
+  // hold a dozen passes; never let a heavyweight job pin a core for long.
+  const startMs = Date.now();
+  const budgetMs = 20000;
   for (const idx of orderingIdxs) {
     const o = orderings[idx];
     if (!o) continue;
@@ -751,6 +778,7 @@ export function cncRunPasses(
       sheets: r.lives.map((l) => ({ placements: l.placements, usedArea: l.usedArea })),
       unplaced: r.unplaced,
     });
+    if (Date.now() - startMs > budgetMs) break;
   }
 }
 
