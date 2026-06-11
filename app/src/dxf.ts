@@ -6,6 +6,16 @@
  * Fusion, SolidWorks, LightBurn, Aspire, FreeCAD, etc.). For cut-list
  * fabrication it's the right pick.
  *
+ * STRICT R12 ONLY — this is the compatibility contract. Older waterjet /
+ * plasma CAM packages parse nothing newer. Specifically:
+ *   - polylines are classic POLYLINE + VERTEX + SEQEND chains, NEVER
+ *     LWPOLYLINE (that entity arrived in R14 and strict R12 readers reject
+ *     the whole file over it);
+ *   - the TABLES section declares LTYPE (CONTINUOUS) and STYLE (STANDARD)
+ *     before LAYER — the pickiest readers refuse layers that reference an
+ *     undeclared linetype/text style;
+ *   - $EXTMIN/$EXTMAX are emitted so ancient viewers can zoom-extents.
+ *
  * We emit a tiny but valid R12 file with:
  *   - layer SHEET     (sheet border)
  *   - layer MARGIN    (dashed inner safe area)
@@ -55,16 +65,20 @@ const DIM_TEXT_H = 4;      // mm — for dim text
 // ---------------------------------------------------------------------------
 // Header & footer
 // ---------------------------------------------------------------------------
-function header(): string {
+function header(minX: number, minY: number, maxX: number, maxY: number): string {
+  // R12-era variables only. $INSUNITS/$MEASUREMENT are NOT emitted — they
+  // postdate R12, and while most readers skip unknown header variables, the
+  // strictest waterjet importers reject files over them. Coordinates are mm;
+  // CAM software lets the operator pick units on import.
   return [
     '0', 'SECTION',
     '2', 'HEADER',
     '9', '$ACADVER',
     '1', 'AC1009',     // R12
-    '9', '$INSUNITS',
-    '70', '4',         // 4 = millimetres
-    '9', '$MEASUREMENT',
-    '70', '1',         // metric
+    '9', '$EXTMIN',
+    '10', f(minX), '20', f(minY), '30', '0',
+    '9', '$EXTMAX',
+    '10', f(maxX), '20', f(maxY), '30', '0',
     '0', 'ENDSEC',
   ].join(NL);
 }
@@ -73,12 +87,23 @@ function tables(): string {
   return [
     '0', 'SECTION',
     '2', 'TABLES',
+    // LTYPE first — layers below reference CONTINUOUS, and strict readers
+    // want it declared before use.
+    '0', 'TABLE', '2', 'LTYPE', '70', '1',
+    ['0', 'LTYPE', '2', 'CONTINUOUS', '70', '0',
+     '3', 'Solid line', '72', '65', '73', '0', '40', '0.0'].join(NL),
+    '0', 'ENDTAB',
     '0', 'TABLE', '2', 'LAYER', '70', '5',
     layer('SHEET', 7),
     layer('MARGIN', 8),
     layer('PARTS', 5),
     layer('LABELS', 3),
     layer('DIMS', 1),
+    '0', 'ENDTAB',
+    // Text style for TEXT entities.
+    '0', 'TABLE', '2', 'STYLE', '70', '1',
+    ['0', 'STYLE', '2', 'STANDARD', '70', '0', '40', '0.0', '41', '1.0',
+     '50', '0.0', '71', '0', '42', '2.5', '3', 'txt', '4', ''].join(NL),
     '0', 'ENDTAB',
     '0', 'ENDSEC',
   ].join(NL);
@@ -89,7 +114,10 @@ function layer(name: string, color: number): string {
 }
 
 function footer(): string {
-  return ['0', 'ENDSEC', '0', 'EOF'].join(NL);
+  // Just the EOF marker. The caller closes ENTITIES with its own ENDSEC —
+  // emitting another here produced a stray ENDSEC that strict readers
+  // (several waterjet CAM importers) rejected the whole file over.
+  return ['0', 'EOF'].join(NL);
 }
 
 // ---------------------------------------------------------------------------
@@ -104,16 +132,23 @@ function line(layer: string, x1: number, y1: number, x2: number, y2: number): st
   ].join(NL);
 }
 
-function lwpolyline(layer: string, points: Vec2[], closed = true): string {
+/**
+ * Classic R12 polyline: POLYLINE header + one VERTEX entity per point +
+ * SEQEND. LWPOLYLINE would be ~3× smaller but is an R14 entity — strict R12
+ * readers (old waterjet/plasma CAM) reject the whole file over it.
+ */
+function polyline(layer: string, points: Vec2[], closed = true): string {
   const out: string[] = [
-    '0', 'LWPOLYLINE',
+    '0', 'POLYLINE',
     '8', layer,
-    '90', String(points.length),
+    '66', '1',                    // vertices follow
     '70', closed ? '1' : '0',
+    '10', '0', '20', '0', '30', '0', // dummy point, required by the spec
   ];
   for (const [x, y] of points) {
-    out.push('10', f(x), '20', f(y));
+    out.push('0', 'VERTEX', '8', layer, '10', f(x), '20', f(y), '30', '0');
   }
+  out.push('0', 'SEQEND', '8', layer);
   return out.join(NL);
 }
 
@@ -180,7 +215,7 @@ function arrowHead(x: number, y: number, sign: number, horizontal: boolean): str
   } else {
     pts = [[x, y], [x + ARROW_W, y + sign * ARROW_LEN], [x - ARROW_W, y + sign * ARROW_LEN]];
   }
-  return lwpolyline('DIMS', pts, true);
+  return polyline('DIMS', pts, true);
 }
 
 // ---------------------------------------------------------------------------
@@ -190,7 +225,7 @@ export function sheetToDxf(sheet: NestSheet, opt: DxfOptions): string {
   const ents: string[] = [];
 
   // Sheet border
-  ents.push(lwpolyline('SHEET', [
+  ents.push(polyline('SHEET', [
     [0, 0],
     [opt.sheetW, 0],
     [opt.sheetW, opt.sheetL],
@@ -201,7 +236,7 @@ export function sheetToDxf(sheet: NestSheet, opt: DxfOptions): string {
   // Omitted in cut-file mode — it isn't a contour the machine cuts.
   if (opt.margin > 0 && !opt.outlinesOnly) {
     const m = opt.margin;
-    ents.push(lwpolyline('MARGIN', [
+    ents.push(polyline('MARGIN', [
       [m, m],
       [opt.sheetW - m, m],
       [opt.sheetW - m, opt.sheetL - m],
@@ -220,7 +255,17 @@ export function sheetToDxf(sheet: NestSheet, opt: DxfOptions): string {
     ents.push(dimension(0, 0, 0, opt.sheetL, DIM_OFFSET + 5, fmtDim(opt.sheetL, opt.units)));
   }
 
-  return [header(), tables(), '0', 'SECTION', '2', 'ENTITIES', ...ents, '0', 'ENDSEC', footer()].join(NL);
+  // Extents pad out past the dimension lines drawn below/left of the sheet.
+  const pad = DIM_OFFSET + 25;
+  return [
+    header(-pad, -pad, opt.sheetW + pad, opt.sheetL + pad),
+    tables(),
+    // Empty BLOCKS section — part of the canonical R12 skeleton; some strict
+    // readers treat its absence as a malformed file.
+    '0', 'SECTION', '2', 'BLOCKS', '0', 'ENDSEC',
+    '0', 'SECTION', '2', 'ENTITIES', ...ents, '0', 'ENDSEC',
+    footer(),
+  ].join(NL);
 }
 
 function partEntities(p: PlacedPart, opt: DxfOptions): string {
@@ -228,11 +273,11 @@ function partEntities(p: PlacedPart, opt: DxfOptions): string {
 
   // Outer ring translated to sheet coords
   const outerWorld: Vec2[] = p.outer.map(([x, y]) => [x + p.x, y + p.y]);
-  out.push(lwpolyline('PARTS', outerWorld));
+  out.push(polyline('PARTS', outerWorld));
 
   // Holes
   for (const h of p.holes) {
-    out.push(lwpolyline('PARTS', h.map(([x, y]) => [x + p.x, y + p.y])));
+    out.push(polyline('PARTS', h.map(([x, y]) => [x + p.x, y + p.y])));
   }
 
   // Cut-file mode stops here — outlines + holes only, nothing else.

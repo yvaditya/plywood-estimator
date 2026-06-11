@@ -125,6 +125,9 @@ const dropzone = $('dropzone');
 const fileInput = $<HTMLInputElement>('fileInput');
 const pickFileBtn = $('pickFileBtn');
 const loadStatus = $('loadStatus');
+const loadProgress = $('loadProgress');
+const loadProgressFill = $('loadProgressFill');
+const loadProgressLabel = $('loadProgressLabel');
 const bodyList = $('bodyList');
 const bodyCount = $('bodyCount');
 const versionLine = $('versionLine');
@@ -347,6 +350,23 @@ function shiftMeshesAxis(meshes: any[], axis: 0 | 1 | 2, delta: number) {
 const meshesAabbX = (meshes: any[]) => meshesAabbAxis(meshes, 0);
 const shiftMeshesX = (meshes: any[], dx: number) => shiftMeshesAxis(meshes, 0, dx);
 
+// --- Import progress bar -----------------------------------------------
+// STEP parse (OCCT WASM) and per-body analysis can both take seconds on
+// complex models / many bodies; the bar keeps the UI honest meanwhile.
+function showLoadProgress(frac: number, label: string) {
+  loadProgress.hidden = false;
+  loadProgressFill.style.width = `${Math.min(100, Math.max(0, frac * 100)).toFixed(1)}%`;
+  loadProgressLabel.textContent = label;
+}
+function hideLoadProgress() {
+  loadProgress.hidden = true;
+  loadProgressFill.style.width = '0%';
+}
+/** Yield to the event loop so the progress bar actually repaints. */
+const uiYield = () => new Promise<void>((r) => setTimeout(r, 0));
+/** Within one file: fraction of the bar given to parsing vs body analysis. */
+const PARSE_SHARE = 0.4;
+
 async function handleFiles(files: FileList | File[]) {
   const list = Array.from(files).filter((f) => {
     const n = f.name.toLowerCase();
@@ -362,9 +382,17 @@ async function handleFiles(files: FileList | File[]) {
   let totalAdded = 0;
   let totalSkippedNotSheet = 0;
   try {
-    for (const file of list) {
+    for (let fi = 0; fi < list.length; fi++) {
+      const file = list[fi];
+      const fileBase = fi / list.length;
+      const fileTagLabel = list.length > 1 ? `File ${fi + 1}/${list.length} · ` : '';
+      showLoadProgress(fileBase, `${fileTagLabel}parsing ${file.name} …`);
+      await uiYield(); // paint before the (blocking) WASM parse
       const buf = await file.arrayBuffer();
       const res = await parseStep(buf);
+      showLoadProgress(fileBase + PARSE_SHARE / list.length,
+        `${fileTagLabel}analyzing ${res.meshes.length} bodies …`);
+      await uiYield();
       state.result = res; // last file's result kept for legacy reasons
       totalRaw += res.meshes.length;
 
@@ -401,9 +429,19 @@ async function handleFiles(files: FileList | File[]) {
       state.collapsedFiles.add(tag);
 
       let perFileValid = 0;
-      res.meshes.forEach((m, meshIdx) => {
+      for (let meshIdx = 0; meshIdx < res.meshes.length; meshIdx++) {
+        const m = res.meshes[meshIdx];
+        // Keep the bar moving and the page responsive: analyzeBody +
+        // viewer mesh construction are synchronous and can take tens of
+        // ms per body on dense tessellations.
+        if (meshIdx % 4 === 0) {
+          const inFile = PARSE_SHARE + (1 - PARSE_SHARE) * (meshIdx / res.meshes.length);
+          showLoadProgress(fileBase + inFile / list.length,
+            `${fileTagLabel}analyzing body ${meshIdx + 1}/${res.meshes.length} …`);
+          await uiYield();
+        }
         const indices = m.index?.array;
-        if (!indices || indices.length < 3) return;
+        if (!indices || indices.length < 3) continue;
         try {
           const analysis = analyzeBody(m);
           if (!analysis) {
@@ -413,7 +451,7 @@ async function handleFiles(files: FileList | File[]) {
             viewer.addNonSheetMesh(m);
             totalSkippedNotSheet++;
             state.nonSheetCount++;
-            return;
+            continue;
           }
           const id = nextBodyId++;
           const baseName = m.name && m.name.trim() ? m.name : `Body ${meshIdx + 1}`;
@@ -436,7 +474,7 @@ async function handleFiles(files: FileList | File[]) {
         } catch (e) {
           console.warn(`Failed to analyze body in ${file.name}:`, e);
         }
-      });
+      }
     }
 
     viewer.finishLoad();
@@ -458,6 +496,8 @@ async function handleFiles(files: FileList | File[]) {
   } catch (err: any) {
     console.error(err);
     setStatus(err.message || 'Failed to parse STEP file.', 'error');
+  } finally {
+    hideLoadProgress();
   }
 }
 

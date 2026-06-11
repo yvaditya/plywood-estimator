@@ -111,6 +111,10 @@ export class Viewer {
   private grainStates = new Map<number, GrainLock>();
   private onSelectionChange?: () => void;
   private onGrainCycle?: (bodyId: number) => void;
+  /** Wheel-gesture stream state — see handleWheelPan. A stream keeps its
+   *  pan/zoom verdict; a >400 ms pause starts a fresh classification. */
+  private wheelStreamKind: 'pan' | 'zoom' | null = null;
+  private lastWheelTs = -Infinity;
   private pmrem: THREE.PMREMGenerator;
   private key!: THREE.DirectionalLight;
   private rim!: THREE.DirectionalLight;
@@ -326,9 +330,22 @@ export class Viewer {
     //   - large vertical-only steps with deltaX === 0
     // Precision touchpads on BOTH Mac and Windows emit deltaMode === 0 with
     // small mixed deltaX/deltaY values — handle those as pan.
-    const isMouseWheel =
-      ev.deltaMode !== 0 || (ev.deltaX === 0 && Math.abs(ev.deltaY) >= 50);
-    if (isMouseWheel) return; // defer to OrbitControls (zoom)
+    //
+    // Classification is STICKY per gesture stream: events arriving within
+    // 400 ms of the previous one keep the stream's verdict instead of being
+    // re-classified. Windows wheel drivers with smooth scrolling split a
+    // fast spin into many small pixel-mode deltas — judged per-event, the
+    // sub-50px ones fell through to the pan path and the model jumped
+    // up/down mid-zoom. A user can't switch devices mid-scroll, so the
+    // first event of a stream decides for all of it.
+    const sinceLast = ev.timeStamp - this.lastWheelTs;
+    this.lastWheelTs = ev.timeStamp;
+    if (sinceLast > 400 || this.wheelStreamKind === null) {
+      const isMouseWheel =
+        ev.deltaMode !== 0 || (ev.deltaX === 0 && Math.abs(ev.deltaY) >= 50);
+      this.wheelStreamKind = isMouseWheel ? 'zoom' : 'pan';
+    }
+    if (this.wheelStreamKind === 'zoom') return; // defer to OrbitControls
 
     ev.preventDefault();
     ev.stopPropagation();

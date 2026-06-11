@@ -51,6 +51,9 @@ const DEPTH_MIN = 10; // mm
 const DEPTH_MAX = 30; // mm
 /** Dovetail flare angle (how much wider the tip is than the base, per side). */
 const FLARE_DEG = 9;
+/** Joints shorter than this get a plain straight cut — a dovetail needs room
+ *  for a tail plus two shoulders to mean anything structurally. */
+const MIN_DOVETAIL_JOINT = 24; // mm
 /** Clearance kept between a segment's bbox (tails included) and the bin. */
 const FIT_SLACK = 5; // mm
 /** Recursion guard — a part is never split into more than ~2^4 generations. */
@@ -159,9 +162,16 @@ function fitsBin(w: number, h: number, grain: NestPart['grain'], binX: number, b
  * interrupted by `nTails` trapezoidal tails protruding to cx + depth, flared
  * wider at the tip so the joint interlocks. Intersecting a part with this
  * region yields the tail side; subtracting it yields the matching socket side.
+ *
+ * The region rectangle spans [regY0, regY1] — the part's FULL vertical
+ * extent — so everything left of the cut ends up in the left piece even where
+ * the part is taller than the joint. The tails are laid out only within
+ * [jointY0, jointY1], the material actually present at the cut line.
  */
 function dovetailRegion(
   cx: number,
+  regY0: number,
+  regY1: number,
   jointY0: number,
   jointY1: number,
   farLeftX: number,
@@ -169,18 +179,17 @@ function dovetailRegion(
   nTails: number,
   flare: number,
 ): Poly {
-  const pad = depth + 10;
   const seg = (jointY1 - jointY0) / (2 * nTails + 1);
   const ring: Ring = [
-    [farLeftX, jointY0 - pad],
-    [cx, jointY0 - pad],
+    [farLeftX, regY0],
+    [cx, regY0],
   ];
   for (let i = 0; i < nTails; i++) {
     const a = jointY0 + (2 * i + 1) * seg;
     const b = a + seg;
     ring.push([cx, a], [cx + depth, a - flare], [cx + depth, b + flare], [cx, b]);
   }
-  ring.push([cx, jointY1 + pad], [farLeftX, jointY1 + pad]);
+  ring.push([cx, regY1], [farLeftX, regY1]);
   return [ring];
 }
 
@@ -191,6 +200,29 @@ export function tailCountFor(jointLen: number): number {
 
 function tailDepthFor(thickness: number): number {
   return Math.min(DEPTH_MAX, Math.max(DEPTH_MIN, thickness * DEPTH_PER_THICKNESS));
+}
+
+/**
+ * Actual material span along the cut line at x = cx: the min/max Y of the
+ * part's intersection with a thin vertical band there. The part's global
+ * bbox is wrong for shaped parts — an L-shaped panel cut through its narrow
+ * arm would get tails laid out over empty space and clipped to fragments.
+ * Returns null when the band misses the material entirely.
+ */
+function jointSpanAt(material: Poly[], cx: number, y0: number, y1: number): { jy0: number; jy1: number } | null {
+  const band: Poly = [[
+    [cx - 0.5, y0],
+    [cx + 0.5, y0],
+    [cx + 0.5, y1],
+    [cx - 0.5, y1],
+  ]];
+  const hit = pc.intersection(material as pcNs.MultiPolygon, [band] as pcNs.MultiPolygon) as Poly[];
+  let minY = Infinity, maxY = -Infinity;
+  for (const poly of hit) for (const ring of poly) for (const [, y] of ring) {
+    if (y < minY) minY = y;
+    if (y > maxY) maxY = y;
+  }
+  return Number.isFinite(minY) ? { jy0: minY, jy1: maxY } : null;
 }
 
 // ---------------------------------------------------------------------------
@@ -227,18 +259,34 @@ function splitPoly(
   const maxSeg = limit - depth - FIT_SLACK;
   const k = Math.max(2, Math.ceil(wb.w / Math.max(1, maxSeg)));
 
-  const jointLen = wb.h;
-  const nTails = tailCountFor(jointLen);
-  const seg = jointLen / (2 * nTails + 1);
-  const flare = Math.min(depth * Math.tan((FLARE_DEG * Math.PI) / 180), seg * 0.45);
   const farLeft = wb.minX - depth - 20;
 
-  // Peel segments off left-to-right with successive boolean cuts.
+  // Peel segments off left-to-right with successive boolean cuts. Each
+  // joint is sized from the material ACTUALLY present at its cut line, so
+  // shaped and skinny parts get tails that sit fully on the joint:
+  //   - tail count scales with the real joint length;
+  //   - tail depth never exceeds the tail width (no fragile fingers);
+  //   - joints too short for a meaningful dovetail fall back to a straight
+  //     cut rather than a clipped sliver of a tail.
   const pieces: Poly[] = [];
   let remaining: Poly[] = [work];
+  const regY0 = wb.minY - depth - 10;
+  const regY1 = wb.maxY + depth + 10;
   for (let i = 1; i < k; i++) {
     const cx = wb.minX + (wb.w * i) / k;
-    const region = dovetailRegion(cx, wb.minY, wb.maxY, farLeft, depth, nTails, flare);
+    const span = jointSpanAt(remaining, cx, regY0, regY1)
+      ?? { jy0: wb.minY, jy1: wb.maxY };
+    const jointLen = span.jy1 - span.jy0;
+    let region: Poly;
+    if (jointLen < MIN_DOVETAIL_JOINT) {
+      region = dovetailRegion(cx, regY0, regY1, span.jy0, span.jy1, farLeft, 0, 0, 0); // straight cut
+    } else {
+      const nTails = tailCountFor(jointLen);
+      const seg = jointLen / (2 * nTails + 1);
+      const depthJ = Math.min(depth, seg);
+      const flare = Math.min(depthJ * Math.tan((FLARE_DEG * Math.PI) / 180), seg * 0.45);
+      region = dovetailRegion(cx, regY0, regY1, span.jy0, span.jy1, farLeft, depthJ, nTails, flare);
+    }
     const left = pc.intersection(remaining as pcNs.MultiPolygon, [region] as pcNs.MultiPolygon);
     remaining = pc.difference(remaining as pcNs.MultiPolygon, [region] as pcNs.MultiPolygon) as Poly[];
     for (const p of left as Poly[]) pieces.push(p);
