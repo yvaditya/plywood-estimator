@@ -440,9 +440,10 @@ export interface CncOptions {
 
 function chooseResolution(sheetW: number, sheetH: number, opt: CncOptions): number {
   const long = Math.max(sheetW, sheetH);
-  // Finer grid = tighter nesting (less quantisation waste, fewer sheets) at the
-  // cost of speed. ~300 cells on the long edge (~8 mm on a 4×8) balances the
-  // two; the cell cap keeps the worst case bounded.
+  // Finer grid = tighter nesting (less quantisation waste, fewer sheets) at
+  // the cost of speed. ~300 cells on the long edge (~8 mm on a 4×8) is the
+  // single-core default; the multicore pool (optPool.ts) overrides
+  // targetCells/maxCells upward since the passes run in parallel.
   const target = opt.targetCells ?? 300;
   let res = Math.min(25, Math.max(1.5, long / target));
   const cap = opt.maxCells ?? 120000;
@@ -562,11 +563,14 @@ function consolidate(lives: LiveSheet[], getMask: MaskFn, res: number, byId: Map
 
   // Try to re-place every part of `victim` onto clones of the other sheets.
   // Returns the new sheet list on success, null when something didn't fit.
-  const tryDissolve = (vi: number, leftFirst: boolean): LiveSheet[] | null => {
+  const tryDissolve = (vi: number, leftFirst: boolean, byLongSide: boolean): LiveSheet[] | null => {
     const victim = working[vi];
     const clones = working.filter((_, i) => i !== vi).map(cloneLive);
-    // Largest victim parts first — harder pieces placed while space is freest.
-    const parts = victim.placements.slice().sort((a, b) => b.area - a.area);
+    // Hardest pieces placed while space is freest — "hard" judged by area
+    // or by longest side (a long skinny part can be harder than a big one).
+    const parts = victim.placements.slice().sort((a, b) => byLongSide
+      ? Math.max(b.w, b.h) - Math.max(a.w, a.h)
+      : b.area - a.area);
     for (const p of parts) {
       const it = byId.get(p.id);
       if (!it) return null;
@@ -590,9 +594,11 @@ function consolidate(lives: LiveSheet[], getMask: MaskFn, res: number, byId: Map
       .slice(0, VICTIM_CANDIDATES);
     outer: for (const vi of victims) {
       for (const leftFirst of [false, true]) {
-        if (Date.now() - startMs > budgetMs) break outer;
-        const dissolved = tryDissolve(vi, leftFirst);
-        if (dissolved) { working = dissolved; improved = true; break outer; }
+        for (const byLongSide of [false, true]) {
+          if (Date.now() - startMs > budgetMs) break outer;
+          const dissolved = tryDissolve(vi, leftFirst, byLongSide);
+          if (dissolved) { working = dissolved; improved = true; break outer; }
+        }
       }
     }
   }
@@ -700,7 +706,12 @@ function livesToSheets(lives: LiveSheet[], res: number, withFree: boolean): CncS
  *  carries a hard wall-clock budget that bails out of excess passes. */
 export function cncAttemptCount(nItems: number, restarts: number): number {
   const cap = nItems <= 12 ? 96 : nItems <= 25 ? 48 : nItems <= 50 ? 24 : 10;
-  return Math.max(1, Math.min(restarts, cap));
+  // A job with few parts only HAS n!·2 distinct (ordering × scan-direction)
+  // passes — anything beyond that re-runs identical layouts.
+  let perms = 2;
+  for (let i = 2; i <= Math.min(nItems, 8); i++) perms *= i;
+  const distinct = nItems > 8 ? Infinity : perms;
+  return Math.max(1, Math.min(restarts, cap, distinct));
 }
 
 // ---------------------------------------------------------------------------

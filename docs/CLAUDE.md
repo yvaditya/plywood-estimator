@@ -193,11 +193,26 @@ the expand state across renders.
   error with model size (2.5 mm sag on a 2.5 m cabinet, visibly faceted
   circles).
 - **CNC PDF**: `PdfOptions.cnc` suppresses the panel-saw cut-sequence pages
-  (a router follows contours — without the flag the EMPTY cnc cut tree hits
-  the legacy full-sheet-line fallback and prints fictional cuts). Split
-  parts get a "Join split parts" section (`drawSplitJoins`, fed by
-  `buildSplitJoins()` in main.ts); split segments' panel labels carry roman
-  suffixes ('1a-i') added in `annotatePlacedParts`.
+  AND the parts-overview grid (a router follows contours — without the flag
+  the EMPTY cnc cut tree hits the legacy full-sheet-line fallback and prints
+  fictional cuts). Split parts get a "Join split parts" section
+  (`drawSplitJoins`, fed by `buildSplitJoins()` in main.ts); split segments'
+  panel labels carry roman suffixes ('1a-i') added in `annotatePlacedParts`.
+- **Optimiser is multicore** (`optPool.ts` + `optWorker.ts`): rect trials and
+  CNC raster passes fan out across a Web Worker pool; the sequential drivers
+  in packRect/cncNest are the deterministic fallback (auto-used when Workers
+  are missing or error). Worker pool layouts can differ run-to-run on
+  objective ties (arrival order). The pool passes a FINER CNC grid
+  (targetCells 450) than the single-core default (300) — pass and finish
+  messages must always share the same `opt` or masks/grids disagree.
+- **CNC attempt budget** (`cncAttemptCount`): caps are sized for the worker
+  pool (96/48/24/10 by part count), bounded by n!·2 distinct orderings for
+  small jobs, plus per-worker and per-generator wall-clock budgets.
+- **Dovetail cuts avoid notches**: `splitParts.ts` probes candidate cut
+  positions around the even split and scores material coverage over the
+  whole joint zone (cut line + tail depth, area-based); a cut through a
+  notch/hole loses to a nearby full-material position. Don't score by
+  bbox extent — L-shaped islands read as full material.
 
 ## UI rules from the user (don't violate without asking)
 - Notion-style **light theme** for the chrome; 3D viewer is intentionally

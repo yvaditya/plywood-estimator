@@ -127,6 +127,15 @@ export async function packCncParallel(
     return packCncAnimated(items, sheetW, sheetH, kerf, onProgress, opt);
   }
 
+  // Finer raster than the single-core default — the passes run in parallel,
+  // so the extra per-pass cost is hidden, and a tighter grid wastes less
+  // material at every part boundary. MUST be identical for the pass and
+  // finish messages (masks/grids have to agree on resolution).
+  const wopt: CncOptions = {
+    ...opt,
+    targetCells: opt.targetCells ?? 450,
+    maxCells: opt.maxCells ?? 280000,
+  };
   const attempts = cncAttemptCount(items.length, opt.restarts ?? 8);
   const totalSteps = attempts + 1; // +1 = the consolidation step
   const idxChunks = chunk(Array.from({ length: attempts }, (_, i) => i), poolSize(attempts));
@@ -158,7 +167,7 @@ export async function packCncParallel(
           }
         } catch (err) { fail(err); }
       };
-      w.postMessage({ kind: 'cnc-passes', items, sheetW, sheetH, kerf, opt, attempts, orderingIdxs: idxs });
+      w.postMessage({ kind: 'cnc-passes', items, sheetW, sheetH, kerf, opt: wopt, attempts, orderingIdxs: idxs });
     })));
 
     // Consolidation + (save-last) compaction on one worker.
@@ -172,7 +181,7 @@ export async function packCncParallel(
           resolve(e.data.result as CncResult);
         }
       };
-      w.postMessage({ kind: 'cnc-finish', items, sheetW, sheetH, kerf, opt, winner: best! });
+      w.postMessage({ kind: 'cnc-finish', items, sheetW, sheetH, kerf, opt: wopt, winner: best! });
     });
 
     await onProgress({
