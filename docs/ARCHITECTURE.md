@@ -1,6 +1,7 @@
 # ARCHITECTURE — Data Pipeline
 
 How a dropped STEP file becomes an optimized cut plan, function by function.
+(Reader-friendly companion with diagrams: [WHITEPAPER.md](WHITEPAPER.md).)
 
 ```
 ┌──────────────┐    ┌──────────────┐    ┌──────────────┐    ┌──────────────┐
@@ -14,8 +15,8 @@ How a dropped STEP file becomes an optimized cut plan, function by function.
                                                                    │
 ┌──────────────┐    ┌──────────────┐    ┌──────────────┐    ┌──────┴───────┐
 │  PDF / DXF / │ ←  │  Cut sheet   │ ←  │  Nest        │ ←  │  Estimate    │
-│  CSV exports │    │  detail +    │    │  (multi-     │    │  button      │
-│              │    │  thumbnails  │    │   restart)   │    │              │
+│  CSV / STEP  │    │  detail +    │    │  (worker pool│    │  (+ CNC auto-│
+│  exports     │    │  join guide  │    │   multicore) │    │   split)     │
 └──────────────┘    └──────────────┘    └──────────────┘    └──────────────┘
 ```
 
@@ -42,8 +43,17 @@ For each file in order:
    `OcctResult` containing a `meshes[]` array of `OcctMesh`
    (positions, normals, triangle indices, brep-face boundaries).
 
+   Tessellation fidelity is set HERE and nowhere else: **0.1 mm absolute
+   linear deflection + 0.2 rad angular**. The importer only exposes
+   triangles (no B-spline pass-through), so this is the curve quality for
+   the whole pipeline — far inside cutting tolerance.
+
    This stage runs *after* the Z and X shifts so the rest of the
    pipeline sees the translated coordinates naturally.
+
+4. **Import progress** — `handleFiles` drives a per-file progress bar
+   (parse share, then per-body analysis), yielding to the event loop every
+   few bodies so the page stays responsive on large assemblies.
 
 ---
 
@@ -154,9 +164,38 @@ skipped.
 
 ---
 
+## Stage 4.5: CNC auto-split (optional, CNC strategies only)
+
+**Entry**: `splitOversizeParts(parts, binX, binY)` in `src/splitParts.ts`,
+called from `runEstimate` in `main.ts` BEFORE the nester sees the parts.
+
+Parts whose footprint can't fit the usable sheet at any allowed orientation
+are replaced by dovetail-jointed segments (`<id>.s<n>`):
+
+- cut perpendicular to the longest axis into the minimum number of fitting
+  pieces; recursion handles doubly-oversize parts;
+- candidate cut positions probed around the even split, scored by material
+  AREA in the joint zone (cut line + tail depth) — cuts avoid notches and
+  holes;
+- `tails = max(1, round(jointLen / 120mm))`, depth `1.5×thickness` clamped
+  [10, 30] and ≤ tail width, 9° flare; joints < 24 mm get a straight cut;
+- polygon booleans via `polygon-clipping`; pieces conserve area exactly
+  (tiny flare-tip shards at joint crossings are dropped);
+- `state.splitSegmentGeo` keeps segment geometry for the unplaced-STEP
+  export and the PDF join guide; placed segments get roman-suffixed panel
+  labels (`1a-i`) in `annotatePlacedParts`.
+
+---
+
 ## Stage 5: Nest
 
-**Entry**: `runNest(parts: NestPart[], config: NestConfig)` in `src/nest.ts`.
+**Entry**: `runNest` (sync) / `runNestAnimated` (async, used by the UI) in
+`src/nest.ts`. Both bucket by thickness, then dispatch by strategy:
+rectangle packing (`packRect.ts`) or CNC true-shape (`cncNest.ts`). The
+animated path routes through the **multicore worker pool** (`optPool.ts` →
+`optWorker.ts`), with the single-core drivers as automatic fallback.
+
+### Rectangle path (free / guillotine / save-last)
 
 1. **Bucket by thickness** at 0.5 mm tolerance. Each bucket nests
    independently into its own stack of sheets.
@@ -171,19 +210,15 @@ skipped.
    - `grain=width` → opposite.
    - `grain=free` and `mode='flip90'` → packer may flip 0/90.
 
-4. **Auto-orient sheet** — `packMulti` runs twice, once with bin =
-   `(usableW × usableL)` and once with `(usableL × usableW)`. The
-   winner (by `compareTries`: fewest unplaced → fewest sheets → tightest
-   last sheet) decides the sheet orientation for this thickness group.
-   Per-sheet `sheetW` / `sheetL` are recorded.
+4. **Sheet orientation is LOCKED landscape** — bin X = sheet length. (The
+   portrait auto-orient try was removed at user request so every document
+   shows one consistent orientation.)
 
-5. **Multi-restart packer** (`packMulti` in `src/packRect.ts`):
-   - **Phase 1** — every heuristic (BSSF, BLSF, BAF, BL) × baseline
-     area-descending order.
-   - **Phase 2** — same heuristics × longest-side-descending order.
-   - **Phase 3** — random shuffles of the baseline up to `restarts - 8`
-     iterations.
-   The best result wins by `isBetter`.
+5. **Multi-restart optimiser** (`buildTrialSchedule` + `packMulti` /
+   `packMultiParallel`): every heuristic (BSSF, BLSF, BAF, BL) × area-desc
+   and longest-side-desc orders, then seeded shuffles up to the restarts
+   budget. `seedOffset` shifts the shuffle stream for "Optimize further"
+   re-runs. The best result wins by the strategy-aware `isBetter`.
 
 6. **Per-attempt packer** (`packOne`):
    The cabinet-builder fix here is critical — when a part doesn't fit
@@ -194,16 +229,33 @@ skipped.
 
 7. **Bin packer** (cut strategy):
    - **`MaxRectsBin`** — Jukka Jylänki's maximal-rectangles algorithm.
-     Each placement splits its free rect into up to 4 sub-rects, then
-     prune dominated free rects.
-   - **`GuillotineBin`** — each placement creates exactly TWO child free
-     rects via a SAS (Shorter Axis Split). The whole layout is
-     producible with edge-to-edge cuts on a track saw or panel saw.
+   - **`ShelfBin`** — FFDH shelves; the true min-cuts strategy.
+   - (**`GuillotineBin`** — legacy SAS splitter, kept for reference.)
 
-8. **Placement → PlacedPart** — each placement is mapped back to the
-   original polygon (rotated 0° or 90° to match what the packer chose)
-   and shifted by the sheet's edge `margin`. PlacedPart carries the
-   polygon `outer + holes` for downstream SVG / DXF / PDF rendering.
+8. **Finish** (`finishPack`): `consolidateSheets` rebuilds live bins from
+   finished sheets and tries to dissolve the least-filled sheet into the
+   others' free space; save-last then corner-packs the last sheet.
+
+### CNC path (cnc / cnc-save-last) — `cncNest.ts`
+
+Raster true-shape nesting: masks per part×angle on a ~5–8 mm grid
+(conservative rasterisation from simplified rings; exact contours carried on
+the mask for output), kerf halo dilation, holes left open so parts nest
+inside them. Placement scan is heavily optimised (SAT O(1) accept/reject,
+boundary-first cells, monotonic resume cursors — 17× measured). Each pass
+= ordering × scan-direction × placement-policy (bottom-left vs
+touching-perimeter); passes fan out across workers; `finalSqueeze`
+alternates per-sheet shake with consolidation, then save-last compaction.
+"Optimize further" runs `packCncDeep` — a genetic algorithm over placement
+orders (order-crossover + swap mutation, generations evaluated in
+parallel).
+
+### Output
+
+**Placement → PlacedPart** — each placement is mapped back to the original
+polygon (rotated to match the packer) and shifted by the sheet's edge
+`margin`. PlacedPart carries the polygon `outer + holes` for downstream
+SVG / DXF / PDF rendering.
 
 Returns a `NestResult` with `groups[].sheets[].parts[]` plus aggregate
 sheet count, yield, total area, and per-sheet `largestFree` offcut.
@@ -237,10 +289,13 @@ sheet count, yield, total area, and per-sheet `largestFree` offcut.
 
 ## Stage 7: Exports
 
-### DXF (R12 ASCII)
-`sheetToDxf(sheet, opt)` in `src/dxf.ts` emits a tiny but valid DXF
-with layers SHEET / MARGIN / PARTS / LABELS / DIMS. Opens in every CAD
-tool that reads DXF.
+### DXF (STRICT R12 ASCII)
+`sheetToDxf(sheet, opt)` in `src/dxf.ts` emits strict R12 with layers
+SHEET / MARGIN / PARTS / LABELS / DIMS: classic `POLYLINE`/`VERTEX`/`SEQEND`
+(NEVER `LWPOLYLINE` — that's R14 and old waterjet importers reject the
+file), LTYPE/STYLE/BLOCKS tables, `$EXTMIN/$EXTMAX`, single `ENDSEC` per
+section. `outlinesOnly` mode emits contours only for CAM. Validate changes
+with ezdxf's strict `readfile`, not just `recover`.
 
 ### PDF report
 `buildPdf(result, opt)` in `src/pdf.ts`. Multi-page report on the
@@ -248,17 +303,36 @@ user-selected paper size:
 
 1. **Summary** — job name, sheet metrics, per-thickness breakdown,
    inventory check (from shopping list).
-2. **Parts overview** — IKEA-style grid. Each card = letter label,
-   silhouette to scale, part name, `L × W × T` dims, quantity.
-3. **One page per sheet** — sheet diagram with parts overlaid + letter
-   labels overlaid on each part centered on its bbox.
-4. **Cut instructions** — total cut count, then per sheet:
-   numbered list of rip cuts (parallel to sheet length / grain) first,
-   then crosscuts; distance from reference edge (left for rips, bottom
-   for crosscuts).
+2. **Shopping list** page.
+3. **Parts overview** — IKEA-style grid (SKIPPED in CNC mode).
+4. **One page per sheet** — sheet diagram with parts overlaid + letter
+   labels; followed by per-sheet cut-sequence cards (SKIPPED in CNC mode —
+   `opt.cnc`; a router follows contours).
+5. **Join split parts** (only when the CNC auto-split fired) — each split
+   parent drawn reassembled from its segments, labelled `i / ii / …` with
+   the sheet panel id (`1a-i`) each piece nests under (`drawSplitJoins`,
+   data from `buildSplitJoins()` in main.ts).
+6. **Per-cabinet assembly** — cover + IKEA-style step pages.
 
 Shopping list rows flow into the PDF's inventory check section as
 `InventoryCheck[]`.
+
+### STEP (unplaced parts)
+`buildStep()` in `src/stepExport.ts` — one extruded-prism solid per
+unplaced instance from its footprint outline (split segments resolve via
+`state.splitSegmentGeo`).
+
+---
+
+## "Optimize further"
+
+`#optimizeMoreBtn` re-runs `runEstimate({ seed: ++n, deepSearch: true })`:
+CNC routes to the genetic search (`packCncDeep`), saw strategies get
+doubled restarts + a fresh shuffle stream. The new result replaces
+`state.lastNest` only if strictly better (unplaced → sheets → yield);
+otherwise the previous layout is restored and the verdict shown in
+`detailSub`. Every click increments the seed — repeated clicks mine
+different regions of the search space.
 
 ---
 

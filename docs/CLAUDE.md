@@ -9,7 +9,9 @@ Quick orientation for a fresh session working on this repo.
 - **`app/`**: full Vite + TS app. All npm commands run from there.
   - `cd app && npm install && npm run dev`
   - Vite serves at `http://localhost:5173` (or next free port).
-- **`docs/`**: ARCHITECTURE.md (data pipeline), this file.
+- **`docs/`**: ARCHITECTURE.md (data pipeline, function-by-function),
+  WHITEPAPER.md (user-facing explainer with Mermaid diagrams + `img/`
+  screenshots — keep it in sync when behaviour changes), this file.
 - **`tests/`**: `visual_check.py` end-to-end Playwright pipeline + the
   gitignored `_output/` landing pad it writes to.
 
