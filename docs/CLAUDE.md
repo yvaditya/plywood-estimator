@@ -213,6 +213,19 @@ the expand state across renders.
   whole joint zone (cut line + tail depth, area-based); a cut through a
   notch/hole loses to a nearby full-material position. Don't score by
   bbox extent — L-shaped islands read as full material.
+- **CNC placement scan is heavily optimised** (`cncNest.ts`) — a 50-instance
+  dense-outline bench went 22.9s → 1.3s (17×). Three invariants keep it
+  correct; break any and you get overlaps or missed placements:
+  1. `SheetGrid.cursors` assume MONOTONIC occupancy (cells are marked, never
+     cleared). If you ever add cell clearing, cursors must be invalidated.
+  2. Mask cell lists are boundary-first for fail-fast — orderings may change,
+     but the set must stay the full solid.
+  3. Masks raster from `simplifyRing`-reduced rings (tol ≤ min(0.5, res/6));
+     placements/exports keep the EXACT rings carried on the Mask. Don't put
+     simplified rings into `Mask.outer/holes`.
+  GPU (WebGPU) was evaluated and rejected: each placement mutates the grid,
+  so per-placement GPU readback latency eats the parallel gain; cross-pass
+  parallelism is already covered by the worker pool.
 
 ## UI rules from the user (don't violate without asking)
 - Notion-style **light theme** for the chrome; 3D viewer is intentionally

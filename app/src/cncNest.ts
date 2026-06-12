@@ -155,6 +155,55 @@ interface Mask {
   h: number;
 }
 
+/**
+ * Douglas-Peucker simplification of a CLOSED ring. Used ONLY for the raster
+ * masks — placements and exports keep the exact fine-tessellated contour
+ * (low-quality polylines for optimisation, full quality in the result). At a
+ * ~5–8 mm cell size a 0.1 mm-faithful outline is wasted precision: the
+ * conservative rasteriser swallows deviations far below one cell anyway.
+ */
+function simplifyRing(ring: Vec2[], tol: number): Vec2[] {
+  const n = ring.length;
+  if (tol <= 0 || n <= 16) return ring;
+  const keep = new Uint8Array(n);
+  // Anchor at two extreme points so the closed ring becomes two open chains.
+  let iMin = 0, iMax = 0;
+  for (let i = 1; i < n; i++) {
+    if (ring[i][0] < ring[iMin][0]) iMin = i;
+    if (ring[i][0] > ring[iMax][0]) iMax = i;
+  }
+  if (iMin === iMax) return ring; // degenerate
+  keep[iMin] = keep[iMax] = 1;
+  const tol2 = tol * tol;
+  // Iterative DP over the index range [a..b] (wrapping), stack-based.
+  const stack: [number, number][] = [[iMin, iMax], [iMax, iMin + n]];
+  while (stack.length) {
+    const [a, b] = stack.pop()!;
+    if (b - a < 2) continue;
+    const [ax, ay] = ring[a % n];
+    const [bx, by] = ring[b % n];
+    const dx = bx - ax, dy = by - ay;
+    const len2 = dx * dx + dy * dy || 1e-12;
+    let worst = -1, worstD = tol2;
+    for (let i = a + 1; i < b; i++) {
+      const [px, py] = ring[i % n];
+      // Perpendicular distance² from the chord (segment-clamped).
+      let t = ((px - ax) * dx + (py - ay) * dy) / len2;
+      t = t < 0 ? 0 : t > 1 ? 1 : t;
+      const ex = px - (ax + t * dx), ey = py - (ay + t * dy);
+      const d2 = ex * ex + ey * ey;
+      if (d2 > worstD) { worstD = d2; worst = i; }
+    }
+    if (worst >= 0) {
+      keep[worst % n] = 1;
+      stack.push([a, worst], [worst, b]);
+    }
+  }
+  const out: Vec2[] = [];
+  for (let i = 0; i < n; i++) if (keep[i]) out.push(ring[i]);
+  return out.length >= 3 ? out : ring;
+}
+
 /** Even-odd scanline: sorted x-intersections of (rings) at height py. */
 function scanlineX(rings: Vec2[][], py: number): number[] {
   const xs: number[] = [];
@@ -215,13 +264,31 @@ function rasterSolid(outer: Vec2[], holes: Vec2[][], res: number, sw: number, sh
 function buildMask(outer: Vec2[], holes: Vec2[][], w: number, h: number, res: number, pad: number): Mask {
   const sw = Math.max(1, Math.ceil(w / res));
   const sh = Math.max(1, Math.ceil(h / res));
-  const solid = rasterSolid(outer, holes, res, sw, sh);
+  // Raster from a simplified copy of the rings: collision quality is bounded
+  // by the cell size, not the curve tessellation. The EXACT rings still go
+  // into the returned Mask (and from there into placements / exports).
+  const tol = Math.min(0.5, res / 6);
+  const sOuter = simplifyRing(outer, tol);
+  const sHoles = holes.map((hh) => simplifyRing(hh, tol));
+  const solid = rasterSolid(sOuter, sHoles, res, sw, sh);
 
-  // Solid offsets (collision/placement).
+  // Solid offsets (collision/placement), BOUNDARY cells first: a collision
+  // almost always shows up at the mask's rim, so testing rim cells first
+  // lets findBottomLeft reject crowded positions in a handful of probes.
   const cells: number[] = [];
-  for (let cy = 0; cy < sh; cy++)
-    for (let cx = 0; cx < sw; cx++)
-      if (solid[cy * sw + cx]) cells.push(cx, cy);
+  const inner: number[] = [];
+  for (let cy = 0; cy < sh; cy++) {
+    for (let cx = 0; cx < sw; cx++) {
+      if (!solid[cy * sw + cx]) continue;
+      const isRim =
+        cx === 0 || cx === sw - 1 || cy === 0 || cy === sh - 1 ||
+        !solid[cy * sw + cx - 1] || !solid[cy * sw + cx + 1] ||
+        !solid[(cy - 1) * sw + cx] || !solid[(cy + 1) * sw + cx];
+      if (isRim) cells.push(cx, cy);
+      else inner.push(cx, cy);
+    }
+  }
+  for (let i = 0; i < inner.length; i++) cells.push(inner[i]);
 
   // Mark offsets (solid dilated by the kerf halo), relative to the solid origin.
   let markCells: number[];
@@ -302,12 +369,24 @@ class SheetGrid {
   /** Free cell count. */
   freeCells(): number { return this.gw * this.gh - this.occupiedCount; }
 
+  /**
+   * Scan-resume cursors, keyed by mask identity + scan order. Occupancy is
+   * MONOTONIC — cells are only ever marked, never cleared — so once a scan
+   * position is proven infeasible for a given mask it stays infeasible for
+   * the life of this grid. The cursor records how many scan positions are
+   * already disproven; the next search for the same mask resumes there.
+   * Duplicate instances of a part (the common "qty" case) each skip all the
+   * scanning their predecessors already paid for.
+   */
+  private cursors = new Map<string, number>();
+
   /** Deep copy (occupancy only; SAT is rebuilt lazily on first query). */
   clone(): SheetGrid {
     const g = new SheetGrid(this.gw, this.gh);
     g.occ.set(this.occ);
     g.occupiedCount = this.occupiedCount;
     g.dirty = true;
+    g.cursors = new Map(this.cursors);
     return g;
   }
 
@@ -344,34 +423,54 @@ class SheetGrid {
    * Scan order: bottom-first (lowest gy, then gx) by default, or left-first
    * (lowest gx, then gy) when `leftFirst` — the two orders produce different
    * layouts, which the multi-restart optimiser exploits.
+   *
+   * `key` (mask identity, e.g. 'geo@deg') enables the monotonic resume
+   * cursor: scanning restarts where the previous search for the same mask
+   * left off instead of at the origin. Pass a stable key or omit for a full
+   * scan. Per position the test is: O(1) accept (window empty), O(1) reject
+   * (window has fewer free cells than the mask needs), else the cell loop —
+   * whose boundary-first ordering fails fast on partial overlaps.
    */
-  findBottomLeft(mask: Mask, leftFirst = false): { gx: number; gy: number } | null {
+  findBottomLeft(mask: Mask, leftFirst = false, key?: string): { gx: number; gy: number } | null {
     const { gw, gh, occ } = this;
     const { mw, mh, cells } = mask;
     if (mw > gw || mh > gh) return null;
     const maxY = gh - mh;
     const maxX = gw - mw;
+    const need = cells.length / 2;
+    const winArea = mw * mh;
     const fits = (gx: number, gy: number): boolean => {
-      // O(1) accept: if the whole window is empty, the mask fits.
-      if (this.windowSum(gx, gy, gx + mw, gy + mh) === 0) return true;
+      const occupied = this.windowSum(gx, gy, gx + mw, gy + mh);
+      // O(1) accept: the whole window is empty.
+      if (occupied === 0) return true;
+      // O(1) reject: not enough free cells left in the window.
+      if (winArea - occupied < need) return false;
       for (let i = 0; i < cells.length; i += 2) {
         if (occ[(gy + cells[i + 1]) * gw + (gx + cells[i])]) return false;
       }
       return true;
     };
-    if (leftFirst) {
-      for (let gx = 0; gx <= maxX; gx++) {
-        for (let gy = 0; gy <= maxY; gy++) {
-          if (fits(gx, gy)) return { gx, gy };
-        }
-      }
-    } else {
-      for (let gy = 0; gy <= maxY; gy++) {
-        for (let gx = 0; gx <= maxX; gx++) {
-          if (fits(gx, gy)) return { gx, gy };
-        }
+
+    // Resume after the last infeasible prefix for this mask + scan order.
+    const ck = key ? `${key}${leftFirst ? '|L' : '|B'}` : null;
+    const start = ck ? (this.cursors.get(ck) ?? 0) : 0;
+    const innerMax = leftFirst ? maxY : maxX;
+    const rowLen = innerMax + 1;
+    const total = (leftFirst ? maxX + 1 : maxY + 1) * rowLen;
+
+    for (let i = start; i < total; i++) {
+      const outer = (i / rowLen) | 0;
+      const inner = i - outer * rowLen;
+      const gx = leftFirst ? outer : inner;
+      const gy = leftFirst ? inner : outer;
+      if (fits(gx, gy)) {
+        // Position i is now about to be occupied by this very part, so the
+        // NEXT search may still start here — it will fail fast and move on.
+        if (ck) this.cursors.set(ck, i);
+        return { gx, gy };
       }
     }
+    if (ck) this.cursors.set(ck, total);
     return null;
   }
 
@@ -478,7 +577,7 @@ function placeOnSheet(live: LiveSheet, it: CncInput, getMask: MaskFn, res: numbe
   for (const deg of it.angles) {
     const mask = getMask(it, deg);
     if (mask.cells.length / 2 > free) continue; // can't possibly fit — skip cheaply
-    const spot = live.grid.findBottomLeft(mask, leftFirst);
+    const spot = live.grid.findBottomLeft(mask, leftFirst, `${it.geoKey}@${deg}`);
     if (!spot) continue;
     const better = !best || (leftFirst
       ? (spot.gx < best.gx || (spot.gx === best.gx && spot.gy < best.gy))
