@@ -1086,14 +1086,16 @@ function consolidateSheets(result: MultiSheetResult, job: PackJob): MultiSheetRe
  */
 export interface PackTrial { order: PackInput[]; heur: Heuristic }
 
-export function buildTrialSchedule(job: PackJob, restarts: number): PackTrial[] {
+export function buildTrialSchedule(job: PackJob, restarts: number, seedOffset = 0): PackTrial[] {
   const heuristics: Heuristic[] = ['BSSF', 'BLSF', 'BAF', 'BL'];
   const baseline = job.items.slice().sort((a, b) => b.w * b.h - a.w * a.h);
   const bySide = job.items.slice().sort((a, b) => Math.max(b.w, b.h) - Math.max(a.w, a.h));
   const trials: PackTrial[] = [];
   for (const h of heuristics) trials.push({ order: baseline, heur: h });
   for (const h of heuristics) trials.push({ order: bySide, heur: h });
-  let seed = 0x9e3779b1;
+  // `seedOffset` shifts the shuffle stream so an "Optimize further" re-run
+  // explores NEW orderings rather than repeating the canonical search.
+  let seed = (0x9e3779b1 ^ Math.imul(seedOffset + 1, 0x85ebca6b)) >>> 0;
   const rand = () => { seed = (seed * 1664525 + 1013904223) >>> 0; return seed / 0xffffffff; };
   const phase3 = Math.max(0, restarts - heuristics.length * 2);
   for (let i = 0; i < phase3; i++) {
@@ -1169,10 +1171,11 @@ export async function packMultiAnimated(
   restarts: number,
   onProgress: (p: PackProgress) => void | Promise<void>,
   yieldEvery = 4,
+  seedOffset = 0,
 ): Promise<MultiSheetResult> {
   const optJob = effectiveJob(job);
   const objectiveStrategy: CutStrategy = job.cutStrategy ?? 'free';
-  const trials = buildTrialSchedule(job, restarts);
+  const trials = buildTrialSchedule(job, restarts, seedOffset);
 
   const total = trials.length;
   let best: MultiSheetResult | null = null;

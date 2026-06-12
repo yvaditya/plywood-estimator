@@ -12,7 +12,15 @@
  */
 
 import { packOne, type PackJob, type PackInput, type Heuristic } from './packRect';
-import { cncRunPasses, cncFinish, type CncInput, type CncOptions, type CncSerialPass } from './cncNest';
+import {
+  cncRunPasses,
+  cncRunExplicitOrders,
+  cncFinish,
+  type CncInput,
+  type CncOptions,
+  type CncSerialPass,
+  type CncOrderSpec,
+} from './cncNest';
 
 export interface RectJobMsg {
   kind: 'rect';
@@ -29,6 +37,15 @@ export interface CncPassesMsg {
   attempts: number;
   orderingIdxs: number[];
 }
+export interface CncOrdersMsg {
+  kind: 'cnc-orders';
+  items: CncInput[];
+  sheetW: number;
+  sheetH: number;
+  kerf: number;
+  opt: CncOptions;
+  orders: CncOrderSpec[];
+}
 export interface CncFinishMsg {
   kind: 'cnc-finish';
   items: CncInput[];
@@ -38,7 +55,7 @@ export interface CncFinishMsg {
   opt: CncOptions;
   winner: CncSerialPass;
 }
-export type OptWorkerMsg = RectJobMsg | CncPassesMsg | CncFinishMsg;
+export type OptWorkerMsg = RectJobMsg | CncPassesMsg | CncOrdersMsg | CncFinishMsg;
 
 self.onmessage = (e: MessageEvent<OptWorkerMsg>) => {
   const msg = e.data;
@@ -53,6 +70,12 @@ self.onmessage = (e: MessageEvent<OptWorkerMsg>) => {
   } else if (msg.kind === 'cnc-passes') {
     cncRunPasses(
       msg.items, msg.sheetW, msg.sheetH, msg.kerf, msg.opt, msg.attempts, msg.orderingIdxs,
+      (idx, pass) => self.postMessage({ kind: 'cnc-pass', idx, pass }),
+    );
+    self.postMessage({ kind: 'done' });
+  } else if (msg.kind === 'cnc-orders') {
+    cncRunExplicitOrders(
+      msg.items, msg.sheetW, msg.sheetH, msg.kerf, msg.opt, msg.orders,
       (idx, pass) => self.postMessage({ kind: 'cnc-pass', idx, pass }),
     );
     self.postMessage({ kind: 'done' });

@@ -226,6 +226,23 @@ the expand state across renders.
   GPU (WebGPU) was evaluated and rejected: each placement mutates the grid,
   so per-placement GPU readback latency eats the parallel gain; cross-pass
   parallelism is already covered by the worker pool.
+- **CNC densification** (cncNest.ts): every ordering runs under BOTH
+  placement policies — bottom-left-fill AND touching-perimeter ('contact':
+  pick among ~5 frontier candidates by mask-fringe contact with stock/
+  edges). The post-search `finalSqueeze` alternates per-sheet shake
+  (re-pack each sheet's own parts toward the origin) with consolidation —
+  this combination is what dissolves under-filled sheets (bench: a job
+  stuck at 3 sheets through every earlier change packs in 2). Don't strip
+  either policy or the shake.
+- **"Optimize further" button** (`#optimizeMoreBtn`, main.ts): re-runs the
+  estimate with `deepSearch` + an incrementing `seed`, keeps the new layout
+  ONLY if it beats the current one (unplaced → sheets → yield), else
+  restores and says so. CNC deepSearch routes to `packCncDeep` (optPool.ts)
+  — a Deepnest-style genetic algorithm: genome = placement order + scan
+  direction + placement policy, order-crossover + adjacent-swap mutation,
+  generations evaluated in parallel via 'cnc-orders' worker jobs. Saw
+  strategies get doubled restarts + a fresh shuffle stream (seedOffset in
+  buildTrialSchedule). Every click mines a different seed.
 
 ## UI rules from the user (don't violate without asking)
 - Notion-style **light theme** for the chrome; 3D viewer is intentionally

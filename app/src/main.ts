@@ -168,6 +168,7 @@ const resultsEmpty = $('resultsEmpty');
 const resultsDetail = $('resultsDetail');
 const detailTitle = $('detailTitle');
 const replayBtn = $<HTMLButtonElement>('replayBtn');
+const optimizeMoreBtn = $<HTMLButtonElement>('optimizeMoreBtn');
 const convergenceChart = $('convergenceChart');
 const detailSub = $('detailSub');
 const detailSvg = $('detailSvg');
@@ -939,7 +940,12 @@ renderShoppingList();
 // --------------------------------------------------------------------------
 // Nesting + results
 // --------------------------------------------------------------------------
-nestBtn.addEventListener('click', async () => {
+/**
+ * Run one estimate. `deepSearch` + `seed` drive the "Optimize further"
+ * button: a deeper search (GA over placement orders for CNC, fresh shuffle
+ * stream for the saw strategies) seeded differently on every click.
+ */
+async function runEstimate(opts: { seed?: number; deepSearch?: boolean } = {}) {
   const selected = state.bodies.filter((b) => b.selected);
   if (selected.length === 0) return;
   const sheetW = toMm(parseFloat(sheetWInput.value), state.units);
@@ -996,8 +1002,10 @@ nestBtn.addEventListener('click', async () => {
     const result = await runNestAnimated(nestParts, {
       sheetW, sheetL, margin, kerf,
       resolution: estimateResolution(sheetW, sheetL),
-      restarts,
+      restarts: opts.deepSearch ? restarts * 2 : restarts,
       cutStrategy: strategy,
+      seed: opts.seed,
+      deepSearch: opts.deepSearch,
     }, async (info) => {
       const pct = ((info.trial + 1) / info.totalTrials) * 100;
       // CNC reports optimiser passes (orderings + consolidation), not saw trials.
@@ -1053,8 +1061,56 @@ nestBtn.addEventListener('click', async () => {
   } finally {
     nestBtn.disabled = false;
     nestBtn.textContent = 'Estimate cut sheets';
+    optimizeMoreBtn.disabled = !state.lastNest;
+  }
+}
+
+nestBtn.addEventListener('click', () => runEstimate());
+
+// "Optimize further": a deeper, differently-seeded search that only
+// replaces the current layout when it actually beats it. Every click
+// explores a NEW region of the search space (incrementing seed), so
+// repeated clicks keep mining.
+let optimizeSeed = 0;
+optimizeMoreBtn.addEventListener('click', async () => {
+  if (!state.lastNest || nestBtn.disabled) return;
+  const prev = {
+    nest: state.lastNest,
+    labels: state.partLabels,
+    sheetKey: state.currentSheetKey,
+  };
+  const prevUnplaced = totalUnplacedOf(prev.nest);
+  optimizeMoreBtn.disabled = true;
+  await runEstimate({ seed: ++optimizeSeed, deepSearch: true });
+  const next = state.lastNest;
+  if (!next || next === prev.nest) return; // estimate failed — nothing to compare
+  const better =
+    totalUnplacedOf(next) < prevUnplaced ||
+    (totalUnplacedOf(next) === prevUnplaced && (
+      next.totalSheets < prev.nest.totalSheets ||
+      (next.totalSheets === prev.nest.totalSheets && next.yield > prev.nest.yield + 1e-9)));
+  if (better) {
+    const sheetsMsg = next.totalSheets < prev.nest.totalSheets
+      ? `${prev.nest.totalSheets} → ${next.totalSheets} sheets`
+      : `yield ${(prev.nest.yield * 100).toFixed(1)}% → ${(next.yield * 100).toFixed(1)}%`;
+    detailSub.textContent = `Improved: ${sheetsMsg}`;
+  } else {
+    // Restore the previous (better or equal) layout.
+    state.lastNest = prev.nest;
+    state.partLabels = prev.labels;
+    state.currentSheetKey = prev.sheetKey;
+    state.lastTrialFrames = [];
+    state.lastTrialMetrics = [];
+    renderResults();
+    renderConvergenceChart();
+    replayBtn.disabled = true;
+    detailSub.textContent = 'No improvement found — kept the current layout. Click again to search elsewhere.';
   }
 });
+
+function totalUnplacedOf(r: NestResult): number {
+  return r.groups.reduce((s, g) => s + g.unplaced.length, 0);
+}
 
 // Replay button: animate the captured trial sequence at 25 fps. While the
 // replay runs, the button toggles to "stop" and the final state is restored

@@ -147,6 +147,11 @@ interface Mask {
    *  negative). Marked occupied when the part is placed so the NEXT part keeps
    *  a kerf gap; clipped at the sheet edge by the grid. */
   markCells: Int32Array;
+  /** Offsets of cells just OUTSIDE the solid (its 4-neighbour fringe, may be
+   *  negative / beyond mw,mh). Used by the touching-perimeter placement
+   *  score: a fringe cell landing on occupied stock or past the sheet edge
+   *  counts as contact. */
+  rim: Int32Array;
   /** Rotated+anchored polygon for this angle (origin at 0,0). */
   outer: Vec2[];
   holes: Vec2[][];
@@ -275,20 +280,33 @@ function buildMask(outer: Vec2[], holes: Vec2[][], w: number, h: number, res: nu
   // Solid offsets (collision/placement), BOUNDARY cells first: a collision
   // almost always shows up at the mask's rim, so testing rim cells first
   // lets findBottomLeft reject crowded positions in a handful of probes.
+  // The outward 4-neighbour fringe is collected alongside for the
+  // touching-perimeter score.
   const cells: number[] = [];
   const inner: number[] = [];
+  const fringe = new Set<number>();
+  const solidAt = (cx: number, cy: number) =>
+    cx >= 0 && cx < sw && cy >= 0 && cy < sh && solid[cy * sw + cx] === 1;
   for (let cy = 0; cy < sh; cy++) {
     for (let cx = 0; cx < sw; cx++) {
       if (!solid[cy * sw + cx]) continue;
-      const isRim =
-        cx === 0 || cx === sw - 1 || cy === 0 || cy === sh - 1 ||
-        !solid[cy * sw + cx - 1] || !solid[cy * sw + cx + 1] ||
-        !solid[(cy - 1) * sw + cx] || !solid[(cy + 1) * sw + cx];
+      let isRim = false;
+      for (const [dx, dy] of [[-1, 0], [1, 0], [0, -1], [0, 1]] as const) {
+        if (!solidAt(cx + dx, cy + dy)) {
+          isRim = true;
+          // Key with an offset so negative coords pack into one integer.
+          fringe.add((cy + dy + 2) * (sw + 4) + (cx + dx + 2));
+        }
+      }
       if (isRim) cells.push(cx, cy);
       else inner.push(cx, cy);
     }
   }
   for (let i = 0; i < inner.length; i++) cells.push(inner[i]);
+  const rim: number[] = [];
+  for (const k of fringe) {
+    rim.push((k % (sw + 4)) - 2, Math.floor(k / (sw + 4)) - 2);
+  }
 
   // Mark offsets (solid dilated by the kerf halo), relative to the solid origin.
   let markCells: number[];
@@ -312,6 +330,7 @@ function buildMask(outer: Vec2[], holes: Vec2[][], w: number, h: number, res: nu
     mw: sw,
     mh: sh,
     markCells: markCells === cells ? Int32Array.from(cells) : Int32Array.from(markCells),
+    rim: Int32Array.from(rim),
     outer, holes, w, h,
   };
 }
@@ -432,9 +451,28 @@ class SheetGrid {
    * whose boundary-first ordering fails fast on partial overlaps.
    */
   findBottomLeft(mask: Mask, leftFirst = false, key?: string): { gx: number; gy: number } | null {
+    const c = this.findCandidates(mask, leftFirst, key, 1, 0);
+    return c.length > 0 ? { gx: c[0].gx, gy: c[0].gy } : null;
+  }
+
+  /**
+   * Collect up to `maxCand` feasible positions in scan order: the first
+   * feasible one, plus any others found within `horizonRows` further
+   * rows/columns of the scan. The cursor still records only the PROVEN
+   * infeasible prefix (everything before the first feasible position), so
+   * resume semantics stay sound regardless of which candidate the caller
+   * commits.
+   */
+  findCandidates(
+    mask: Mask,
+    leftFirst: boolean,
+    key: string | undefined,
+    maxCand: number,
+    horizonRows: number,
+  ): { gx: number; gy: number; i: number }[] {
     const { gw, gh, occ } = this;
     const { mw, mh, cells } = mask;
-    if (mw > gw || mh > gh) return null;
+    if (mw > gw || mh > gh) return [];
     const maxY = gh - mh;
     const maxX = gw - mw;
     const need = cells.length / 2;
@@ -458,20 +496,44 @@ class SheetGrid {
     const rowLen = innerMax + 1;
     const total = (leftFirst ? maxX + 1 : maxY + 1) * rowLen;
 
-    for (let i = start; i < total; i++) {
+    const out: { gx: number; gy: number; i: number }[] = [];
+    let stop = total;
+    for (let i = start; i < stop; i++) {
       const outer = (i / rowLen) | 0;
       const inner = i - outer * rowLen;
       const gx = leftFirst ? outer : inner;
       const gy = leftFirst ? inner : outer;
       if (fits(gx, gy)) {
-        // Position i is now about to be occupied by this very part, so the
-        // NEXT search may still start here — it will fail fast and move on.
-        if (ck) this.cursors.set(ck, i);
-        return { gx, gy };
+        if (out.length === 0) {
+          // Position i may be occupied by this very part next — the NEXT
+          // search starts here, fails fast on it and moves on.
+          if (ck) this.cursors.set(ck, i);
+          stop = Math.min(total, i + horizonRows * rowLen + 1);
+        }
+        out.push({ gx, gy, i });
+        if (out.length >= maxCand) return out;
       }
     }
-    if (ck) this.cursors.set(ck, total);
-    return null;
+    if (out.length === 0 && ck) this.cursors.set(ck, total);
+    return out;
+  }
+
+  /**
+   * Touching-perimeter score for a mask at (gx,gy): how many of the mask's
+   * outward fringe cells land on occupied stock or past the sheet edge.
+   * Higher = the part nests snugly against neighbours/edges instead of
+   * leaving slivers of unusable space around it.
+   */
+  contactScore(mask: Mask, gx: number, gy: number): number {
+    const { gw, gh, occ } = this;
+    const { rim } = mask;
+    let score = 0;
+    for (let i = 0; i < rim.length; i += 2) {
+      const x = gx + rim[i];
+      const y = gy + rim[i + 1];
+      if (x < 0 || x >= gw || y < 0 || y >= gh || occ[y * gw + x]) score++;
+    }
+    return score;
   }
 
   /** Mark a placed part (solid + kerf halo) as occupied, clipped at the edges. */
@@ -535,6 +597,11 @@ export interface CncOptions {
    * into one corner so the remaining material is a clean reusable offcut.
    */
   saveLast?: boolean;
+  /** Varies the shuffle stream + pass order so a re-run ("Optimize further")
+   *  explores NEW orderings. 0 / undefined = the canonical deterministic run. */
+  seed?: number;
+  /** Doubles the attempt caps — used by "Optimize further" deep searches. */
+  extraEffort?: boolean;
 }
 
 function chooseResolution(sheetW: number, sheetH: number, opt: CncOptions): number {
@@ -570,21 +637,47 @@ function cloneLive(s: LiveSheet): LiveSheet {
   return { grid: s.grid.clone(), placements: s.placements.slice(), usedArea: s.usedArea };
 }
 
-/** Place one item on a sheet at its best (lowest) feasible angle + position. */
-function placeOnSheet(live: LiveSheet, it: CncInput, getMask: MaskFn, res: number, leftFirst: boolean): boolean {
-  let best: { mask: Mask; gx: number; gy: number; deg: number } | null = null;
+/**
+ * Place one item on a sheet. Two placement policies:
+ *   - bottom-left (default): first feasible position in scan order, lowest
+ *     across all angles — the classic raster BLF.
+ *   - touching-perimeter (`contact`): collect a few feasible candidates per
+ *     angle near the scan frontier and commit the one with the highest
+ *     contact score (mask fringe against stock/edges). Trades a bit of
+ *     "lowness" for snugness — fewer unusable slivers between parts.
+ */
+function placeOnSheet(
+  live: LiveSheet,
+  it: CncInput,
+  getMask: MaskFn,
+  res: number,
+  leftFirst: boolean,
+  contact = false,
+): boolean {
+  let best: { mask: Mask; gx: number; gy: number; deg: number; score: number; i: number } | null = null;
   const free = live.grid.freeCells();
   for (const deg of it.angles) {
     const mask = getMask(it, deg);
     if (mask.cells.length / 2 > free) continue; // can't possibly fit — skip cheaply
-    const spot = live.grid.findBottomLeft(mask, leftFirst, `${it.geoKey}@${deg}`);
-    if (!spot) continue;
-    const better = !best || (leftFirst
-      ? (spot.gx < best.gx || (spot.gx === best.gx && spot.gy < best.gy))
-      : (spot.gy < best.gy || (spot.gy === best.gy && spot.gx < best.gx)));
-    if (better) {
-      best = { mask, gx: spot.gx, gy: spot.gy, deg };
-      if (spot.gx === 0 && spot.gy === 0) break; // origin — can't do better
+    const key = `${it.geoKey}@${deg}`;
+    if (contact) {
+      const cands = live.grid.findCandidates(mask, leftFirst, key, 5, 2);
+      for (const c of cands) {
+        const score = live.grid.contactScore(mask, c.gx, c.gy);
+        if (!best || score > best.score || (score === best.score && c.i < best.i)) {
+          best = { mask, gx: c.gx, gy: c.gy, deg, score, i: c.i };
+        }
+      }
+    } else {
+      const spot = live.grid.findBottomLeft(mask, leftFirst, key);
+      if (!spot) continue;
+      const better = !best || (leftFirst
+        ? (spot.gx < best.gx || (spot.gx === best.gx && spot.gy < best.gy))
+        : (spot.gy < best.gy || (spot.gy === best.gy && spot.gx < best.gx)));
+      if (better) {
+        best = { mask, gx: spot.gx, gy: spot.gy, deg, score: 0, i: 0 };
+        if (spot.gx === 0 && spot.gy === 0) break; // origin — can't do better
+      }
     }
   }
   if (!best) return false;
@@ -601,17 +694,25 @@ function placeOnSheet(live: LiveSheet, it: CncInput, getMask: MaskFn, res: numbe
 
 /** One full greedy pass over a given order. First-fit across existing sheets
  *  (oldest first, so earlier sheets fill before new stock opens). */
-function runPass(order: CncInput[], gw: number, gh: number, getMask: MaskFn, res: number, leftFirst: boolean): PassResult {
+function runPass(
+  order: CncInput[],
+  gw: number,
+  gh: number,
+  getMask: MaskFn,
+  res: number,
+  leftFirst: boolean,
+  contact = false,
+): PassResult {
   const lives: LiveSheet[] = [];
   const unplaced: string[] = [];
   for (const it of order) {
     let done = false;
     for (const live of lives) {
-      if (placeOnSheet(live, it, getMask, res, leftFirst)) { done = true; break; }
+      if (placeOnSheet(live, it, getMask, res, leftFirst, contact)) { done = true; break; }
     }
     if (!done) {
       const live: LiveSheet = { grid: new SheetGrid(gw, gh), placements: [], usedArea: 0 };
-      if (placeOnSheet(live, it, getMask, res, leftFirst)) lives.push(live);
+      if (placeOnSheet(live, it, getMask, res, leftFirst, contact)) lives.push(live);
       else unplaced.push(it.id);
     }
   }
@@ -710,6 +811,64 @@ function consolidate(lives: LiveSheet[], getMask: MaskFn, res: number, byId: Map
  * remaining material as a single clean offcut. Only mutates that one sheet and
  * only if every part still fits; otherwise the original layout is kept.
  */
+/**
+ * "Shake" defragmentation: re-pack EVERY sheet's own parts from scratch
+ * (largest first, bottom-left) so each layout compacts toward the origin.
+ * Pockets and slivers scattered by greedy insertion merge into one
+ * contiguous free region per sheet — which is exactly what the following
+ * consolidation round needs to dissolve an under-filled sheet. A sheet
+ * whose re-pack fails (rare: BL ordering differs) keeps its layout.
+ */
+function shakeSheets(
+  lives: LiveSheet[],
+  gw: number,
+  gh: number,
+  getMask: MaskFn,
+  res: number,
+  byId: Map<string, CncInput>,
+): LiveSheet[] {
+  return lives.map((live) => {
+    const parts = live.placements.slice().sort((a, b) => b.area - a.area);
+    const fresh: LiveSheet = { grid: new SheetGrid(gw, gh), placements: [], usedArea: 0 };
+    for (const p of parts) {
+      const it = byId.get(p.id);
+      if (!it || !placeOnSheet(fresh, it, getMask, res, false)) return live;
+    }
+    return fresh;
+  });
+}
+
+/**
+ * Post-search squeeze shared by the generator and the worker-pool finisher:
+ * alternate shake (per-sheet defrag) and consolidation (dissolve the
+ * least-filled sheet into the others) until neither changes the sheet
+ * count, then optionally corner-pack the last sheet for save-last.
+ */
+function finalSqueeze(
+  lives: LiveSheet[],
+  gw: number,
+  gh: number,
+  getMask: MaskFn,
+  res: number,
+  byId: Map<string, CncInput>,
+  saveLast: boolean,
+): LiveSheet[] {
+  let working = consolidate(lives, getMask, res, byId);
+  for (let round = 0; round < 2; round++) {
+    const shaken = shakeSheets(working, gw, gh, getMask, res, byId);
+    const after = consolidate(shaken, getMask, res, byId);
+    if (after.length >= working.length) {
+      // No sheet saved this round. Keep the shaken layout only if it kept
+      // the same count (it's denser per sheet); then stop.
+      if (after.length === working.length) working = after;
+      break;
+    }
+    working = after;
+  }
+  if (saveLast) working = compactLastSheet(working, gw, gh, getMask, res, byId);
+  return working;
+}
+
 function compactLastSheet(
   lives: LiveSheet[], gw: number, gh: number, getMask: MaskFn, res: number, byId: Map<string, CncInput>,
 ): LiveSheet[] {
@@ -736,8 +895,12 @@ function bbox0(outer: Vec2[]): { w: number; h: number } {
   return { w: maxX - minX, h: maxY - minY };
 }
 
-/** Candidate (ordering × scan-direction) restarts, capped to `passes`. */
-function buildOrderings(items: CncInput[], passes: number): { order: CncInput[]; leftFirst: boolean }[] {
+interface Ordering { order: CncInput[]; leftFirst: boolean; contact: boolean }
+
+/** Candidate (ordering × scan-direction × placement-policy) restarts, capped
+ *  to `passes`. `seed` varies the shuffle stream so a re-run ("Optimize
+ *  further") explores NEW orderings instead of repeating the same search. */
+function buildOrderings(items: CncInput[], passes: number, seed = 0): Ordering[] {
   const dims = new Map<string, { w: number; h: number }>();
   for (const it of items) if (!dims.has(it.geoKey)) dims.set(it.geoKey, bbox0(it.outer));
   const d = (it: CncInput) => dims.get(it.geoKey)!;
@@ -762,7 +925,7 @@ function buildOrderings(items: CncInput[], passes: number): { order: CncInput[];
     return mixed;
   };
 
-  const out: { order: CncInput[]; leftFirst: boolean }[] = [
+  const base: { order: CncInput[]; leftFirst: boolean }[] = [
     { order: sorted(byArea), leftFirst: false },
     { order: sorted(byArea), leftFirst: true },
     { order: sorted(byLong), leftFirst: false },
@@ -776,13 +939,28 @@ function buildOrderings(items: CncInput[], passes: number): { order: CncInput[];
     { order: sorted(byPerim), leftFirst: true },
     { order: sorted(byShort), leftFirst: true },
   ];
-  // Deterministic shuffles fill any remaining budget (reproducible runs).
-  let seed = 0x9e3779b1;
-  const rand = () => { seed = (seed * 1664525 + 1013904223) >>> 0; return seed / 0xffffffff; };
+  // Every base entry runs under BOTH placement policies: bottom-left-fill
+  // and touching-perimeter. Neither dominates — BL wins on rectangular
+  // mixes, contact wins when irregular parts leave pockets.
+  const out: Ordering[] = [];
+  for (const b of base) out.push({ ...b, contact: false });
+  for (const b of base) out.push({ ...b, contact: true });
+  // Deterministic shuffles fill any remaining budget (reproducible runs;
+  // `seed` shifts the stream for re-runs).
+  let s = (0x9e3779b1 ^ Math.imul(seed + 1, 0x85ebca6b)) >>> 0;
+  const rand = () => { s = (s * 1664525 + 1013904223) >>> 0; return s / 0xffffffff; };
   while (out.length < passes) {
     const sh = sorted(byArea);
     for (let k = sh.length - 1; k > 0; k--) { const j = Math.floor(rand() * (k + 1)); [sh[k], sh[j]] = [sh[j], sh[k]]; }
-    out.push({ order: sh, leftFirst: out.length % 2 === 1 });
+    out.push({ order: sh, leftFirst: out.length % 2 === 1, contact: out.length % 4 >= 2 });
+  }
+  // A nonzero seed ALSO reorders the deterministic prefix so a re-run's
+  // budget isn't spent on the exact same passes.
+  if (seed !== 0) {
+    for (let k = out.length - 1; k > 0; k--) {
+      const j = Math.floor(rand() * (k + 1));
+      [out[k], out[j]] = [out[j], out[k]];
+    }
   }
   return out.slice(0, Math.max(1, passes));
 }
@@ -803,11 +981,12 @@ function livesToSheets(lives: LiveSheet[], res: number, withFree: boolean): CncS
  *  worker pool so both build the SAME deterministic ordering list. The caps
  *  assume the multicore pool (optPool.ts) — the sequential generator also
  *  carries a hard wall-clock budget that bails out of excess passes. */
-export function cncAttemptCount(nItems: number, restarts: number): number {
-  const cap = nItems <= 12 ? 96 : nItems <= 25 ? 48 : nItems <= 50 ? 24 : 10;
-  // A job with few parts only HAS n!·2 distinct (ordering × scan-direction)
-  // passes — anything beyond that re-runs identical layouts.
-  let perms = 2;
+export function cncAttemptCount(nItems: number, restarts: number, extraEffort = false): number {
+  const boost = extraEffort ? 2 : 1;
+  const cap = (nItems <= 12 ? 96 : nItems <= 25 ? 48 : nItems <= 50 ? 24 : 10) * boost;
+  // A job with few parts only HAS n!·2·2 distinct (ordering × scan-direction
+  // × placement-policy) passes — beyond that re-runs identical layouts.
+  let perms = 4;
   for (let i = 2; i <= Math.min(nItems, 8); i++) perms *= i;
   const distinct = nItems > 8 ? Infinity : perms;
   return Math.max(1, Math.min(restarts, cap, distinct));
@@ -875,7 +1054,7 @@ export function cncRunPasses(
   onPass: (orderingIdx: number, pass: CncSerialPass) => void,
 ): void {
   const { res, gw, gh, getMask } = setupCnc(items, sheetW, sheetH, kerf, opt);
-  const orderings = buildOrderings(items, attempts);
+  const orderings = buildOrderings(items, attempts, opt.seed ?? 0);
   // Per-worker wall-clock budget: with the raised attempt caps a worker may
   // hold a dozen passes; never let a heavyweight job pin a core for long.
   const startMs = Date.now();
@@ -883,7 +1062,39 @@ export function cncRunPasses(
   for (const idx of orderingIdxs) {
     const o = orderings[idx];
     if (!o) continue;
-    const r = runPass(o.order, gw, gh, getMask, res, o.leftFirst);
+    const r = runPass(o.order, gw, gh, getMask, res, o.leftFirst, o.contact);
+    onPass(idx, {
+      sheets: r.lives.map((l) => ({ placements: l.placements, usedArea: l.usedArea })),
+      unplaced: r.unplaced,
+    });
+    if (Date.now() - startMs > budgetMs) break;
+  }
+}
+
+/** One genome of the Deepnest-style GA: a placement order + pass policy. */
+export interface CncOrderSpec { ids: string[]; leftFirst: boolean; contact: boolean }
+
+/**
+ * Run passes for EXPLICIT orders (the worker side of the genetic search in
+ * optPool.packCncDeep — genomes are placement orders bred between
+ * generations, unlike the blind ordering list of cncRunPasses).
+ */
+export function cncRunExplicitOrders(
+  items: CncInput[],
+  sheetW: number,
+  sheetH: number,
+  kerf: number,
+  opt: CncOptions,
+  orders: CncOrderSpec[],
+  onPass: (orderIdx: number, pass: CncSerialPass) => void,
+): void {
+  const { res, gw, gh, getMask, byId } = setupCnc(items, sheetW, sheetH, kerf, opt);
+  const startMs = Date.now();
+  const budgetMs = 20000;
+  for (let idx = 0; idx < orders.length; idx++) {
+    const o = orders[idx];
+    const order = o.ids.map((id) => byId.get(id)).filter(Boolean) as CncInput[];
+    const r = runPass(order, gw, gh, getMask, res, o.leftFirst, o.contact);
     onPass(idx, {
       sheets: r.lives.map((l) => ({ placements: l.placements, usedArea: l.usedArea })),
       unplaced: r.unplaced,
@@ -918,9 +1129,8 @@ export function cncFinish(
     }
     return live;
   });
-  let consolidated = consolidate(lives, getMask, res, byId);
-  if (opt.saveLast) consolidated = compactLastSheet(consolidated, gw, gh, getMask, res, byId);
-  return { sheets: livesToSheets(consolidated, res, true), unplaced: winner.unplaced };
+  const squeezed = finalSqueeze(lives, gw, gh, getMask, res, byId, opt.saveLast ?? false);
+  return { sheets: livesToSheets(squeezed, res, true), unplaced: winner.unplaced };
 }
 
 /**
@@ -958,8 +1168,8 @@ export function* packCncGen(
   // It follows the "Optimize tries" setting, but each pass is a full raster
   // re-pack (far heavier than a rectangle trial), so the count is capped by
   // part count to keep wall-clock time sane, and a hard time budget backs that.
-  const attempts = cncAttemptCount(items.length, opt.restarts ?? 8);
-  const orderings = buildOrderings(items, attempts);
+  const attempts = cncAttemptCount(items.length, opt.restarts ?? 8, opt.extraEffort ?? false);
+  const orderings = buildOrderings(items, attempts, opt.seed ?? 0);
   const totalSteps = orderings.length + 1; // +1 = the consolidation step
   const startMs = Date.now();
   const budgetMs = 15000;
@@ -967,8 +1177,8 @@ export function* packCncGen(
   const saveLast = opt.saveLast ?? false;
   let best: PassResult | null = null;
   for (let i = 0; i < orderings.length; i++) {
-    const { order, leftFirst } = orderings[i];
-    const result = runPass(order, gw, gh, getMask, res, leftFirst);
+    const { order, leftFirst, contact } = orderings[i];
+    const result = runPass(order, gw, gh, getMask, res, leftFirst, contact);
     const isNewBest = !best || passBetter(result, best, saveLast);
     if (isNewBest) best = result;
     yield {
@@ -983,11 +1193,9 @@ export function* packCncGen(
     if (Date.now() - startMs > budgetMs) break;
   }
 
-  // Final squeeze: try to eliminate under-filled sheets.
-  let consolidated = consolidate(best!.lives, getMask, res, byId);
-  // Save-last: pack the least-filled sheet into one corner so its remnant is a
-  // clean, reusable offcut.
-  if (saveLast) consolidated = compactLastSheet(consolidated, gw, gh, getMask, res, byId);
+  // Final squeeze: shake-defrag + dissolve under-filled sheets (+ save-last
+  // corner packing) — see finalSqueeze.
+  const consolidated = finalSqueeze(best!.lives, gw, gh, getMask, res, byId, saveLast);
   const finalSheets = livesToSheets(consolidated, res, true);
   yield {
     trial: orderings.length,

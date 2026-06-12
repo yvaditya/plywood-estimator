@@ -25,7 +25,7 @@
 import type { Vec2 } from './geometry';
 import { packMulti, isCncStrategy, type PackInput, type PackPlacement, type CutStrategy, type Cut, type PackProgress } from './packRect';
 import { packCnc, polyArea, type CncInput, type CncSheet } from './cncNest';
-import { packMultiParallel, packCncParallel } from './optPool';
+import { packMultiParallel, packCncParallel, packCncDeep } from './optPool';
 
 export type { CutStrategy, Cut, PackProgress };
 export { isCncStrategy };
@@ -54,6 +54,12 @@ export interface NestConfig {
   restarts?: number;
   /** 'free' = MaxRects (max yield). 'guillotine' = track-saw friendly. */
   cutStrategy?: CutStrategy;
+  /** Search seed — a re-run with a different seed explores NEW orderings
+   *  ("Optimize further"). 0 / undefined = canonical deterministic run. */
+  seed?: number;
+  /** Deep search: doubles the CNC attempt caps and uses a finer rotation
+   *  step for free-grain parts. Used by "Optimize further". */
+  deepSearch?: boolean;
 }
 
 export interface PlacedPart {
@@ -436,6 +442,7 @@ export async function runNestAnimated(
           sheetL: winnerSheetL,
         });
       },
+      config.seed ?? 0,
     );
 
     const sheets: NestSheet[] = toNestSheets(winner);
@@ -596,13 +603,16 @@ function compareTries(
 // renderer (SVG / DXF / PDF) treats CNC sheets like any other.
 // ---------------------------------------------------------------------------
 
-/** Candidate rotation angles (deg, CCW) for a part under the CNC strategy. */
+/** Candidate rotation angles (deg, CCW) for a part under the CNC strategy.
+ *  Deep search ("Optimize further") halves the step for free-grain parts. */
 const CNC_ANGLE_STEP = 15;
+const CNC_ANGLE_STEP_FINE = 7.5;
 
-function cncAnglesFor(grain: GrainLock, w0: number, h0: number): number[] {
+function cncAnglesFor(grain: GrainLock, w0: number, h0: number, fine = false): number[] {
   if (grain === 'free') {
     const out: number[] = [];
-    for (let a = 0; a < 360; a += CNC_ANGLE_STEP) out.push(a);
+    const step = fine ? CNC_ANGLE_STEP_FINE : CNC_ANGLE_STEP;
+    for (let a = 0; a < 360; a += step) out.push(a);
     return out;
   }
   // Respect an explicit grain lock: keep the part's length (grain) axis aligned
@@ -640,12 +650,12 @@ function bucketByThickness(parts: NestPart[]): Map<number, NestPart[]> {
 
 interface CncMeta { part: NestPart; instance: number; }
 
-function buildCncItems(bucket: NestPart[]): { items: CncInput[]; meta: Map<string, CncMeta> } {
+function buildCncItems(bucket: NestPart[], fineAngles = false): { items: CncInput[]; meta: Map<string, CncMeta> } {
   const items: CncInput[] = [];
   const meta = new Map<string, CncMeta>();
   for (const p of bucket) {
     const bb = ringBbox(p.outer);
-    const angles = cncAnglesFor(p.grain, bb.w, bb.h);
+    const angles = cncAnglesFor(p.grain, bb.w, bb.h, fineAngles);
     const area = polyArea(p.outer, p.holes);
     for (let inst = 1; inst <= p.qty; inst++) {
       const id = `${p.id}#${inst}`;
@@ -713,10 +723,12 @@ export function runCncNest(parts: NestPart[], config: NestConfig): NestResult {
   let totalPartArea = 0, totalSheetArea = 0, totalSheets = 0;
 
   for (const t of thicknesses) {
-    const { items, meta } = buildCncItems(buckets.get(t)!);
+    const { items, meta } = buildCncItems(buckets.get(t)!, config.deepSearch ?? false);
     const res = packCnc(items, usableL, usableW, kerf, {
       restarts: config.restarts,
       saveLast: config.cutStrategy === 'cnc-save-last',
+      seed: config.seed,
+      extraEffort: config.deepSearch,
     });
     const sheets = res.sheets.map((cs, idx) =>
       cncSheetToNest(cs, idx, t, margin, winnerSheetW, winnerSheetL, meta));
@@ -762,7 +774,7 @@ export async function runCncNestAnimated(
 
   for (let gi = 0; gi < totalGroups; gi++) {
     const t = thicknesses[gi];
-    const { items, meta } = buildCncItems(buckets.get(t)!);
+    const { items, meta } = buildCncItems(buckets.get(t)!, config.deepSearch ?? false);
 
     const toSheets = (css: CncSheet[]): NestSheet[] => {
       const sheets = css.map((cs, idx) =>
@@ -772,8 +784,16 @@ export async function runCncNestAnimated(
       return sheets;
     };
 
-    // Multicore: raster passes fan out across a Web Worker pool.
-    const res = await packCncParallel(items, usableL, usableW, kerf, async (p) => {
+    // Multicore: raster passes fan out across a Web Worker pool. Deep search
+    // ("Optimize further") swaps the blind multi-restart for the genetic
+    // search over placement orders.
+    const cncOpts = {
+      restarts: config.restarts,
+      saveLast: config.cutStrategy === 'cnc-save-last',
+      seed: config.seed,
+      extraEffort: config.deepSearch,
+    };
+    const onCncProgress = async (p: { trial: number; total: number; current: CncSheet[]; best: CncSheet[]; isNewBest: boolean }) => {
       await onTrial({
         groupIdx: gi,
         totalGroups,
@@ -785,7 +805,10 @@ export async function runCncNestAnimated(
         sheetW: winnerSheetW,
         sheetL: winnerSheetL,
       });
-    }, { restarts: config.restarts, saveLast: config.cutStrategy === 'cnc-save-last' });
+    };
+    const res = config.deepSearch
+      ? await packCncDeep(items, usableL, usableW, kerf, onCncProgress, cncOpts, config.seed ?? 1)
+      : await packCncParallel(items, usableL, usableW, kerf, onCncProgress, cncOpts);
 
     const sheets = res.sheets.map((cs, idx) =>
       cncSheetToNest(cs, idx, t, margin, winnerSheetW, winnerSheetL, meta));
