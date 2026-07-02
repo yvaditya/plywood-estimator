@@ -3,6 +3,7 @@ app/dist
 app/.vite
 app/_screenshots
 tests/_output
+__pycache__/
 .playwright-mcp/
 .vite
 .claude/
