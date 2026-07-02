@@ -9,11 +9,6 @@
 
 import './style.css';
 
-// Build-time-injected git info (see vite.config.ts `define`).
-declare const __GIT_SHA__: string;
-declare const __GIT_AUTHOR__: string;
-declare const __GIT_DATE__: string;
-
 import { parseStep, type OcctResult } from './stepLoader';
 import { Viewer, bodyColor } from './viewer';
 import { analyzeBody, type BodyAnalysis } from './geometry';
@@ -132,12 +127,8 @@ const loadProgressFill = $('loadProgressFill');
 const loadProgressLabel = $('loadProgressLabel');
 const bodyList = $('bodyList');
 const bodyCount = $('bodyCount');
-const versionLine = $('versionLine');
-// Inject git build info from vite define. Keep it terse: "0123abc · author · 2026-05-27"
-if (versionLine) {
-  const parts = [__GIT_SHA__, __GIT_AUTHOR__, __GIT_DATE__].filter(Boolean);
-  versionLine.textContent = parts.join(' · ');
-}
+// #versionLine is filled server-side by the git-version-line vite plugin
+// (see vite.config.ts) — always the repo's current HEAD, no restart needed.
 const nestBtn = $<HTMLButtonElement>('nestBtn');
 const selectAllBtn = $('selectAllBtn');
 const clearAllBtn = $('clearAllBtn');
@@ -1914,6 +1905,7 @@ downloadPdfBtn.addEventListener('click', async () => {
   // Use a clean WHITE scene background + faint shadow floor for all PDF
   // snapshots — the dark studio backdrop the live viewer uses prints
   // poorly. exitPdfBg restores the live look at the end.
+  const tCapture0 = performance.now();
   viewer.enterPdfBg();
   const cabinets: import('./pdf').CabinetSnapshot[] = [];
   let assembledPng: string | undefined;
@@ -1921,9 +1913,10 @@ downloadPdfBtn.addEventListener('click', async () => {
   try {
     // Two render targets — cover gets a near-square aspect to fill the
     // half-page snapshot box; IKEA step cards are wide (2:1-ish) and use a
-    // 16:9 target so the cabinet fills the card horizontally.
+    // 16:9 target so the cabinet fills the card horizontally. Step cards
+    // print at ~6 × 3.4in — 1280×720 is ~180 dpi there, plenty.
     const SHOT_COVER = { w: 1200, h: 1100 };
-    const SHOT_STEP  = { w: 1600, h: 900 };
+    const SHOT_STEP  = { w: 1280, h: 720 };
     const fileCount = byFile.size;
     let fileIdx = 0;
     for (const [tag, bodies] of byFile) {
@@ -1931,6 +1924,7 @@ downloadPdfBtn.addEventListener('click', async () => {
       setProgress(`Capturing ${tag}…`, 10 + (70 * (fileIdx - 1) / Math.max(1, fileCount)));
       await yieldFrame();
       const visibleIds = new Set(bodies.map((b) => b.id));
+      viewer.beginSnapshotBatch(SHOT_COVER);
       const assembled = viewer.snapshotFiltered(visibleIds, null, 0, undefined, SHOT_COVER);
       const exploded = viewer.snapshotFiltered(visibleIds, directions, explodeDist, undefined, SHOT_COVER);
       const ids: string[] = [];
@@ -1951,6 +1945,7 @@ downloadPdfBtn.addEventListener('click', async () => {
       const stepDist = Math.max(15, explodeDist * 0.28);
       const steps: import('./pdf').SnapshotImage[] = [];
       const stepPanelIds: string[] = [];
+      viewer.beginSnapshotBatch(SHOT_STEP); // switch batch size once for all steps
       for (let i = 0; i < bodies.length; i++) {
         const installed = new Set<number>();
         for (let j = 0; j <= i; j++) installed.add(bodies[j].id);
@@ -1977,16 +1972,22 @@ downloadPdfBtn.addEventListener('click', async () => {
         steps, stepPanelIds,
       });
     }
-    // Backwards-compat fallback: combined all-cabinet snapshots (used
-    // when a future caller doesn't populate `cabinets`).
-    assembledPng = viewer.snapshot().dataUrl;
-    explodedPng = viewer.snapshotExploded(directions, explodeDist).dataUrl;
+    // Backwards-compat fallback: combined all-cabinet snapshots — only
+    // captured when no per-cabinet snapshots exist (the PDF ignores them
+    // otherwise, so rendering them would be two wasted full-scene passes).
+    if (cabinets.length === 0) {
+      viewer.endSnapshotBatch();
+      assembledPng = viewer.snapshot().dataUrl;
+      explodedPng = viewer.snapshotExploded(directions, explodeDist).dataUrl;
+    }
   } catch (err) {
     console.warn('Per-cabinet snapshot failed; assembly pages skipped.', err);
   } finally {
+    viewer.endSnapshotBatch();
     viewer.exitPdfBg();
   }
 
+  const tBuild0 = performance.now();
   setProgress('Building PDF…', 85);
   await yieldFrame();
   const doc = buildPdf(state.lastNest, {
@@ -2009,8 +2010,12 @@ downloadPdfBtn.addEventListener('click', async () => {
   });
   setProgress('Saving…', 98);
   await yieldFrame();
+  const tSave0 = performance.now();
   const safe = (state.jobName || 'plywood_cut_estimate').replace(/[^a-z0-9_-]+/gi, '_').toLowerCase();
   downloadPdf(`${safe}.pdf`, doc);
+  console.log(
+    `pdf: snapshots ${(tBuild0 - tCapture0).toFixed(0)}ms · build ${(tSave0 - tBuild0).toFixed(0)}ms · save ${(performance.now() - tSave0).toFixed(0)}ms`,
+  );
   // Restore button
   downloadPdfBtn.innerHTML = originalLabel;
   downloadPdfBtn.classList.remove('busy');

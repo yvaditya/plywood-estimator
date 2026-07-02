@@ -524,14 +524,18 @@ export class Viewer {
   }
 
   /**
-   * Snapshot the current 3D scene as a base64 PNG.
+   * Snapshot the current 3D scene as a base64 JPEG.
+   * JPEG, not PNG: the canvas encode is several times faster AND jsPDF
+   * embeds JPEG bytes directly (DCTDecode) instead of decoding a PNG in
+   * JS — together the dominant cost of PDF generation. Snapshots render
+   * on the opaque white PDF background, so alpha is never needed.
    * Returns the canvas pixel dimensions too so callers can preserve
    * aspect ratio when placing the image elsewhere (e.g. in a PDF).
    */
   snapshot(): { dataUrl: string; width: number; height: number } {
     this.composer.render();
     const c = this.renderer.domElement;
-    return { dataUrl: c.toDataURL('image/png'), width: c.width, height: c.height };
+    return { dataUrl: c.toDataURL('image/jpeg', 0.9), width: c.width, height: c.height };
   }
 
   /**
@@ -560,7 +564,7 @@ export class Viewer {
     }
     this.composer.render();
     const c = this.renderer.domElement;
-    const out = { dataUrl: c.toDataURL('image/png'), width: c.width, height: c.height };
+    const out = { dataUrl: c.toDataURL('image/jpeg', 0.9), width: c.width, height: c.height };
     // Restore so the live viewer doesn't visibly jump
     for (const b of this.bodies) {
       const bk = backup.get(b.id);
@@ -629,6 +633,45 @@ export class Viewer {
     return size.length();
   }
 
+  // While a snapshot batch is open, snapshotFiltered skips its per-call
+  // renderer resize AND the restore-the-live-view re-render — both are pure
+  // waste between consecutive snapshots. Holds the ORIGINAL live-view size
+  // to restore when the batch ends.
+  private _snapBatch: { size: THREE.Vector2; aspect: number } | null = null;
+
+  /**
+   * Open (or re-target) a snapshot batch: size the renderer for a BURST of
+   * same-size snapshots. Resizing a WebGL renderer reallocates the
+   * multisampled + SMAA render targets — doing that (plus a live-view
+   * re-render) per snapshot dominated PDF generation time. Call again with a
+   * different target to switch sizes mid-batch (one realloc), and
+   * endSnapshotBatch() once when every capture is done.
+   */
+  beginSnapshotBatch(target: { w: number; h: number }) {
+    if (!this._snapBatch) {
+      this._snapBatch = {
+        size: this.renderer.getSize(new THREE.Vector2()),
+        aspect: this.camera.aspect,
+      };
+    }
+    this.renderer.setSize(target.w, target.h, false);
+    this.composer.setSize(target.w, target.h);
+    this.camera.aspect = target.w / target.h;
+    this.camera.updateProjectionMatrix();
+  }
+
+  /** Restore the live-view renderer size and repaint. Safe to call when no
+   *  batch is open. */
+  endSnapshotBatch() {
+    if (!this._snapBatch) return;
+    this.renderer.setSize(this._snapBatch.size.x, this._snapBatch.size.y, false);
+    this.composer.setSize(this._snapBatch.size.x, this._snapBatch.size.y);
+    this.camera.aspect = this._snapBatch.aspect;
+    this.camera.updateProjectionMatrix();
+    this._snapBatch = null;
+    this.composer.render();
+  }
+
   /**
    * Snapshot ONLY a subset of bodies (e.g. one cabinet's panels per STEP file).
    *
@@ -653,9 +696,12 @@ export class Viewer {
     target?: { w: number; h: number },
   ): { dataUrl: string; width: number; height: number } {
     // 0. (Optional) resize the renderer for a high-resolution snapshot.
+    //    Inside a snapshot batch the renderer is already sized — skip the
+    //    (expensive) per-call resize entirely.
+    const inBatch = this._snapBatch !== null;
     const sizeBackup = this.renderer.getSize(new THREE.Vector2());
     const aspectBackup = this.camera.aspect;
-    if (target) {
+    if (target && !inBatch) {
       this.renderer.setSize(target.w, target.h, false);
       this.composer.setSize(target.w, target.h);
       this.camera.aspect = target.w / target.h;
@@ -749,7 +795,7 @@ export class Viewer {
     // 4. Render + grab (canvas dims captured for downstream aspect-fit)
     this.composer.render();
     const c = this.renderer.domElement;
-    const out = { dataUrl: c.toDataURL('image/png'), width: c.width, height: c.height };
+    const out = { dataUrl: c.toDataURL('image/jpeg', 0.9), width: c.width, height: c.height };
 
     // 5. Restore EVERYTHING — remove ghosts, restore positions and visibility.
     for (const g of ghosts) {
@@ -769,15 +815,17 @@ export class Viewer {
     this.controls.target.copy(cameraBackup.target);
     this.camera.near = cameraBackup.near;
     this.camera.far = cameraBackup.far;
-    // Restore renderer size + camera aspect if we changed them for the snapshot.
-    if (target) {
+    // Restore renderer size + camera aspect if we changed them for the
+    // snapshot. In a batch both stay put (endSnapshotBatch restores), and
+    // the live-view repaint is skipped — the next snapshot re-renders anyway.
+    if (target && !inBatch) {
       this.renderer.setSize(sizeBackup.x, sizeBackup.y, false);
       this.composer.setSize(sizeBackup.x, sizeBackup.y);
       this.camera.aspect = aspectBackup;
     }
     this.camera.updateProjectionMatrix();
     this.controls.update();
-    this.composer.render();
+    if (!inBatch) this.composer.render();
     return out;
   }
 

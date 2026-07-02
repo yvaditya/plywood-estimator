@@ -19,7 +19,10 @@ export type PdfPaper =
   | 'letter-landscape' | 'letter-portrait'
   | 'legal-landscape'  | 'legal-portrait'
   | 'tabloid-landscape'
-  | 'a4-landscape';
+  | 'a4-landscape'
+  /** Phone-portrait pages, one cut per page — for reading the cut sequence
+   *  at the saw from a phone. */
+  | 'mobile';
 
 export interface PdfOptions {
   sheetW: number;       // mm
@@ -170,11 +173,30 @@ const PAPER_DIMS: Record<
   'legal-portrait':    { w: 612,  h: 1008, format: 'legal',    orient: 'portrait'  },
   'tabloid-landscape': { w: 1224, h: 792,  format: 'tabloid',  orient: 'landscape' },
   'a4-landscape':      { w: 842,  h: 595,  format: 'a4',       orient: 'landscape' },
+  // 9:16 phone-portrait — fills a phone screen page-per-swipe.
+  'mobile':            { w: 396,  h: 704,  format: [396, 704], orient: 'portrait'  },
 };
 const PAGE_PAD = 36; // 0.5"
 
+// ---------------------------------------------------------------------------
+// Deferred navigation. Page numbers aren't known while a page is being drawn
+// (later sections haven't been laid out yet), so cross-references are
+// RECORDED during drawing and RESOLVED in a post-pass once every page exists:
+//   - links: invisible click rectangles jumping to a section's first page
+//   - notes: small "→ Section p.N" text lines (text needs the resolved page
+//     number, so the whole note is drawn in the post-pass)
+//   - toc:   entries for the Contents page
+// Targets are section names (matched against sectionPerPage).
+// ---------------------------------------------------------------------------
+interface NavCtx {
+  links: { page: number; x: number; y: number; w: number; h: number; target: string }[];
+  notes: { page: number; x: number; y: number; label: string; target: string }[];
+  toc: { title: string; desc: string; target: string }[];
+}
+
 export function buildPdf(result: NestResult, opt: PdfOptions): jsPDF {
   const paper = opt.paper ?? 'widescreen-16-9';
+  if (paper === 'mobile') return buildMobilePdf(result, opt);
   const dims = PAPER_DIMS[paper];
   const doc = new jsPDF({ orientation: dims.orient, unit: 'pt', format: dims.format });
 
@@ -188,31 +210,66 @@ export function buildPdf(result: NestResult, opt: PdfOptions): jsPDF {
     doc.addPage(dims.format, dims.orient);
     tagSection(section);
   };
+  const nav: NavCtx = { links: [], notes: [], toc: [] };
+  const curPage = () => doc.getNumberOfPages();
 
-  // 1. COVER — job summary (sheets / yield / cost / cabinets list)
+  // Panel id ("1a") → cabinet name, for the per-sheet cabinet cross-refs.
+  const cabinetByPanelId = new Map<string, string>();
+  for (const cab of opt.cabinets ?? []) {
+    for (const id of cab.partIds) cabinetByPanelId.set(id, cab.name);
+  }
+
+  // 1. COVER — job summary (sheets / yield / cost / per-thickness table)
   tagSection('Cover');
   drawSummary(doc, result, opt, dims);
 
-  // 2. SHOPPING LIST — what to buy first
+  // 2. CONTENTS — reserved now, filled in the post-pass once every page
+  //    number is known. Doubles as the "how to use this document" intro.
+  addPage('Contents');
+  const contentsPage = curPage();
+
+  // 3. QUICK REFERENCE — every sheet at a glance; the shop-wall page.
+  addPage('Quick reference');
+  nav.toc.push({ title: 'Quick reference', desc: 'Every sheet at a glance — post this at the saw.', target: 'Quick reference' });
+  drawQuickReference(doc, result, opt, dims, labels, () => addPage('Quick reference'));
+
+  // 4. SHOPPING LIST — what to buy first
   addPage('Shopping list');
+  nav.toc.push({ title: 'Shopping list', desc: 'Materials to buy before starting.', target: 'Shopping list' });
   drawShoppingListPage(doc, opt, dims);
 
-  // 3. PARTS OVERVIEW — all panels grouped by unique part, dimensions.
+  // 5. PARTS OVERVIEW — all panels grouped by unique part, dimensions.
   //    Skipped for CNC jobs (the machine cuts straight from the sheet
   //    contours; the saw-shop parts grid is dead weight there).
   if (!opt.cnc) {
     addPage('Parts');
-    drawPartsOverview(doc, labels, opt, dims, tagSection);
+    nav.toc.push({ title: 'Parts overview', desc: 'One card per unique panel, with dimensions.', target: 'Parts' });
+    drawPartsOverview(doc, labels, opt, dims, tagSection, nav, curPage);
   }
 
-  // 4. PER SHEET — layout page first, then its cut sequence cards.
-  //    Spillover pages within a sheet are tagged "Sheet N" so the
-  //    header reads "Sheet 3 (page 2 of 4)".
+  // 6. CUT SHEETS grouped by thickness — divider page per group when the job
+  //    mixes thicknesses, then one layout page + cut-sequence cards per
+  //    sheet. Each group's join-split guide follows ITS sheets, so the guide
+  //    sits next to the sheets that carry its segments.
+  const multiGroup = result.groups.length > 1;
+  const renderedJoins = new Set<SplitJoinGroup>();
   for (const group of result.groups) {
+    const firstSheet = group.sheets[0];
+    const groupTitle = multiGroup
+      ? `Cut sheets — ${fmtDim(group.thickness, opt.units)}`
+      : 'Cut sheets';
+    if (multiGroup) {
+      const dividerSection = `Sheets · ${fmtDim(group.thickness, opt.units)}`;
+      addPage(dividerSection);
+      nav.toc.push({ title: groupTitle, desc: 'Layout and cut sequence for each sheet.', target: dividerSection });
+      drawGroupDivider(doc, group, opt, dims);
+    } else if (firstSheet) {
+      nav.toc.push({ title: groupTitle, desc: 'Layout and cut sequence for each sheet.', target: `Sheet ${firstSheet.globalIndex}` });
+    }
     for (const sheet of group.sheets) {
       const sectionName = `Sheet ${sheet.globalIndex}`;
       addPage(sectionName);
-      drawSheet(doc, sheet, opt, dims, labels);
+      drawSheet(doc, sheet, opt, dims, labels, cabinetByPanelId, nav, curPage);
       // The sheet's cuts come on the next page(s) — same section so they
       // share the "Sheet 3 (2 of 3)" pagination header. CNC jobs skip the
       // cards entirely: a router/waterjet follows the part contours, so a
@@ -222,20 +279,32 @@ export function buildPdf(result: NestResult, opt: PdfOptions): jsPDF {
           () => { addPage(sectionName); });
       }
     }
+    const joins = (opt.splitJoins ?? []).filter((j) => j.thickness === group.thickness);
+    if (joins.length > 0) {
+      joins.forEach((j) => renderedJoins.add(j));
+      addPage('Join split parts');
+      if (!nav.toc.some((t) => t.target === 'Join split parts')) {
+        nav.toc.push({ title: 'Join split parts', desc: 'How dovetailed oversize-part segments reassemble.', target: 'Join split parts' });
+      }
+      drawSplitJoins(doc, joins, opt, dims, () => addPage('Join split parts'));
+    }
   }
-
-  // 4b. SPLIT-PART JOIN GUIDE — which dovetailed segments rebuild which
-  //     original oversize part.
-  if (opt.splitJoins && opt.splitJoins.length > 0) {
+  // Safety net: join groups whose thickness matched no sheet group.
+  const leftoverJoins = (opt.splitJoins ?? []).filter((j) => !renderedJoins.has(j));
+  if (leftoverJoins.length > 0) {
     addPage('Join split parts');
-    drawSplitJoins(doc, opt.splitJoins, opt, dims, () => addPage('Join split parts'));
+    if (!nav.toc.some((t) => t.target === 'Join split parts')) {
+      nav.toc.push({ title: 'Join split parts', desc: 'How dovetailed oversize-part segments reassemble.', target: 'Join split parts' });
+    }
+    drawSplitJoins(doc, leftoverJoins, opt, dims, () => addPage('Join split parts'));
   }
 
-  // 5. ASSEMBLY — overview page per cabinet, then step-by-step panel cards
+  // 7. ASSEMBLY — overview page per cabinet, then step-by-step panel cards
   if (opt.cabinets && opt.cabinets.length > 0) {
     for (const cab of opt.cabinets) {
       const sectionName = `Assembly · ${cab.name}`;
       addPage(sectionName);
+      nav.toc.push({ title: sectionName, desc: 'What is in the box, then step-by-step build order.', target: sectionName });
       drawCabinetAssembly(doc, cab, opt, dims);
       if (cab.steps && cab.steps.length > 0) {
         drawCabinetSteps(doc, cab, opt, dims, () => addPage(sectionName));
@@ -244,13 +313,588 @@ export function buildPdf(result: NestResult, opt: PdfOptions): jsPDF {
   } else if (opt.assembledPng && opt.explodedPng) {
     // Backwards-compat fallback: single all-cabinet assembly page.
     addPage('Assembly');
+    nav.toc.push({ title: 'Assembly', desc: 'Assembled and exploded views.', target: 'Assembly' });
     drawAssemblyGuide(doc, opt, dims);
   }
 
-  // Post-pass: add header/footer to every page except the cover.
+  // Post-passes, in order: fill the Contents page (needs final page
+  // numbers), sidebar bookmarks, headers/footers, then deferred notes/links.
+  drawContents(doc, contentsPage, dims, opt, nav, sectionPerPage);
+  addBookmarks(doc, nav, sectionPerPage, result);
   paginateAndDecorate(doc, dims, opt, sectionPerPage);
+  resolveNav(doc, nav, sectionPerPage);
 
   return doc;
+}
+
+/** First page (1-based) tagged with this section, or null. */
+function sectionStartPage(sectionPerPage: string[], target: string): number | null {
+  const i = sectionPerPage.indexOf(target);
+  return i >= 0 ? i + 1 : null;
+}
+
+// ---------------------------------------------------------------------------
+// Contents page — filled in the post-pass so page numbers are real. Also
+// carries the one-line "how to use" workflow intro.
+// ---------------------------------------------------------------------------
+function drawContents(
+  doc: jsPDF,
+  pageNo: number,
+  dims: { w: number; h: number },
+  opt: PdfOptions,
+  nav: NavCtx,
+  sectionPerPage: string[],
+) {
+  doc.setPage(pageNo);
+  const PAGE_W = dims.w;
+
+  doc.setFont('helvetica', 'bold');
+  doc.setFontSize(20);
+  doc.setTextColor(0);
+  doc.text('Contents', PAGE_PAD, PAGE_PAD + 6);
+  doc.setFont('helvetica', 'normal');
+  doc.setFontSize(10);
+  doc.setTextColor(120);
+  doc.text(
+    'Work front to back: buy the materials, cut each sheet in order, join any split parts, then assemble.',
+    PAGE_PAD, PAGE_PAD + 24, { maxWidth: PAGE_W - 2 * PAGE_PAD },
+  );
+
+  let y = PAGE_PAD + 56;
+  const lineH = 30;
+  for (const e of nav.toc) {
+    const page = sectionStartPage(sectionPerPage, e.target);
+    if (page === null) continue;
+    doc.setFont('helvetica', 'bold');
+    doc.setFontSize(12);
+    doc.setTextColor(25);
+    doc.text(e.title, PAGE_PAD, y);
+    const titleW = doc.getTextWidth(e.title);
+    const descX = Math.max(PAGE_PAD + 190, PAGE_PAD + titleW + 16);
+    doc.setFont('helvetica', 'normal');
+    doc.setFontSize(9);
+    doc.setTextColor(130);
+    doc.text(e.desc, descX, y);
+    doc.setFont('helvetica', 'bold');
+    doc.setFontSize(11);
+    doc.setTextColor(60);
+    doc.text(String(page), PAGE_W - PAGE_PAD, y, { align: 'right' });
+    // Dotted leader between description and page number.
+    doc.setFont('helvetica', 'normal');
+    doc.setFontSize(9);
+    const descW = doc.getTextWidth(e.desc);
+    const leadX = descX + descW + 10;
+    if (leadX < PAGE_W - PAGE_PAD - 34) {
+      doc.setDrawColor(210);
+      doc.setLineWidth(0.5);
+      doc.setLineDashPattern([1, 3], 0);
+      doc.line(leadX, y - 2, PAGE_W - PAGE_PAD - 24, y - 2);
+      doc.setLineDashPattern([], 0);
+    }
+    // Whole row is clickable.
+    doc.link(PAGE_PAD, y - 12, PAGE_W - 2 * PAGE_PAD, 18, { pageNumber: page });
+    y += lineH;
+  }
+  doc.setTextColor(0);
+}
+
+// ---------------------------------------------------------------------------
+// PDF sidebar bookmarks (outline). jsPDF ships an outline plugin in its
+// standard build; guard anyway so a build without it degrades gracefully.
+// ---------------------------------------------------------------------------
+function addBookmarks(doc: jsPDF, nav: NavCtx, sectionPerPage: string[], result: NestResult) {
+  const outline = (doc as any).outline;
+  if (!outline || typeof outline.add !== 'function') return;
+  for (const e of nav.toc) {
+    const page = sectionStartPage(sectionPerPage, e.target);
+    if (page === null) continue;
+    const node = outline.add(null, e.title, { pageNumber: page });
+    // Child bookmarks: one per sheet under its "Cut sheets" entry.
+    if (e.title.startsWith('Cut sheets')) {
+      for (const g of result.groups) {
+        for (const s of g.sheets) {
+          const sp = sectionStartPage(sectionPerPage, `Sheet ${s.globalIndex}`);
+          if (sp !== null && sp >= page) outline.add(node, `Sheet ${s.globalIndex}`, { pageNumber: sp });
+        }
+      }
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Resolve deferred cross-references now that all pages exist: draw the
+// "→ Section p.N" notes and lay the invisible link rectangles.
+// ---------------------------------------------------------------------------
+function resolveNav(doc: jsPDF, nav: NavCtx, sectionPerPage: string[]) {
+  for (const n of nav.notes) {
+    const page = sectionStartPage(sectionPerPage, n.target);
+    if (page === null) continue;
+    doc.setPage(n.page);
+    doc.setFont('helvetica', 'normal');
+    doc.setFontSize(8.5);
+    doc.setTextColor(110);
+    const label = `${n.label} p.${page}`;
+    doc.text(label, n.x, n.y);
+    doc.link(n.x, n.y - 8, doc.getTextWidth(label), 10, { pageNumber: page });
+    doc.setTextColor(0);
+  }
+  for (const l of nav.links) {
+    const page = sectionStartPage(sectionPerPage, l.target);
+    if (page === null) continue;
+    doc.setPage(l.page);
+    doc.link(l.x, l.y, l.w, l.h, { pageNumber: page });
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Thickness-group divider page (only for jobs mixing thicknesses).
+// ---------------------------------------------------------------------------
+function drawGroupDivider(
+  doc: jsPDF,
+  group: NestResult['groups'][number],
+  opt: PdfOptions,
+  dims: { w: number; h: number },
+) {
+  const cx = dims.w / 2;
+  const cy = dims.h / 2;
+  const partCount = group.sheets.reduce((a, s) => a + s.parts.length, 0);
+  const first = group.sheets[0]?.globalIndex;
+  const last = group.sheets[group.sheets.length - 1]?.globalIndex;
+  doc.setFont('helvetica', 'bold');
+  doc.setFontSize(34);
+  doc.setTextColor(30);
+  doc.text(`${fmtDim(group.thickness, opt.units)} sheets`, cx, cy - 10, { align: 'center' });
+  doc.setFont('helvetica', 'normal');
+  doc.setFontSize(12);
+  doc.setTextColor(120);
+  const range = first === last ? `Sheet ${first}` : `Sheets ${first}–${last}`;
+  doc.text(
+    `${range}  ·  ${group.sheets.length} ${group.sheets.length === 1 ? 'sheet' : 'sheets'}  ·  ${partCount} parts`,
+    cx, cy + 14, { align: 'center' },
+  );
+  doc.setTextColor(0);
+}
+
+// ---------------------------------------------------------------------------
+// Quick-reference page — thumbnail grid of every sheet with job totals on
+// top and a color legend underneath. Meant to be printed once and posted
+// at the saw.
+// ---------------------------------------------------------------------------
+function drawQuickReference(
+  doc: jsPDF,
+  result: NestResult,
+  opt: PdfOptions,
+  dims: { w: number; h: number },
+  labels: Map<string, PartLabel>,
+  openNewPage: () => void,
+) {
+  const PAGE_W = dims.w;
+  const PAGE_H = dims.h;
+  const innerW = PAGE_W - 2 * PAGE_PAD;
+
+  doc.setFont('helvetica', 'bold');
+  doc.setFontSize(20);
+  doc.setTextColor(0);
+  doc.text('Quick reference', PAGE_PAD, PAGE_PAD + 6);
+
+  // Totals — one compact line, right-aligned with the title.
+  const totals: string[] = [
+    `${result.totalSheets} ${result.totalSheets === 1 ? 'sheet' : 'sheets'}`,
+    `${(result.yield * 100).toFixed(1)}% yield`,
+  ];
+  if (opt.jobCost && opt.jobCost > 0 && opt.currency) {
+    try {
+      totals.push(new Intl.NumberFormat(undefined, { style: 'currency', currency: opt.currency }).format(opt.jobCost));
+    } catch { /* unknown currency */ }
+  }
+  doc.setFont('helvetica', 'normal');
+  doc.setFontSize(11);
+  doc.setTextColor(90);
+  doc.text(totals.join('   ·   '), PAGE_W - PAGE_PAD, PAGE_PAD + 6, { align: 'right' });
+  doc.setTextColor(0);
+
+  const sheets = result.groups.flatMap((g) => g.sheets.map((s) => ({ s, thickness: g.thickness })));
+  if (sheets.length === 0) return;
+
+  // Legend of unique parts (color → name) along the bottom of the FIRST
+  // page — colors are the key that connects thumbnails to parts.
+  const legendItems = Array.from(labels.values());
+  const legendRows = legendItems.length > 0 ? Math.min(2, Math.ceil(legendItems.length / 4)) : 0;
+  const legendH = legendRows > 0 ? legendRows * 14 + 10 : 0;
+
+  // Thumbnail grid fills the rest. Thumbs render long-edge-horizontal, so
+  // cell aspect comes from the first sheet's dims.
+  const top = PAGE_PAD + 26;
+  const gutter = 14;
+  const captionH = 14;
+  const s0 = sheets[0].s;
+  const aspect = Math.min(s0.sheetW, s0.sheetL) / Math.max(s0.sheetW, s0.sheetL); // h/w in display
+  const availH = PAGE_H - top - PAGE_PAD - legendH;
+  // Smallest column count whose grid fits vertically.
+  let cols = 2;
+  for (; cols <= 8; cols++) {
+    const tw = (innerW - gutter * (cols - 1)) / cols;
+    const th = tw * aspect + captionH;
+    const rows = Math.ceil(sheets.length / cols);
+    if (rows * th + (rows - 1) * gutter <= availH) break;
+  }
+  cols = Math.min(cols, 8);
+  const thumbW = (innerW - gutter * (cols - 1)) / cols;
+  const thumbH = thumbW * aspect;
+
+  let x = PAGE_PAD;
+  let y = top;
+  let col = 0;
+  for (const { s, thickness } of sheets) {
+    if (y + thumbH + captionH > PAGE_H - PAGE_PAD - legendH) {
+      openNewPage();
+      y = PAGE_PAD + 16;
+      col = 0;
+      x = PAGE_PAD;
+    }
+    drawSheetThumb(doc, s, x, y, thumbW, thumbH);
+    doc.setFont('helvetica', 'bold');
+    doc.setFontSize(9);
+    doc.setTextColor(40);
+    doc.text(`Sheet ${s.globalIndex}`, x, y + thumbH + 11);
+    doc.setFont('helvetica', 'normal');
+    doc.setTextColor(130);
+    const fill = s.parts.length > 0 ? (s.usedArea / (s.sheetW * s.sheetL)) * 100 : 0;
+    doc.text(
+      `${fmtDim(thickness, opt.units)} · ${fill.toFixed(0)}%`,
+      x + thumbW, y + thumbH + 11, { align: 'right' },
+    );
+    col++;
+    x += thumbW + gutter;
+    if (col >= cols) { col = 0; x = PAGE_PAD; y += thumbH + captionH + gutter; }
+  }
+
+  // Legend — color swatch + part name (×qty). Two rows max; overflow noted.
+  if (legendRows > 0) {
+    const ly0 = PAGE_H - PAGE_PAD - legendH + 10;
+    doc.setDrawColor(225);
+    doc.setLineWidth(0.4);
+    doc.line(PAGE_PAD, ly0 - 6, PAGE_W - PAGE_PAD, ly0 - 6);
+    doc.setFont('helvetica', 'normal');
+    doc.setFontSize(8.5);
+    let lx = PAGE_PAD;
+    let ly = ly0 + 4;
+    let shown = 0;
+    for (const it of legendItems) {
+      const name = it.partName.length > 26 ? it.partName.slice(0, 23) + '…' : it.partName;
+      const chip = it.totalQty > 1 ? `${name} ×${it.totalQty}` : name;
+      const w = 12 + doc.getTextWidth(chip) + 16;
+      if (lx + w > PAGE_W - PAGE_PAD) {
+        lx = PAGE_PAD;
+        ly += 14;
+        if (ly > ly0 + legendH - 8) break;
+      }
+      const [r, g, b] = hexToRgb(it.color);
+      doc.setFillColor(r, g, b);
+      doc.rect(lx, ly - 7, 8, 8, 'F');
+      doc.setTextColor(70);
+      doc.text(chip, lx + 12, ly);
+      lx += w;
+      shown++;
+    }
+    if (shown < legendItems.length) {
+      doc.setTextColor(140);
+      doc.text(`+${legendItems.length - shown} more — see Parts overview`, lx + 12, ly);
+    }
+    doc.setTextColor(0);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// MOBILE build — phone-portrait pages designed to be read at the saw:
+// swipe page-per-cut. Structure: compact cover → shopping list → per sheet
+// (layout + part list, then ONE CUT PER PAGE with a big instruction) →
+// join guide → per cabinet (cover + one assembly step per page). Desktop
+// niceties (contents, quick reference, parts grid, bookmarks) are dropped —
+// on a phone you just swipe.
+// ---------------------------------------------------------------------------
+function buildMobilePdf(result: NestResult, opt: PdfOptions): jsPDF {
+  const dims = PAPER_DIMS['mobile'];
+  const doc = new jsPDF({ orientation: 'portrait', unit: 'pt', format: dims.format });
+  const PAGE_W = dims.w;
+  const PAGE_H = dims.h;
+  const innerW = PAGE_W - 2 * PAGE_PAD;
+  const sectionPerPage: string[] = [];
+  const tagSection = (s: string) => sectionPerPage.push(s);
+  const addPage = (s: string) => {
+    doc.addPage(dims.format, 'portrait');
+    tagSection(s);
+  };
+
+  // COVER — compact: accent bar, job name, key stats, hero render.
+  tagSection('Cover');
+  {
+    let y = PAGE_PAD + 12;
+    doc.setFillColor(107, 79, 49);
+    doc.rect(PAGE_PAD, y, 30, 3, 'F');
+    y += 26;
+    doc.setFont('helvetica', 'bold');
+    doc.setFontSize(19);
+    doc.setTextColor(25);
+    doc.text(opt.jobName || 'Plywood cut estimate', PAGE_PAD, y, { maxWidth: innerW });
+    y += 26;
+    doc.setFont('helvetica', 'normal');
+    doc.setFontSize(9);
+    doc.setTextColor(130);
+    doc.text(
+      `Sheet ${fmtDim(opt.sheetW, opt.units)} × ${fmtDim(opt.sheetL, opt.units)}  ·  margin ${fmtDim(opt.margin, opt.units)}  ·  kerf ${fmtDim(opt.kerf, opt.units)}`,
+      PAGE_PAD, y, { maxWidth: innerW },
+    );
+    y += 26;
+    const metrics: [string, string][] = [
+      ['Sheets', String(result.totalSheets)],
+      ['Yield', `${(result.yield * 100).toFixed(1)}%`],
+    ];
+    if (opt.jobCost && opt.jobCost > 0 && opt.currency) {
+      try {
+        metrics.push(['Job cost', new Intl.NumberFormat(undefined, { style: 'currency', currency: opt.currency }).format(opt.jobCost)]);
+      } catch { /* unknown currency */ }
+    }
+    const colW = innerW / 2;
+    metrics.forEach(([k, v], i) => {
+      const x = PAGE_PAD + (i % 2) * colW;
+      const ry = y + Math.floor(i / 2) * 46;
+      doc.setFont('helvetica', 'normal');
+      doc.setFontSize(8);
+      doc.setTextColor(140);
+      doc.text(k.toUpperCase(), x, ry);
+      doc.setFont('helvetica', 'bold');
+      doc.setFontSize(18);
+      doc.setTextColor(25);
+      doc.text(v, x, ry + 20);
+    });
+    y += 46 * Math.ceil(metrics.length / 2) + 8;
+    const hero = opt.cabinets?.find((c) => c.assembled)?.assembled;
+    if (hero) {
+      drawSnapshotPanel(doc, hero, PAGE_PAD, y, innerW, PAGE_H - PAGE_PAD - y - 6, { frameless: true });
+    }
+    doc.setTextColor(0);
+  }
+
+  // SHOPPING LIST — compact "material · buy N" rows.
+  const items = opt.inventoryCheck ?? [];
+  if (items.length > 0) {
+    addPage('Shopping list');
+    let y = PAGE_PAD + 16;
+    doc.setFont('helvetica', 'bold');
+    doc.setFontSize(16);
+    doc.setTextColor(25);
+    doc.text('Shopping list', PAGE_PAD, y);
+    y += 24;
+    doc.setFontSize(10.5);
+    for (const r of items) {
+      const short = Math.max(0, r.needed - r.available);
+      doc.setFont('helvetica', 'normal');
+      doc.setTextColor(40);
+      doc.text(r.label, PAGE_PAD, y, { maxWidth: innerW - 70 });
+      doc.setFont('helvetica', 'bold');
+      if (short > 0) doc.setTextColor(192, 58, 54);
+      else doc.setTextColor(80, 132, 110);
+      doc.text(short > 0 ? `Buy ${short}` : 'OK', PAGE_W - PAGE_PAD, y, { align: 'right' });
+      y += 18;
+      if (y > PAGE_H - PAGE_PAD) { addPage('Shopping list'); y = PAGE_PAD + 16; }
+    }
+    doc.setTextColor(0);
+  }
+
+  // SHEETS — layout page (with a part list standing in for the desktop
+  // Parts overview), then one page per cut.
+  for (const group of result.groups) {
+    for (const sheet of group.sheets) {
+      const section = `Sheet ${sheet.globalIndex}`;
+      addPage(section);
+      drawMobileSheetPage(doc, sheet, opt, dims);
+      if (!opt.cnc) {
+        const sc = (allCutSteps({ groups: [{ thickness: sheet.thickness, sheets: [sheet], unplaced: [] }] } as any, opt.margin))[0];
+        if (sc) {
+          for (let i = 0; i < sc.steps.length; i++) {
+            addPage(section);
+            drawMobileCutPage(doc, sc, sheet.parts, i, opt, dims);
+          }
+        }
+      }
+    }
+  }
+
+  // JOIN-SPLIT GUIDE — the desktop renderer is page-size-driven already.
+  if (opt.splitJoins && opt.splitJoins.length > 0) {
+    addPage('Join split parts');
+    drawSplitJoins(doc, opt.splitJoins, opt, dims, () => addPage('Join split parts'));
+  }
+
+  // ASSEMBLY — hero + panel list, then one step per page.
+  for (const cab of opt.cabinets ?? []) {
+    const section = `Assembly · ${cab.name}`;
+    addPage(section);
+    {
+      let y = PAGE_PAD + 16;
+      doc.setFont('helvetica', 'bold');
+      doc.setFontSize(15);
+      doc.setTextColor(25);
+      doc.text(cab.name, PAGE_PAD, y, { maxWidth: innerW });
+      y += 16;
+      doc.setFont('helvetica', 'normal');
+      doc.setFontSize(9);
+      doc.setTextColor(130);
+      const totalPanels = cab.panels?.length ?? cab.partIds.length;
+      doc.text(`${totalPanels} panels`, PAGE_PAD, y);
+      y += 10;
+      const imgH = Math.min(innerW, PAGE_H - y - PAGE_PAD - 8);
+      drawSnapshotPanel(doc, cab.assembled, PAGE_PAD, y, innerW, imgH, { frameless: true });
+      doc.setTextColor(0);
+    }
+    if (cab.steps && cab.steps.length > 0) {
+      for (let i = 0; i < cab.steps.length; i++) {
+        addPage(section);
+        const img = cab.steps[i];
+        const ratio = img.width > 0 && img.height > 0 ? img.height / img.width : 9 / 16;
+        const h = Math.min(innerW * ratio + 40, PAGE_H - 2 * PAGE_PAD);
+        const y = PAGE_PAD + (PAGE_H - 2 * PAGE_PAD - h) / 2;
+        drawIkeaStepCard(doc, img, cab.stepPanelIds?.[i] ?? '', i + 1, PAGE_PAD, y, innerW, h);
+      }
+    }
+  }
+
+  paginateAndDecorate(doc, dims, opt, sectionPerPage);
+  return doc;
+}
+
+/** Mobile sheet page: layout drawing (long edge horizontal, as everywhere)
+ *  with a compact part list below it. */
+function drawMobileSheetPage(doc: jsPDF, sheet: NestSheet, opt: PdfOptions, dims: { w: number; h: number }) {
+  const PAGE_W = dims.w;
+  const PAGE_H = dims.h;
+  const innerW = PAGE_W - 2 * PAGE_PAD;
+  let y = PAGE_PAD + 16;
+
+  doc.setFont('helvetica', 'bold');
+  doc.setFontSize(16);
+  doc.setTextColor(25);
+  doc.text(`Sheet ${sheet.globalIndex}`, PAGE_PAD, y);
+  y += 14;
+  doc.setFont('helvetica', 'normal');
+  doc.setFontSize(8.5);
+  doc.setTextColor(130);
+  const fill = sheet.parts.length > 0 ? (sheet.usedArea / (sheet.sheetW * sheet.sheetL)) * 100 : 0;
+  doc.text(
+    `${fmtDim(sheet.sheetW, opt.units)} × ${fmtDim(sheet.sheetL, opt.units)} × ${fmtDim(sheet.thickness, opt.units)}  ·  ${sheet.parts.length} parts  ·  ${fill.toFixed(0)}% fill`,
+    PAGE_PAD, y, { maxWidth: innerW },
+  );
+  y += 12;
+
+  // Layout — same long-edge-horizontal convention as every other view.
+  const orient = makeOrient(sheet.sheetW, sheet.sheetL);
+  const scale = Math.min(innerW / orient.dispW, (PAGE_H * 0.34) / orient.dispH);
+  const dW = orient.dispW * scale;
+  const dH = orient.dispH * scale;
+  const ox = PAGE_PAD + (innerW - dW) / 2;
+  doc.setFillColor(245, 239, 217);
+  doc.setDrawColor(180, 162, 112);
+  doc.setLineWidth(0.8);
+  doc.rect(ox, y, dW, dH, 'FD');
+  const sheetBox = { x: ox, y, w: dW, h: dH };
+  for (const p of sheet.parts) {
+    drawPart(doc, p, ox, y, scale, opt, `${sheet.globalIndex}${p.panelLabel}`, orient, sheetBox);
+  }
+  y += dH + 22;
+
+  // Part list — id · name · long × short. Stands in for the desktop
+  // Parts overview grid.
+  doc.setFontSize(10);
+  for (const p of sheet.parts) {
+    if (y > PAGE_H - PAGE_PAD - 6) break;
+    doc.setFont('helvetica', 'bold');
+    doc.setTextColor(30);
+    doc.text(`${sheet.globalIndex}${p.panelLabel}`, PAGE_PAD, y);
+    doc.setFont('helvetica', 'normal');
+    doc.setTextColor(90);
+    const name = p.partName.length > 22 ? p.partName.slice(0, 19) + '…' : p.partName;
+    doc.text(name, PAGE_PAD + 30, y);
+    doc.setTextColor(40);
+    doc.text(
+      `${fmtDim(Math.max(p.w, p.h), opt.units)} × ${fmtDim(Math.min(p.w, p.h), opt.units)}`,
+      PAGE_W - PAGE_PAD, y, { align: 'right' },
+    );
+    y += 15;
+  }
+  doc.setTextColor(0);
+}
+
+/** Mobile cut page: one cut, full page — big step header, big instruction,
+ *  tall diagram (the sheet keeps its natural orientation so it FILLS a
+ *  portrait phone screen). */
+function drawMobileCutPage(
+  doc: jsPDF,
+  sc: ReturnType<typeof allCutSteps>[number],
+  parts: NestSheet['parts'],
+  cutIdx: number,
+  opt: PdfOptions,
+  dims: { w: number; h: number },
+) {
+  const PAGE_W = dims.w;
+  const PAGE_H = dims.h;
+  const innerW = PAGE_W - 2 * PAGE_PAD;
+  const cur = sc.steps[cutIdx];
+  let y = PAGE_PAD + 20;
+
+  doc.setFont('helvetica', 'bold');
+  doc.setFontSize(18);
+  doc.setTextColor(25);
+  doc.text(`Cut ${cur.index} of ${sc.steps.length}`, PAGE_PAD, y);
+  y += 22;
+
+  let label: string;
+  let edgeRef: string;
+  if (cur.isTrim) {
+    label = 'Trim margin';
+    edgeRef = '(reference edge)';
+  } else {
+    label = cur.axis === 'rip' ? 'Rip' : 'Crosscut';
+    edgeRef = cur.axis === 'rip' ? 'from the LEFT edge' : 'from the BOTTOM edge';
+  }
+  doc.setFont('helvetica', 'normal');
+  doc.setFontSize(12.5);
+  doc.setTextColor(70);
+  doc.text(`${label}  ·  ${fmtDim(cur.distance, opt.units)}  ${edgeRef}`, PAGE_PAD, y, { maxWidth: innerW });
+  y += 16;
+
+  // Diagram fills the rest of the page (same orientation as the desktop
+  // cut cards). Sits just under the instruction — not vertically centered —
+  // so the eye lands on header → instruction → diagram in one line.
+  const aspect = sc.sheetL / sc.sheetW;
+  const availH = PAGE_H - PAGE_PAD - y - 4;
+  const w = Math.min(innerW, availH / aspect);
+  const h = w * aspect;
+  drawCutDiagram(doc, sc, parts, cutIdx, PAGE_PAD + (innerW - w) / 2, y + Math.min((availH - h) / 2, 30), w, h, opt);
+}
+
+/** Tiny sheet layout: cream stock + colored part bboxes. Long edge always
+ *  horizontal, matching every other view. */
+function drawSheetThumb(doc: jsPDF, sheet: NestSheet, x: number, y: number, w: number, h: number) {
+  const orient = makeOrient(sheet.sheetW, sheet.sheetL);
+  const scale = Math.min(w / orient.dispW, h / orient.dispH);
+  const dW = orient.dispW * scale;
+  const dH = orient.dispH * scale;
+  const ox = x + (w - dW) / 2;
+  const oy = y + (h - dH) / 2;
+  doc.setFillColor(245, 239, 217);
+  doc.setDrawColor(180, 162, 112);
+  doc.setLineWidth(0.6);
+  doc.rect(ox, oy, dW, dH, 'FD');
+  const GS = (doc as any).GState;
+  if (GS) (doc as any).setGState(new GS({ opacity: 0.55 }));
+  for (const p of sheet.parts) {
+    const r0 = orient.rect(p.x, p.y, p.w, p.h);
+    const [r, g, b] = hexToRgb(p.color);
+    doc.setFillColor(r, g, b);
+    doc.rect(ox + r0.x * scale, oy + r0.y * scale, r0.w * scale, r0.h * scale, 'F');
+  }
+  if (GS) (doc as any).setGState(new GS({ opacity: 1 }));
 }
 
 /**
@@ -354,7 +998,10 @@ function drawSnapshotPanel(
   const oy = y + inset + (innerH - drawH) / 2;
 
   try {
-    doc.addImage(dataUrl, 'PNG', ox, oy, drawW, drawH, undefined, 'FAST');
+    // JPEG embeds directly (no JS-side decode) — the fast path. PNG kept
+    // for legacy callers.
+    const fmt = dataUrl.startsWith('data:image/jpeg') ? 'JPEG' : 'PNG';
+    doc.addImage(dataUrl, fmt, ox, oy, drawW, drawH, undefined, 'FAST');
   } catch (e) {
     doc.setTextColor(160);
     doc.setFont('helvetica', 'normal');
@@ -370,26 +1017,40 @@ function drawSnapshotPanel(
 function drawSummary(doc: jsPDF, result: NestResult, opt: PdfOptions, dims: { w: number; h: number }) {
   const PAGE_W = dims.w;
   const PAGE_H = dims.h;
-  let y = PAGE_PAD;
+  let y = PAGE_PAD + 8;
 
+  // Hero — the first cabinet's assembled render fills the right half of the
+  // cover. Text metrics live in the left column; without a hero (CNC-only
+  // or no cabinets) the layout stays full-width.
+  const hero = opt.cabinets?.find((c) => c.assembled)?.assembled;
+  const leftW = hero ? (PAGE_W - 2 * PAGE_PAD) * 0.52 : PAGE_W - 2 * PAGE_PAD;
+  if (hero) {
+    const hx = PAGE_PAD + leftW + 24;
+    drawSnapshotPanel(doc, hero, hx, PAGE_PAD + 6, PAGE_W - PAGE_PAD - hx, PAGE_H - 2 * PAGE_PAD - 12, { frameless: true });
+  }
+
+  // Title block — job name with a short warm accent bar above it, the same
+  // brown family as the sheet stock so the document opens on-brand.
+  doc.setFillColor(107, 79, 49);
+  doc.rect(PAGE_PAD, y - 2, 34, 3, 'F');
+  y += 24;
   doc.setFont('helvetica', 'bold');
-  doc.setFontSize(20);
-  doc.text(opt.jobName || 'Plywood cut estimate', PAGE_PAD, y + 14);
-  y += 36;
+  doc.setFontSize(26);
+  doc.setTextColor(25);
+  doc.text(opt.jobName || 'Plywood cut estimate', PAGE_PAD, y);
+  y += 22;
 
   doc.setFont('helvetica', 'normal');
   doc.setFontSize(10);
-  doc.setTextColor(120);
+  doc.setTextColor(130);
   doc.text(
-    `Sheet ${fmtDim(opt.sheetW, opt.units)} × ${fmtDim(opt.sheetL, opt.units)}   ·   margin ${fmtDim(opt.margin, opt.units)}   ·   kerf ${fmtDim(opt.kerf, opt.units)}   ·   generated ${new Date().toLocaleString()}`,
+    `Sheet ${fmtDim(opt.sheetW, opt.units)} × ${fmtDim(opt.sheetL, opt.units)}   ·   margin ${fmtDim(opt.margin, opt.units)}   ·   kerf ${fmtDim(opt.kerf, opt.units)}   ·   ${new Date().toLocaleDateString()}`,
     PAGE_PAD,
     y,
   );
-  y += 22;
+  y += 36;
 
-  // Metrics row
-  doc.setTextColor(0);
-  doc.setFontSize(12);
+  // Metrics row — big stats, small-caps labels.
   const metrics: [string, string][] = [
     ['Sheets', String(result.totalSheets)],
     ['Yield', `${(result.yield * 100).toFixed(1)}%`],
@@ -403,68 +1064,92 @@ function drawSummary(doc: jsPDF, result: NestResult, opt: PdfOptions, dims: { w:
       metrics.push(['Job cost', new Intl.NumberFormat(undefined, { style: 'currency', currency: opt.currency }).format(opt.jobCost)]);
     } catch { /* unknown currency */ }
   }
-  const colW = (PAGE_W - 2 * PAGE_PAD) / metrics.length;
+  // With a hero, metrics wrap into a 2-per-row grid inside the left column;
+  // full-width covers keep the single row.
+  const perRow = hero ? 2 : metrics.length;
+  const colW = leftW / perRow;
   metrics.forEach(([k, v], i) => {
-    const x = PAGE_PAD + i * colW;
+    const x = PAGE_PAD + (i % perRow) * colW;
+    const ry = y + Math.floor(i / perRow) * 52;
     doc.setFont('helvetica', 'normal');
-    doc.setFontSize(9);
-    doc.setTextColor(120);
-    doc.text(k.toUpperCase(), x, y);
+    doc.setFontSize(8.5);
+    doc.setTextColor(140);
+    doc.text(k.toUpperCase(), x, ry);
     doc.setFont('helvetica', 'bold');
-    doc.setFontSize(16);
-    doc.setTextColor(0);
-    doc.text(v, x, y + 18);
+    doc.setFontSize(22);
+    doc.setTextColor(25);
+    doc.text(v, x, ry + 24);
   });
-  y += 50;
+  y += 52 * Math.ceil(metrics.length / perRow);
 
-  // Per-thickness breakdown
-  doc.setFont('helvetica', 'bold');
-  doc.setFontSize(11);
-  doc.text('Per-thickness breakdown', PAGE_PAD, y);
-  y += 14;
-
-  doc.setFont('helvetica', 'normal');
-  doc.setFontSize(10);
-  const hdr = ['Thickness', 'Sheets', 'Parts placed', 'Unplaced'];
-  drawRow(doc, hdr, PAGE_PAD, y, [120, 80, 100, 80], true);
-  y += 14;
-  for (const g of result.groups) {
-    const placed = g.sheets.reduce((acc, s) => acc + s.parts.length, 0);
-    drawRow(
-      doc,
-      [fmtDim(g.thickness, opt.units), String(g.sheets.length), String(placed), String(g.unplaced.length)],
-      PAGE_PAD,
-      y,
-      [120, 80, 100, 80],
-    );
-    y += 14;
-    if (y > PAGE_H - PAGE_PAD - 50) break;
-  }
-
-  // Inventory check
-  if (opt.inventoryCheck && opt.inventoryCheck.length > 0) {
-    y += 14;
+  // Per-thickness breakdown — only when the job actually mixes thicknesses
+  // (for a single group it just repeats the totals above).
+  if (result.groups.length > 1) {
+    y += 8;
     doc.setFont('helvetica', 'bold');
     doc.setFontSize(11);
-    doc.text('Inventory check', PAGE_PAD, y);
+    doc.setTextColor(25);
+    doc.text('Per-thickness breakdown', PAGE_PAD, y);
     y += 14;
-    doc.setFont('helvetica', 'normal');
+
     doc.setFontSize(10);
-    drawRow(doc, ['Material', 'Need', 'Have', 'Shortfall'], PAGE_PAD, y, [220, 80, 80, 100], true);
-    y += 14;
-    for (const ic of opt.inventoryCheck) {
-      const shortfall = Math.max(0, ic.needed - ic.available);
+    doc.setTextColor(130);
+    drawRow(doc, ['Thickness', 'Sheets', 'Parts placed', 'Unplaced'], PAGE_PAD, y, [120, 80, 100, 80], true);
+    y += 5;
+    doc.setDrawColor(225);
+    doc.setLineWidth(0.4);
+    doc.line(PAGE_PAD, y, PAGE_PAD + 380, y);
+    y += 12;
+    doc.setTextColor(40);
+    for (const g of result.groups) {
+      const placed = g.sheets.reduce((acc, s) => acc + s.parts.length, 0);
       drawRow(
         doc,
-        [ic.label, String(ic.needed), String(ic.available), shortfall > 0 ? `Buy ${shortfall}` : 'OK'],
+        [fmtDim(g.thickness, opt.units), String(g.sheets.length), String(placed), String(g.unplaced.length)],
         PAGE_PAD,
         y,
-        [220, 80, 80, 100],
+        [120, 80, 100, 80],
       );
       y += 14;
-      if (y > PAGE_H - PAGE_PAD) break;
+      if (y > PAGE_H - PAGE_PAD - 130) break;
     }
   }
+
+  // Sheet thumbnail strip along the bottom — a visual preview of the job.
+  // Constrained to the left column when the hero occupies the right half.
+  const sheets = result.groups.flatMap((g) => g.sheets);
+  if (sheets.length > 0) {
+    const maxThumbs = hero ? 3 : 5;
+    const shown = sheets.slice(0, maxThumbs);
+    const gutter = 14;
+    const stripH = 96;
+    const captionH = 13;
+    const stripY = PAGE_H - PAGE_PAD - stripH - captionH;
+    const s0 = shown[0];
+    const aspect = Math.min(s0.sheetW, s0.sheetL) / Math.max(s0.sheetW, s0.sheetL);
+    const thumbW = Math.min(
+      (leftW - gutter * (shown.length - 1)) / shown.length,
+      stripH / aspect,
+    );
+    const thumbH = thumbW * aspect;
+    let x = PAGE_PAD;
+    const ty = stripY + (stripH - thumbH);
+    for (const s of shown) {
+      drawSheetThumb(doc, s, x, ty, thumbW, thumbH);
+      doc.setFont('helvetica', 'normal');
+      doc.setFontSize(8);
+      doc.setTextColor(130);
+      doc.text(`Sheet ${s.globalIndex}`, x, ty + thumbH + 10);
+      x += thumbW + gutter;
+    }
+    if (sheets.length > maxThumbs) {
+      doc.setFont('helvetica', 'normal');
+      doc.setFontSize(9);
+      doc.setTextColor(140);
+      doc.text(`+${sheets.length - maxThumbs} more`, x + 2, ty + thumbH / 2 + 3);
+    }
+  }
+  doc.setTextColor(0);
 }
 
 function drawRow(doc: jsPDF, cols: string[], x: number, y: number, widths: number[], header = false) {
@@ -480,34 +1165,79 @@ function drawRow(doc: jsPDF, cols: string[], x: number, y: number, widths: numbe
 // ---------------------------------------------------------------------------
 // One sheet page
 // ---------------------------------------------------------------------------
-function drawSheet(doc: jsPDF, sheet: NestSheet, opt: PdfOptions, dims: { w: number; h: number }, labels?: Map<string, PartLabel>) {
+function drawSheet(
+  doc: jsPDF,
+  sheet: NestSheet,
+  opt: PdfOptions,
+  dims: { w: number; h: number },
+  labels?: Map<string, PartLabel>,
+  cabinetByPanelId?: Map<string, string>,
+  nav?: NavCtx,
+  curPage?: () => number,
+) {
   const PAGE_W = dims.w;
   const PAGE_H = dims.h;
   // Use the sheet's actual chosen dims (auto-orient may have swapped them)
   const swMm = sheet.sheetW;
   const slMm = sheet.sheetL;
   const orient = makeOrient(swMm, slMm);
-  // Header
+  // Header — title left; ALL the sheet metadata in one line on the right
+  // (dims, thickness, part count, fill, reusable offcut).
   doc.setFont('helvetica', 'bold');
   doc.setFontSize(14);
-  doc.text(
-    `Sheet ${sheet.index} · ${fmtDim(sheet.thickness, opt.units)} thick · ${sheet.parts.length} parts`,
-    PAGE_PAD,
-    PAGE_PAD - 4,
-  );
+  doc.text(`Sheet ${sheet.globalIndex}`, PAGE_PAD, PAGE_PAD - 4);
   doc.setFont('helvetica', 'normal');
   doc.setFontSize(9);
   doc.setTextColor(120);
   const fill = sheet.parts.length > 0
     ? (sheet.usedArea / (swMm * slMm)) * 100
     : 0;
-  doc.text(
-    `Sheet ${fmtDim(swMm, opt.units)} × ${fmtDim(slMm, opt.units)}   ·   ${fill.toFixed(1)}% fill`,
-    PAGE_W - PAGE_PAD,
-    PAGE_PAD - 4,
-    { align: 'right' },
-  );
+  const meta: string[] = [
+    `${fmtDim(swMm, opt.units)} × ${fmtDim(slMm, opt.units)} × ${fmtDim(sheet.thickness, opt.units)}`,
+    `${sheet.parts.length} parts`,
+    `${fill.toFixed(1)}% fill`,
+  ];
+  if (sheet.largestFree && Math.min(sheet.largestFree.w, sheet.largestFree.h) >= 50) {
+    meta.push(`offcut ${fmtDim(Math.max(sheet.largestFree.w, sheet.largestFree.h), opt.units)} × ${fmtDim(Math.min(sheet.largestFree.w, sheet.largestFree.h), opt.units)}`);
+  }
+  doc.text(meta.join('   ·   '), PAGE_W - PAGE_PAD, PAGE_PAD - 4, { align: 'right' });
   doc.setTextColor(0);
+
+  // Cross-references under the title, kept to a single subtle line:
+  //   - which cabinet each panel belongs to (only when >1 cabinet);
+  //   - a "→ Join split parts p.N" note when the sheet carries dovetail
+  //     segments (drawn in the nav post-pass, where the page number exists).
+  let refX = PAGE_PAD + 64;
+  if (cabinetByPanelId && cabinetByPanelId.size > 0) {
+    const byCab = new Map<string, string[]>();
+    for (const p of sheet.parts) {
+      const cab = cabinetByPanelId.get(`${sheet.globalIndex}${p.panelLabel}`);
+      if (cab) {
+        if (!byCab.has(cab)) byCab.set(cab, []);
+        byCab.get(cab)!.push(p.panelLabel);
+      }
+    }
+    if (byCab.size > 1) {
+      const refs = Array.from(byCab.entries())
+        .map(([cab, ids]) => `${cab}: ${ids.sort().join(',')}`)
+        .join('   ·   ');
+      doc.setFont('helvetica', 'normal');
+      doc.setFontSize(8.5);
+      doc.setTextColor(110);
+      doc.text(refs, refX, PAGE_PAD - 4, { maxWidth: PAGE_W - refX - 260 });
+      refX += doc.getTextWidth(refs) + 18;
+      doc.setTextColor(0);
+    }
+  }
+  if (nav && curPage && sheet.parts.some((p) => /\.s\d+$/.test(p.partId))) {
+    nav.notes.push({
+      page: curPage(),
+      x: refX,
+      y: PAGE_PAD - 4,
+      label: '→ Join split parts',
+      target: 'Join split parts',
+    });
+  }
 
   // Available drawing area
   const drawX = PAGE_PAD;
@@ -613,127 +1343,29 @@ function drawPart(
   const shortMm = Math.min(p.w, p.h);
   doc.setTextColor(20);
 
-  // Per-sheet panel id ("1a", "2c") — centered, no inline dim subtitle.
-  // Dimensions get their own ANSI-style callouts below + on the side.
+  // One label block INSIDE the part: panel id ("1a") with the dimensions
+  // stacked underneath — same convention as the cut cards. No dim lines or
+  // leader callouts; everything the reader needs sits on the part itself.
   if (letter) {
-    const big = Math.max(10, Math.min(34, partPt * 0.34));
+    const big = clamp(partPt * 0.30, 8, 30);
     doc.setFont('helvetica', 'bold');
     doc.setFontSize(big);
-    doc.text(letter, cx, cy + big * 0.34, { align: 'center' });
+    const dimText = `${fmtDim(longMm, opt.units)} × ${fmtDim(shortMm, opt.units)}`;
+    doc.setFontSize(clamp(big * 0.45, 6, 10));
+    const dimsFit = partPt >= 34 && doc.getTextWidth(dimText) <= pwPt - 6;
+    doc.setFontSize(big);
+    if (dimsFit) {
+      doc.text(letter, cx, cy - big * 0.10, { align: 'center' });
+      doc.setFont('helvetica', 'normal');
+      doc.setFontSize(clamp(big * 0.45, 6, 10));
+      doc.setTextColor(80);
+      doc.text(dimText, cx, cy + big * 0.62, { align: 'center' });
+      doc.setTextColor(20);
+    } else {
+      doc.text(letter, cx, cy + big * 0.34, { align: 'center' });
+    }
   }
-
-  // Space hints derived from the panel's position within the sheet — a
-  // leader callout fires only when there's actual waste room outside the
-  // panel in that direction (i.e., the panel sits near the sheet edge).
-  const space = sheetBox ? {
-    below: (sheetBox.y + sheetBox.h) - (py + phPt),
-    right: (sheetBox.x + sheetBox.w) - (px + pwPt),
-    above: py - sheetBox.y,
-    left: px - sheetBox.x,
-  } : {};
-  drawPartDims(doc, px, py, pwPt, phPt, r0.w, r0.h, opt, space);
-
-  void longMm; void shortMm;
-}
-
-/**
- * Draw width + height dimension marks for a part rectangle, ANSI style:
- *   |------  24"  ------|
- *      (line broken with a gap where the value text sits)
- *
- * Inline (default): dim lines just inside the panel's bottom + left edges.
- * Outside (fallback): when the panel is too small to fit the value text
- *   inline, draw a leader line from inside the panel to the value placed
- *   OUTSIDE — the caller passes free-space hints via `space` so the leader
- *   only fires when there's actually room.
- */
-function drawPartDims(
-  doc: jsPDF,
-  px: number,
-  py: number,
-  pwPt: number,
-  phPt: number,
-  realW: number,
-  realH: number,
-  opt: PdfOptions,
-  space: { below?: number; right?: number; above?: number; left?: number } = {},
-) {
-  const COLOR: [number, number, number] = [60, 60, 60];
-  const TICK = 2.5;
-  const GAP_PAD = 4;          // px on each side of the value text inside the line gap
-  const INSET = 5;            // distance from panel edge to dim line
-  doc.setDrawColor(...COLOR);
-  doc.setLineWidth(0.45);
-  doc.setFont('helvetica', 'normal');
-  doc.setTextColor(...COLOR);
-
-  // ---- WIDTH (horizontal axis along bottom) ------------------------------
-  const wText = fmtDim(realW, opt.units);
-  const wFontInline = clamp(pwPt * 0.085, 6.5, 9.5);
-  doc.setFontSize(wFontInline);
-  const wTextW = doc.getTextWidth(wText);
-  const lineLen = pwPt - 2 * INSET;
-  const canInlineW = lineLen >= wTextW + GAP_PAD * 4 && phPt >= 22;
-  if (canInlineW) {
-    const dimY = py + phPt - INSET;
-    const x1 = px + INSET;
-    const x2 = px + pwPt - INSET;
-    const cx = (x1 + x2) / 2;
-    const gx1 = cx - wTextW / 2 - GAP_PAD;
-    const gx2 = cx + wTextW / 2 + GAP_PAD;
-    // Witness ticks at both ends
-    doc.line(x1, dimY - TICK, x1, dimY + TICK);
-    doc.line(x2, dimY - TICK, x2, dimY + TICK);
-    // Broken line with gap for the value
-    doc.line(x1, dimY, gx1, dimY);
-    doc.line(gx2, dimY, x2, dimY);
-    doc.text(wText, cx, dimY + wFontInline * 0.34, { align: 'center' });
-  } else if ((space.below ?? 0) > 18) {
-    // Leader callout BELOW the panel — small dot inside, line out + text.
-    doc.setFontSize(8);
-    const sx = px + pwPt / 2;
-    const sy = py + phPt - 3;
-    const ey = py + phPt + Math.min(space.below ?? 18, 14);
-    doc.circle(sx, sy - 0.5, 0.7, 'F');
-    doc.line(sx, sy, sx, ey);
-    doc.text(wText, sx, ey + 7, { align: 'center' });
-  }
-
-  // ---- HEIGHT (vertical axis along left) ---------------------------------
-  const hText = fmtDim(realH, opt.units);
-  const hFontInline = clamp(phPt * 0.085, 6.5, 9.5);
-  doc.setFontSize(hFontInline);
-  const hTextW = doc.getTextWidth(hText);
-  const hLineLen = phPt - 2 * INSET;
-  const canInlineH = hLineLen >= hTextW + GAP_PAD * 4 && pwPt >= 22;
-  if (canInlineH) {
-    const dimX = px + INSET;
-    const y1 = py + INSET;
-    const y2 = py + phPt - INSET;
-    const cy = (y1 + y2) / 2;
-    const gy1 = cy - hTextW / 2 - GAP_PAD;
-    const gy2 = cy + hTextW / 2 + GAP_PAD;
-    doc.line(dimX - TICK, y1, dimX + TICK, y1);
-    doc.line(dimX - TICK, y2, dimX + TICK, y2);
-    doc.line(dimX, y1, dimX, gy1);
-    doc.line(dimX, gy2, dimX, y2);
-    // Rotated text in the gap. With angle=90 in jsPDF, the x coordinate is
-    // the baseline anchor — for the visual centre to sit ON the dim line we
-    // need to offset x to the RIGHT by half the font height (the character
-    // body extends LEFT from the baseline once rotated CCW).
-    doc.text(hText, dimX + hFontInline * 0.34, cy, { align: 'center', angle: 90 });
-  } else if ((space.right ?? 0) > 18) {
-    // Leader callout to the RIGHT of the panel.
-    doc.setFontSize(8);
-    const sx = px + pwPt - 3;
-    const sy = py + phPt / 2;
-    const ex = px + pwPt + Math.min(space.right ?? 18, 14);
-    doc.circle(sx - 0.5, sy, 0.7, 'F');
-    doc.line(sx, sy, ex, sy);
-    doc.text(hText, ex + 4, sy + 2.6);
-  }
-
-  doc.setTextColor(0);
+  void sheetBox;
 }
 
 function clamp(v: number, lo: number, hi: number): number {
@@ -1324,9 +1956,10 @@ function drawShoppingListPage(doc: jsPDF, opt: PdfOptions, dims: { w: number; h:
   doc.setFont('helvetica', 'normal');
   doc.setFontSize(10);
   doc.setTextColor(120);
+  const toBuy = items.reduce((a, x) => a + Math.max(0, x.needed - x.available), 0);
   doc.text(
     items.length > 0
-      ? `${items.reduce((a, x) => a + Math.max(0, x.needed - x.available), 0)} sheets to buy.`
+      ? `${toBuy} ${toBuy === 1 ? 'sheet' : 'sheets'} to buy.`
       : 'No materials needed (empty job).',
     PAGE_W - PAGE_PAD, PAGE_PAD + 6, { align: 'right' },
   );
@@ -1390,76 +2023,6 @@ function drawShoppingListPage(doc: jsPDF, opt: PdfOptions, dims: { w: number; h:
     doc.text('—', PAGE_W - PAGE_PAD, y, { align: 'right' });
   }
   doc.setTextColor(0);
-}
-
-// ---------------------------------------------------------------------------
-// Cut list summary — text-mode rip-then-crosscut steps per sheet.
-// (Visual versions are on the "Cut sheet" pages.)
-// ---------------------------------------------------------------------------
-function drawCutListSummary(
-  doc: jsPDF,
-  result: NestResult,
-  opt: PdfOptions,
-  dims: { w: number; h: number },
-  tagSection?: (s: string) => void,
-) {
-  const PAGE_W = dims.w;
-  const PAGE_H = dims.h;
-  const cuts = allCutSteps(result, opt.margin);
-  const total = cuts.reduce((a, sc) => a + sc.steps.length, 0);
-
-  doc.setFont('helvetica', 'bold');
-  doc.setFontSize(20);
-  doc.text('Cut list', PAGE_PAD, PAGE_PAD + 6);
-  doc.setFont('helvetica', 'normal');
-  doc.setFontSize(10);
-  doc.setTextColor(120);
-  doc.text(
-    `${total} cuts across ${cuts.length} sheets. Larger cuts first; then cut to length.`,
-    PAGE_PAD, PAGE_PAD + 24, { maxWidth: PAGE_W - 2 * PAGE_PAD },
-  );
-  doc.setTextColor(0);
-
-  let y = PAGE_PAD + 46;
-  const lineH = 13;
-  const bottom = PAGE_H - PAGE_PAD;
-
-  for (const sc of cuts) {
-    if (y > bottom - 40) { doc.addPage(); tagSection?.('Cut list'); y = PAGE_PAD + 6; }
-    doc.setFont('helvetica', 'bold');
-    doc.setFontSize(11);
-    doc.setTextColor(20);
-    doc.text(
-      `Sheet ${sc.globalIndex}  ·  ${fmtDim(sc.thickness, opt.units)} thick  ·  ${sc.steps.length} cuts`,
-      PAGE_PAD, y,
-    );
-    y += 14;
-
-    if (sc.steps.length === 0) {
-      doc.setFont('helvetica', 'italic');
-      doc.setFontSize(10);
-      doc.setTextColor(120);
-      doc.text('No interior cuts.', PAGE_PAD + 14, y);
-      doc.setTextColor(0);
-      y += lineH + 4;
-      continue;
-    }
-
-    doc.setFont('helvetica', 'normal');
-    doc.setFontSize(10);
-    doc.setTextColor(40);
-    for (const st of sc.steps) {
-      if (y > bottom - lineH) { doc.addPage(); tagSection?.('Cut list'); y = PAGE_PAD + 6; }
-      const edgeRef = st.axis === 'rip' ? 'from L of parent' : 'from B of parent';
-      const label   = st.axis === 'rip' ? 'Rip' : 'Crosscut';
-      doc.text(
-        `${String(st.index).padStart(2, ' ')}.  ${label}  at  ${fmtDim(st.distance, opt.units)}  ${edgeRef}`,
-        PAGE_PAD + 14, y,
-      );
-      y += lineH;
-    }
-    y += 6;
-  }
 }
 
 // ---------------------------------------------------------------------------
@@ -1554,6 +2117,8 @@ function drawPartsOverview(
   opt: PdfOptions,
   dims: { w: number; h: number },
   tagSection?: (s: string) => void,
+  nav?: NavCtx,
+  curPage?: () => number,
 ) {
   const PAGE_W = dims.w;
   const PAGE_H = dims.h;
@@ -1652,6 +2217,12 @@ function drawPartsOverview(
           color: panel.color,
         };
         drawPartCard(doc, label, x, y, cardW, cardH, opt);
+        // Panel ids embed their sheet number ("3a" → sheet 3) — make the
+        // whole card a link to that sheet's layout page.
+        const sheetNo = parseInt(panel.id, 10);
+        if (nav && curPage && Number.isFinite(sheetNo)) {
+          nav.links.push({ page: curPage(), x, y, w: cardW, h: cardH, target: `Sheet ${sheetNo}` });
+        }
         col++;
         if (col >= cols) { col = 0; y += cardH + gutter; }
       }
@@ -1738,116 +2309,6 @@ function drawPartCard(
   );
 }
 
-// ---------------------------------------------------------------------------
-// Cut instructions
-//   - Per sheet: numbered list of cut steps (rips first, then crosscuts)
-//   - Shows distance from reference edge
-// ---------------------------------------------------------------------------
-function drawCutInstructions(
-  doc: jsPDF,
-  result: NestResult,
-  opt: PdfOptions,
-  dims: { w: number; h: number },
-  _labels: Map<string, PartLabel>,
-  tagSection?: (s: string) => void,
-) {
-  const PAGE_W = dims.w;
-  const PAGE_H = dims.h;
-  // Pair each SheetCuts with its source NestSheet so the cut cards can
-  // overlay the placed parts (color-tinted under the cut lines).
-  const pairs: { sc: ReturnType<typeof allCutSteps>[number]; parts: NestSheet['parts'] }[] = [];
-  const cuts = allCutSteps(result, opt.margin);
-  let pi = 0;
-  for (const g of result.groups) {
-    for (const s of g.sheets) {
-      pairs.push({ sc: cuts[pi++], parts: s.parts });
-    }
-  }
-
-  const totalCuts = cuts.reduce((a, sc) => a + sc.steps.length, 0);
-
-  // Cover header
-  doc.setFont('helvetica', 'bold');
-  doc.setFontSize(20);
-  doc.text('Cut sequence', PAGE_PAD, PAGE_PAD + 6);
-  doc.setFont('helvetica', 'normal');
-  doc.setFontSize(11);
-  doc.setTextColor(60);
-  doc.text(`Total cuts to make: ${totalCuts}`, PAGE_PAD, PAGE_PAD + 24);
-  doc.setFontSize(9);
-  doc.setTextColor(120);
-  doc.text(
-    'For each sheet, follow the cuts in order. The bold red line is the current cut; thin gray lines are cuts already made.',
-    PAGE_PAD, PAGE_PAD + 38,
-  );
-  doc.setTextColor(0);
-
-  // Constants for the per-cut grid
-  const TOP0 = PAGE_PAD + 58;          // y for the first row of diagrams on the cover page
-  const TOP_NEW = PAGE_PAD + 28;       // y for the first row on subsequent pages (less header)
-  const BOTTOM_PAD = PAGE_PAD;
-  const cardGutter = 12;
-  const cardCaptionH = 22;
-  // Choose card width so 4–5 cards fit per row on most paper sizes
-  const cols = PAGE_W > 1000 ? 6 : PAGE_W > 750 ? 5 : 4;
-  const innerW = PAGE_W - 2 * PAGE_PAD;
-  const cardW = (innerW - cardGutter * (cols - 1)) / cols;
-
-  for (let sIdx = 0; sIdx < pairs.length; sIdx++) {
-    const { sc, parts } = pairs[sIdx];
-
-    // Sheet header — break to a new page if there isn't room for at least
-    // one row of cards underneath it.
-    const sheetAspect = sc.sheetL / sc.sheetW;
-    const cardDiagH = cardW * sheetAspect;
-    const cardH = cardDiagH + cardCaptionH;
-    const headerH = 22;
-
-    let y = sIdx === 0 ? TOP0 : TOP_NEW;
-    if (sIdx > 0) {
-      doc.addPage();
-      tagSection?.('Cut sheet');
-      y = TOP_NEW;
-    }
-    doc.setFont('helvetica', 'bold');
-    doc.setFontSize(13);
-    doc.setTextColor(20);
-    doc.text(
-      `Sheet ${sc.globalIndex}  ·  ${fmtDim(sc.thickness, opt.units)} thick  ·  ${fmtDim(sc.sheetW, opt.units)} × ${fmtDim(sc.sheetL, opt.units)}  ·  ${sc.steps.length} cuts`,
-      PAGE_PAD, y,
-    );
-    y += headerH;
-
-    if (sc.steps.length === 0) {
-      doc.setFont('helvetica', 'italic');
-      doc.setFontSize(10);
-      doc.setTextColor(120);
-      doc.text('No interior cuts — single part fills the sheet.', PAGE_PAD, y + 4);
-      doc.setTextColor(0);
-      continue;
-    }
-
-    let col = 0;
-    for (let i = 0; i < sc.steps.length; i++) {
-      // Card sits at (x, y); start a new row when col fills; start a new
-      // page when we'd run off the bottom.
-      if (y + cardH > PAGE_H - BOTTOM_PAD) {
-        doc.addPage();
-        tagSection?.('Cut sheet');
-        y = TOP_NEW;
-        col = 0;
-      }
-      const x = PAGE_PAD + col * (cardW + cardGutter);
-      drawCutCard(doc, sc, parts, i, x, y, cardW, cardDiagH, opt, _labels);
-      col++;
-      if (col >= cols) {
-        col = 0;
-        y += cardH + cardGutter;
-      }
-    }
-  }
-}
-
 /**
  * Draw one cut-step card: caption above, sheet diagram below with
  * placed parts overlaid in their colors, the active parent piece
@@ -1868,15 +2329,6 @@ function drawCutCard(
   _labels?: Map<string, PartLabel>,
 ) {
   const cur = sc.steps[cutIdx];
-  // Cut sequence cards intentionally keep the SHEET's original orientation
-  // (per-sheet "overview" page is the one that rotates to long-edge-horizontal).
-  // Identity orient = no swap.
-  const orient: Orient = {
-    dispW: sc.sheetW,
-    dispH: sc.sheetL,
-    rotated: false,
-    rect: (x, y, w, h) => ({ x, y, w, h }),
-  };
 
   // Caption (above the diagram)
   doc.setFont('helvetica', 'bold');
@@ -1898,9 +2350,34 @@ function drawCutCard(
   doc.text(`${label}  ${fmtDim(cur.distance, opt.units)}  ${edgeRef}`, x, y + 20);
   doc.setTextColor(0);
 
-  // Diagram: sheet rectangle + parts + cuts. Scale uses display dims so
-  // the long edge sits horizontally regardless of sheet orientation.
-  const diagY = y + 24;
+  drawCutDiagram(doc, sc, parts, cutIdx, x, y + 24, cardW, diagH, opt);
+}
+
+/**
+ * The cut-step DIAGRAM alone (sheet + parts + prior cuts + active cut),
+ * without the caption — shared by the desktop cut cards and the mobile
+ * one-cut-per-page layout.
+ */
+function drawCutDiagram(
+  doc: jsPDF,
+  sc: ReturnType<typeof allCutSteps>[number],
+  parts: NestSheet['parts'],
+  cutIdx: number,
+  x: number,
+  diagY: number,
+  cardW: number,
+  diagH: number,
+  opt: PdfOptions,
+) {
+  const cur = sc.steps[cutIdx];
+  // Keep the SHEET's original orientation (the per-sheet overview page is
+  // the one that rotates long-edge-horizontal). Identity orient = no swap.
+  const orient: Orient = {
+    dispW: sc.sheetW,
+    dispH: sc.sheetL,
+    rotated: false,
+    rect: (x, y, w, h) => ({ x, y, w, h }),
+  };
   const scale = Math.min(cardW / orient.dispW, diagH / orient.dispH);
   const dW = orient.dispW * scale;
   const dH = orient.dispH * scale;

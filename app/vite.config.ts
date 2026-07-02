@@ -1,4 +1,4 @@
-import { defineConfig } from 'vite';
+import { defineConfig, type Plugin } from 'vite';
 import { execSync } from 'node:child_process';
 
 /**
@@ -13,11 +13,35 @@ function git(cmd: string, fallback = ''): string {
   }
 }
 
-const GIT_SHA    = git('rev-parse --short HEAD', 'dev');
-const GIT_AUTHOR = git('log -1 --format=%an',    'local');
-const GIT_DATE   = git('log -1 --format=%cs',    '');
+function escapeHtml(s: string): string {
+  return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
+/**
+ * Inject "sha · author · date" of the repo's CURRENT HEAD into the
+ * #versionLine placeholder in index.html. transformIndexHtml runs on every
+ * page load in dev — pulling a new commit shows up on the next reload, no
+ * server restart needed — and once at build time for production bundles.
+ */
+function gitVersionLine(): Plugin {
+  return {
+    name: 'git-version-line',
+    transformIndexHtml(html) {
+      const parts = [
+        git('rev-parse --short HEAD', 'dev'),
+        git('log -1 --format=%an', 'local'),
+        git('log -1 --format=%cs', ''),
+      ].filter(Boolean);
+      return html.replace(
+        /(<p class="version" id="versionLine">)[^<]*(<\/p>)/,
+        `$1${escapeHtml(parts.join(' · '))}$2`,
+      );
+    },
+  };
+}
 
 export default defineConfig({
+  plugins: [gitVersionLine()],
   server: {
     port: 5173,
     open: false,
@@ -31,10 +55,5 @@ export default defineConfig({
   },
   worker: {
     format: 'es'
-  },
-  define: {
-    __GIT_SHA__:    JSON.stringify(GIT_SHA),
-    __GIT_AUTHOR__: JSON.stringify(GIT_AUTHOR),
-    __GIT_DATE__:   JSON.stringify(GIT_DATE),
   },
 });
