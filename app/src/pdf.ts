@@ -627,25 +627,27 @@ function buildMobilePdf(result: NestResult, opt: PdfOptions): jsPDF {
   };
 
   // COVER — compact: accent bar, job name, key stats, hero render.
+  // Type runs ~30% larger than the desktop build throughout the mobile
+  // pages — the page IS the phone screen, no zooming.
   tagSection('Cover');
   {
     let y = PAGE_PAD + 12;
     doc.setFillColor(107, 79, 49);
-    doc.rect(PAGE_PAD, y, 30, 3, 'F');
-    y += 26;
+    doc.rect(PAGE_PAD, y, 34, 4, 'F');
+    y += 32;
     doc.setFont('helvetica', 'bold');
-    doc.setFontSize(19);
+    doc.setFontSize(24);
     doc.setTextColor(25);
     doc.text(opt.jobName || 'Plywood cut estimate', PAGE_PAD, y, { maxWidth: innerW });
-    y += 26;
+    y += 30;
     doc.setFont('helvetica', 'normal');
-    doc.setFontSize(9);
-    doc.setTextColor(130);
+    doc.setFontSize(10.5);
+    doc.setTextColor(120);
     doc.text(
       `Sheet ${fmtDim(opt.sheetW, opt.units)} × ${fmtDim(opt.sheetL, opt.units)}  ·  margin ${fmtDim(opt.margin, opt.units)}  ·  kerf ${fmtDim(opt.kerf, opt.units)}`,
       PAGE_PAD, y, { maxWidth: innerW },
     );
-    y += 26;
+    y += 32;
     const metrics: [string, string][] = [
       ['Sheets', String(result.totalSheets)],
       ['Yield', `${(result.yield * 100).toFixed(1)}%`],
@@ -658,17 +660,17 @@ function buildMobilePdf(result: NestResult, opt: PdfOptions): jsPDF {
     const colW = innerW / 2;
     metrics.forEach(([k, v], i) => {
       const x = PAGE_PAD + (i % 2) * colW;
-      const ry = y + Math.floor(i / 2) * 46;
+      const ry = y + Math.floor(i / 2) * 58;
       doc.setFont('helvetica', 'normal');
-      doc.setFontSize(8);
+      doc.setFontSize(9.5);
       doc.setTextColor(140);
       doc.text(k.toUpperCase(), x, ry);
       doc.setFont('helvetica', 'bold');
-      doc.setFontSize(18);
+      doc.setFontSize(24);
       doc.setTextColor(25);
-      doc.text(v, x, ry + 20);
+      doc.text(v, x, ry + 26);
     });
-    y += 46 * Math.ceil(metrics.length / 2) + 8;
+    y += 58 * Math.ceil(metrics.length / 2) + 10;
     const hero = opt.cabinets?.find((c) => c.assembled)?.assembled;
     if (hero) {
       drawSnapshotPanel(doc, hero, PAGE_PAD, y, innerW, PAGE_H - PAGE_PAD - y - 6, { frameless: true });
@@ -676,28 +678,32 @@ function buildMobilePdf(result: NestResult, opt: PdfOptions): jsPDF {
     doc.setTextColor(0);
   }
 
-  // SHOPPING LIST — compact "material · buy N" rows.
+  // SHOPPING LIST — big "material · buy N" rows with hairline separators.
   const items = opt.inventoryCheck ?? [];
   if (items.length > 0) {
     addPage('Shopping list');
-    let y = PAGE_PAD + 16;
+    let y = PAGE_PAD + 22;
     doc.setFont('helvetica', 'bold');
-    doc.setFontSize(16);
+    doc.setFontSize(20);
     doc.setTextColor(25);
     doc.text('Shopping list', PAGE_PAD, y);
-    y += 24;
-    doc.setFontSize(10.5);
+    y += 32;
+    doc.setFontSize(13);
     for (const r of items) {
       const short = Math.max(0, r.needed - r.available);
       doc.setFont('helvetica', 'normal');
       doc.setTextColor(40);
-      doc.text(r.label, PAGE_PAD, y, { maxWidth: innerW - 70 });
+      doc.text(r.label, PAGE_PAD, y, { maxWidth: innerW - 76 });
       doc.setFont('helvetica', 'bold');
       if (short > 0) doc.setTextColor(192, 58, 54);
       else doc.setTextColor(80, 132, 110);
       doc.text(short > 0 ? `Buy ${short}` : 'OK', PAGE_W - PAGE_PAD, y, { align: 'right' });
+      y += 12;
+      doc.setDrawColor(232);
+      doc.setLineWidth(0.4);
+      doc.line(PAGE_PAD, y, PAGE_W - PAGE_PAD, y);
       y += 18;
-      if (y > PAGE_H - PAGE_PAD) { addPage('Shopping list'); y = PAGE_PAD + 16; }
+      if (y > PAGE_H - PAGE_PAD) { addPage('Shopping list'); y = PAGE_PAD + 22; }
     }
     doc.setTextColor(0);
   }
@@ -732,18 +738,18 @@ function buildMobilePdf(result: NestResult, opt: PdfOptions): jsPDF {
     const section = `Assembly · ${cab.name}`;
     addPage(section);
     {
-      let y = PAGE_PAD + 16;
+      let y = PAGE_PAD + 22;
       doc.setFont('helvetica', 'bold');
-      doc.setFontSize(15);
+      doc.setFontSize(19);
       doc.setTextColor(25);
       doc.text(cab.name, PAGE_PAD, y, { maxWidth: innerW });
-      y += 16;
+      y += 20;
       doc.setFont('helvetica', 'normal');
-      doc.setFontSize(9);
-      doc.setTextColor(130);
+      doc.setFontSize(11);
+      doc.setTextColor(120);
       const totalPanels = cab.panels?.length ?? cab.partIds.length;
       doc.text(`${totalPanels} panels`, PAGE_PAD, y);
-      y += 10;
+      y += 12;
       const imgH = Math.min(innerW, PAGE_H - y - PAGE_PAD - 8);
       drawSnapshotPanel(doc, cab.assembled, PAGE_PAD, y, innerW, imgH, { frameless: true });
       doc.setTextColor(0);
@@ -770,22 +776,22 @@ function drawMobileSheetPage(doc: jsPDF, sheet: NestSheet, opt: PdfOptions, dims
   const PAGE_W = dims.w;
   const PAGE_H = dims.h;
   const innerW = PAGE_W - 2 * PAGE_PAD;
-  let y = PAGE_PAD + 16;
+  let y = PAGE_PAD + 22;
 
   doc.setFont('helvetica', 'bold');
-  doc.setFontSize(16);
+  doc.setFontSize(20);
   doc.setTextColor(25);
   doc.text(`Sheet ${sheet.globalIndex}`, PAGE_PAD, y);
-  y += 14;
+  y += 18;
   doc.setFont('helvetica', 'normal');
-  doc.setFontSize(8.5);
-  doc.setTextColor(130);
+  doc.setFontSize(11);
+  doc.setTextColor(120);
   const fill = sheet.parts.length > 0 ? (sheet.usedArea / (sheet.sheetW * sheet.sheetL)) * 100 : 0;
   doc.text(
     `${fmtDim(sheet.sheetW, opt.units)} × ${fmtDim(sheet.sheetL, opt.units)} × ${fmtDim(sheet.thickness, opt.units)}  ·  ${sheet.parts.length} parts  ·  ${fill.toFixed(0)}% fill`,
     PAGE_PAD, y, { maxWidth: innerW },
   );
-  y += 12;
+  y += 16;
 
   // Layout — same long-edge-horizontal convention as every other view.
   const orient = makeOrient(sheet.sheetW, sheet.sheetL);
@@ -804,23 +810,27 @@ function drawMobileSheetPage(doc: jsPDF, sheet: NestSheet, opt: PdfOptions, dims
   y += dH + 22;
 
   // Part list — id · name · long × short. Stands in for the desktop
-  // Parts overview grid.
-  doc.setFontSize(10);
+  // Parts overview grid. Big rows with hairline separators.
+  doc.setFontSize(13);
   for (const p of sheet.parts) {
-    if (y > PAGE_H - PAGE_PAD - 6) break;
+    if (y > PAGE_H - PAGE_PAD - 10) break;
     doc.setFont('helvetica', 'bold');
     doc.setTextColor(30);
     doc.text(`${sheet.globalIndex}${p.panelLabel}`, PAGE_PAD, y);
     doc.setFont('helvetica', 'normal');
-    doc.setTextColor(90);
-    const name = p.partName.length > 22 ? p.partName.slice(0, 19) + '…' : p.partName;
-    doc.text(name, PAGE_PAD + 30, y);
+    doc.setTextColor(100);
+    const name = p.partName.length > 16 ? p.partName.slice(0, 13) + '…' : p.partName;
+    doc.text(name, PAGE_PAD + 38, y);
     doc.setTextColor(40);
     doc.text(
       `${fmtDim(Math.max(p.w, p.h), opt.units)} × ${fmtDim(Math.min(p.w, p.h), opt.units)}`,
       PAGE_W - PAGE_PAD, y, { align: 'right' },
     );
-    y += 15;
+    y += 10;
+    doc.setDrawColor(235);
+    doc.setLineWidth(0.4);
+    doc.line(PAGE_PAD, y, PAGE_W - PAGE_PAD, y);
+    y += 14;
   }
   doc.setTextColor(0);
 }
@@ -840,28 +850,35 @@ function drawMobileCutPage(
   const PAGE_H = dims.h;
   const innerW = PAGE_W - 2 * PAGE_PAD;
   const cur = sc.steps[cutIdx];
-  let y = PAGE_PAD + 20;
+  let y = PAGE_PAD + 18;
 
-  doc.setFont('helvetica', 'bold');
-  doc.setFontSize(18);
-  doc.setTextColor(25);
-  doc.text(`Cut ${cur.index} of ${sc.steps.length}`, PAGE_PAD, y);
-  y += 22;
+  // Reading order at the saw: where am I (small) → WHAT DO I CUT (huge,
+  // the action + distance) → measured from which edge (medium).
+  doc.setFont('helvetica', 'normal');
+  doc.setFontSize(10.5);
+  doc.setTextColor(140);
+  doc.text(`CUT ${cur.index} OF ${sc.steps.length}`, PAGE_PAD, y);
+  y += 28;
 
   let label: string;
   let edgeRef: string;
   if (cur.isTrim) {
-    label = 'Trim margin';
-    edgeRef = '(reference edge)';
+    label = 'Trim';
+    edgeRef = 'reference edge';
   } else {
     label = cur.axis === 'rip' ? 'Rip' : 'Crosscut';
     edgeRef = cur.axis === 'rip' ? 'from the LEFT edge' : 'from the BOTTOM edge';
   }
+  doc.setFont('helvetica', 'bold');
+  doc.setFontSize(26);
+  doc.setTextColor(25);
+  doc.text(`${label}  ${fmtDim(cur.distance, opt.units)}`, PAGE_PAD, y);
+  y += 20;
   doc.setFont('helvetica', 'normal');
-  doc.setFontSize(12.5);
-  doc.setTextColor(70);
-  doc.text(`${label}  ·  ${fmtDim(cur.distance, opt.units)}  ${edgeRef}`, PAGE_PAD, y, { maxWidth: innerW });
-  y += 16;
+  doc.setFontSize(13.5);
+  doc.setTextColor(90);
+  doc.text(edgeRef, PAGE_PAD, y, { maxWidth: innerW });
+  y += 14;
 
   // Diagram fills the rest of the page (same orientation as the desktop
   // cut cards). Sits just under the instruction — not vertically centered —
