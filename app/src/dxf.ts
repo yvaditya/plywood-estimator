@@ -94,9 +94,11 @@ function tables(): string {
      '3', 'Solid line', '72', '65', '73', '0', '40', '0.0'].join(NL),
     '0', 'ENDTAB',
     '0', 'TABLE', '2', 'LAYER', '70', '5',
-    layer('SHEET', 7),
+    // ACI colors: 5 = blue (stock boundary, not a cut), 7 = white/black
+    // (the machine's actual cut contours — reads black on light backgrounds).
+    layer('SHEET', 5),
     layer('MARGIN', 8),
-    layer('PARTS', 5),
+    layer('PARTS', 7),
     layer('LABELS', 3),
     layer('DIMS', 1),
     '0', 'ENDTAB',
