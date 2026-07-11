@@ -144,9 +144,22 @@ const savePresetBtn = $<HTMLButtonElement>('savePresetBtn');
 const deletePresetBtn = $<HTMLButtonElement>('deletePresetBtn');
 const restartsSelect = $<HTMLSelectElement>('restarts');
 const cutStrategySelect = $<HTMLSelectElement>('cutStrategy');
+const thicknessOverrideSelect = $<HTMLSelectElement>('thicknessOverride');
 const splitOversizeRow = $('splitOversizeRow');
 const splitOversizeCheck = $<HTMLInputElement>('splitOversize');
 const viewerEl = $('viewer');
+
+// Thickness override — standard nominal plywood sizes, exact mm.
+const STANDARD_THICKNESSES_MM = [6.35, 12.7, 19.05, 25.4]; // 1/4″ 1/2″ 3/4″ 1″
+function applyThicknessOverride(measuredMm: number): number {
+  const v = thicknessOverrideSelect.value;
+  if (!v) return measuredMm;
+  if (v === 'snap') {
+    return STANDARD_THICKNESSES_MM.reduce((best, t) =>
+      Math.abs(t - measuredMm) < Math.abs(best - measuredMm) ? t : best);
+  }
+  return parseFloat(v);
+}
 
 // The dovetail auto-split only makes sense for contour-cutting strategies.
 function syncSplitOversizeVisibility() {
@@ -948,7 +961,7 @@ async function runEstimate(opts: { seed?: number; deepSearch?: boolean } = {}) {
   const parts: NestPart[] = selected.map((b) => ({
     id: String(b.id),
     name: b.name,
-    thickness: b.analysis.thickness,
+    thickness: applyThicknessOverride(b.analysis.thickness),
     qty: b.qty,
     grain: b.grain,
     rotation: b.rotation,
@@ -1454,7 +1467,7 @@ function unplacedStepParts(): StepPart[] {
         name: `${u.partName} #${u.instance}`,
         outer: o.outer,
         holes: o.holes,
-        thickness: body.analysis.thickness,
+        thickness: g.thickness,
       });
     }
   }

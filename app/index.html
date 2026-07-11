@@ -98,9 +98,20 @@
               <select id="cutStrategy">
                 <option value="free">Max yield (any cuts)</option>
                 <option value="guillotine" selected>Min cuts (track saw / panel saw)</option>
+                <option value="guillotine-exact">Min cuts+ (exhaustive search, slower)</option>
                 <option value="save-last">Max yield, save last sheet</option>
                 <option value="cnc">CNC nest (any angle · router / waterjet)</option>
                 <option value="cnc-save-last">CNC nest, save last sheet (any angle)</option>
+              </select>
+            </label>
+            <label style="grid-column: 1 / -1">Thickness override
+              <select id="thicknessOverride">
+                <option value="" selected>Off (use measured)</option>
+                <option value="snap">Snap to nearest standard</option>
+                <option value="6.35">1/4″ · 6.35 mm</option>
+                <option value="12.7">1/2″ · 12.7 mm</option>
+                <option value="19.05">3/4″ · 19.05 mm</option>
+                <option value="25.4">1″ (4/4) · 25.4 mm</option>
               </select>
             </label>
             <label id="splitOversizeRow" class="check-row" style="grid-column: 1 / -1" hidden>

@@ -40,12 +40,22 @@ export type Heuristic = 'BSSF' | 'BLSF' | 'BAF' | 'BL';
  *                  leftover parts so the least-filled (last) sheet is as empty
  *                  as possible and its parts cluster in one corner — leaving a
  *                  clean offcut to save for another job.
+ * 'guillotine-exact' = same min-cuts objective as 'guillotine', but the trial
+ *                  pool additionally runs a beam search over guillotine cut
+ *                  trees (part choice × orientation × split axis) — slower,
+ *                  often finds layouts a greedy shelf/SAS pass can't.
  */
-export type CutStrategy = 'free' | 'guillotine' | 'save-last' | 'cnc' | 'cnc-save-last';
+export type CutStrategy = 'free' | 'guillotine' | 'guillotine-exact' | 'save-last' | 'cnc' | 'cnc-save-last';
 
 /** True for any CNC (true-shape) strategy — dispatched to cncNest.ts. */
 export function isCncStrategy(s: CutStrategy): boolean {
   return s === 'cnc' || s === 'cnc-save-last';
+}
+
+/** True for any min-cuts (panel-saw) strategy — both share the same
+ *  objective; 'guillotine-exact' just searches harder. */
+export function isGuillotineStrategy(s: CutStrategy | undefined): boolean {
+  return s === 'guillotine' || s === 'guillotine-exact';
 }
 
 export interface PackInput {
@@ -349,6 +359,49 @@ class ShelfBin implements BinPacker {
 }
 
 /**
+ * ShelfBin rotated 90° — strips run VERTICALLY (rip cuts along the sheet's
+ * short axis) instead of horizontally. A human picks the strip direction to
+ * match the parts; the optimiser tries both and keeps the better one.
+ *
+ * Implemented as a coordinate-transposing wrapper: pack into an inner
+ * ShelfBin whose bin is (h × w), then mirror every rect across the x=y
+ * diagonal on the way out. A part's real orientation is preserved: the
+ * (w, h) footprint goes in as (h, w) and the double swap cancels, so the
+ * inner bin's `rotated` flag maps through unchanged.
+ */
+class ShelfBinV implements BinPacker {
+  binW: number;
+  binH: number;
+  free: FreeRect[] = [];
+  cuts: Cut[] = [];
+  private inner: ShelfBin;
+
+  constructor(w: number, h: number) {
+    this.binW = w;
+    this.binH = h;
+    this.inner = new ShelfBin(h, w);
+  }
+
+  insert(w: number, h: number, allowRotate: boolean, heur: Heuristic): PackPlacement | null {
+    const p = this.inner.insert(h, w, allowRotate, heur);
+    if (!p) return null;
+    return { id: '', x: p.y, y: p.x, w: p.h, h: p.w, rotated: p.rotated };
+  }
+
+  finalize() {
+    this.inner.finalize();
+    this.free = this.inner.free.map((f) => ({ x: f.y, y: f.x, w: f.h, h: f.w, depth: f.depth }));
+    this.cuts = this.inner.cuts.map((c) => ({
+      parentX: c.parentY, parentY: c.parentX,
+      parentW: c.parentH, parentH: c.parentW,
+      axis: c.axis === 'H' ? 'V' as const : 'H' as const,
+      distance: c.distance,
+      depth: c.depth,
+    }));
+  }
+}
+
+/**
  * Guillotine bin packer.
  * Every part placement creates EXACTLY two child free rectangles via an
  * edge-to-edge "cut" — never a 4-way split. The result is producible with
@@ -422,6 +475,14 @@ class GuillotineBin implements BinPacker {
 function recordCuts(cuts: Cut[], f: FreeRect, w: number, h: number, parentDepth: number) {
   const leftoverW = f.w - w;
   const leftoverH = f.h - h;
+  recordCutsAxis(cuts, f, w, h, parentDepth, leftoverW < leftoverH ? 'H' : 'V');
+}
+
+/** recordCuts with the primary (full-span) cut axis chosen by the CALLER —
+ *  the beam search branches on this choice instead of fixing SAS. */
+function recordCutsAxis(cuts: Cut[], f: FreeRect, w: number, h: number, parentDepth: number, primary: 'H' | 'V') {
+  const leftoverW = f.w - w;
+  const leftoverH = f.h - h;
   if (leftoverW <= 0 && leftoverH <= 0) return; // perfect fit, no cut needed
 
   if (leftoverW <= 0) {
@@ -441,7 +502,7 @@ function recordCuts(cuts: Cut[], f: FreeRect, w: number, h: number, parentDepth:
     return;
   }
 
-  if (leftoverW < leftoverH) {
+  if (primary === 'H') {
     // Horizontal cut first across the full parent width
     cuts.push({
       parentX: f.x, parentY: f.y, parentW: f.w, parentH: f.h,
@@ -476,10 +537,16 @@ function recordCuts(cuts: Cut[], f: FreeRect, w: number, h: number, parentDepth:
  * Children inherit `childDepth` so the cut tree stays connected.
  */
 function guillotineSplit(f: FreeRect, w: number, h: number, childDepth: number): FreeRect[] {
+  return guillotineSplitAxis(f, w, h, childDepth, f.w - w < f.h - h ? 'H' : 'V');
+}
+
+/** guillotineSplit with the primary cut axis chosen by the CALLER — must be
+ *  paired with recordCutsAxis using the SAME axis so cuts match free rects. */
+function guillotineSplitAxis(f: FreeRect, w: number, h: number, childDepth: number, primary: 'H' | 'V'): FreeRect[] {
   const leftoverW = f.w - w; // strip to the right of the part
   const leftoverH = f.h - h; // strip below the part
   const out: FreeRect[] = [];
-  if (leftoverW < leftoverH) {
+  if (primary === 'H') {
     // Horizontal cut below the part — bottom strip spans the full width.
     if (leftoverW > 0) {
       out.push({ x: f.x + w, y: f.y, w: leftoverW, h, depth: childDepth + 1 });
@@ -532,6 +599,11 @@ function guillotineSplit(f: FreeRect, w: number, h: number, childDepth: number):
  * frame — the same frame GuillotineBin/ShelfBin use — so callers downstream
  * (margin shift in nest.ts, cutStepsForSheet) treat all strategies alike.
  */
+/** Stock narrower than this (~6") is awkward under a track-saw rail — the
+ *  rail overhangs and tips. Cut choice and the optimiser both avoid making
+ *  the user run the saw over such pieces when an alternative exists. */
+const AWKWARD_MM = 150;
+
 function deriveGuillotineCuts(rects: Rect[], binW: number, binH: number): Cut[] {
   const cuts: Cut[] = [];
   const EPS = 0.5; // mm — tolerant of STEP-tessellation float noise on edges
@@ -543,14 +615,18 @@ function deriveGuillotineCuts(rects: Rect[], binW: number, binH: number): Cut[] 
     axis: 'H' | 'V';
     coord: number;     // absolute cut coordinate (X for V, Y for H)
     separates: boolean; // whole parts on BOTH sides (vs. trimming waste)
+    thinBad: boolean;  // creates a piece thinner than AWKWARD_MM that still needs cuts
     balance: number;   // |partsOnOneSide − partsOnOther|, lower = more even
-    dist: number;      // distance from the region's reference edge
+    pieceMin: number;  // the split's smaller span — bigger = no sliver piece
+    dist: number;      // distance from the WORK edge (TOP for H, left for V)
   }
 
   const betterLine = (a: Line, b: Line): boolean => {
     if (a.separates !== b.separates) return a.separates;               // real splits before trims
+    if (a.thinBad !== b.thinBad) return !a.thinBad;                    // don't strand cuts on skinny stock
     if (Math.abs(a.balance - b.balance) > EPS) return a.balance < b.balance; // even split
-    return a.dist < b.dist;                                            // then nearest reference edge
+    if (Math.abs(a.pieceMin - b.pieceMin) > EPS) return a.pieceMin > b.pieceMin; // keep pieces big
+    return a.dist < b.dist;                                            // then nearest work edge
   };
 
   // Best CLEAN full-span line for one region (one that slices no part), or
@@ -567,19 +643,44 @@ function deriveGuillotineCuts(rects: Rect[], binW: number, binH: number): Cut[] 
     }
     let best: Line | null = null;
     const consider = (axis: 'H' | 'V', coord: number) => {
-      let lo = 0, hi = 0;
+      const loItems: Rect[] = [], hiItems: Rect[] = [];
       for (const it of items) {
         const a = axis === 'V' ? it.x : it.y;
         const b = axis === 'V' ? it.x + it.w : it.y + it.h;
-        if (b <= coord + EPS) lo++;        // wholly below/left of the line
-        else if (a >= coord - EPS) hi++;   // wholly above/right of the line
-        else return;                       // a part straddles → not a clean cut
+        if (b <= coord + EPS) loItems.push(it);        // wholly below/left
+        else if (a >= coord - EPS) hiItems.push(it);   // wholly above/right
+        else return;                                   // straddler → not clean
       }
+      const spanLo = axis === 'V' ? coord - rx : coord - ry;
+      const spanHi = axis === 'V' ? rx + rw - coord : ry + rh - coord;
+      // A side "still needs cuts" unless it's pure waste or exactly one part
+      // filling it. Cutting a sub-AWKWARD piece again means running the rail
+      // on skinny stock — the thing track-saw users avoid.
+      const needsCuts = (side: Rect[], sx: number, sy: number, sw: number, sh: number): boolean => {
+        if (side.length === 0) return false;
+        if (side.length > 1) return true;
+        const it = side[0];
+        return Math.abs(it.x - sx) > EPS || Math.abs(it.y - sy) > EPS ||
+               Math.abs(it.w - sw) > EPS || Math.abs(it.h - sh) > EPS;
+      };
+      const thinBad =
+        (spanLo < AWKWARD_MM && (axis === 'V'
+          ? needsCuts(loItems, rx, ry, spanLo, rh)
+          : needsCuts(loItems, rx, ry, rw, spanLo))) ||
+        (spanHi < AWKWARD_MM && (axis === 'V'
+          ? needsCuts(hiItems, coord, ry, spanHi, rh)
+          : needsCuts(hiItems, rx, coord, rw, spanHi)));
       const line: Line = {
         axis, coord,
-        separates: lo > 0 && hi > 0,
-        balance: Math.abs(lo - hi),
-        dist: axis === 'V' ? coord - rx : coord - ry,
+        separates: loItems.length > 0 && hiItems.length > 0,
+        thinBad,
+        balance: Math.abs(loItems.length - hiItems.length),
+        // Both sub-pieces keep the region's other span; the cut only narrows
+        // one axis — its smaller side is the sliver risk.
+        pieceMin: Math.min(spanLo, spanHi),
+        // Track-saw work order runs TOP-to-bottom: for H lines prefer the
+        // one nearest the TOP edge; for V lines nearest the left.
+        dist: axis === 'V' ? coord - rx : ry + rh - coord,
       };
       if (!best || betterLine(line, best)) best = line;
     };
@@ -594,34 +695,40 @@ function deriveGuillotineCuts(rects: Rect[], binW: number, binH: number): Cut[] 
     // null → a single part fills this region (done), or ≥2 parts interlock
     // with no clean line (irreducible non-guillotine block) — leave intact.
     if (!line) return;
+    // Recurse into the BIGGER piece first — the pro workflow: break the
+    // sheet into manageable sub-panels and process those while they're
+    // large; fiddly narrow strips wait until the end of the sequence.
     if (line.axis === 'V') {
       const xc = line.coord;
       cuts.push({ parentX: rx, parentY: ry, parentW: rw, parentH: rh, axis: 'V', distance: xc - rx, depth });
       // No straddlers (the line is clean), so an edge test partitions exactly.
       const left: Rect[] = [], right: Rect[] = [];
       for (const it of items) (it.x + it.w <= xc + EPS ? left : right).push(it);
-      decompose(rx, ry, xc - rx, rh, left, depth + 1);
-      decompose(xc, ry, rx + rw - xc, rh, right, depth + 1);
+      const halves = [
+        { x: rx, y: ry, w: xc - rx, h: rh, items: left },
+        { x: xc, y: ry, w: rx + rw - xc, h: rh, items: right },
+      ].sort((a, b) => b.w * b.h - a.w * a.h);
+      for (const s of halves) decompose(s.x, s.y, s.w, s.h, s.items, depth + 1);
     } else {
       const yc = line.coord;
       cuts.push({ parentX: rx, parentY: ry, parentW: rw, parentH: rh, axis: 'H', distance: yc - ry, depth });
       const bottom: Rect[] = [], top: Rect[] = [];
       for (const it of items) (it.y + it.h <= yc + EPS ? bottom : top).push(it);
-      decompose(rx, ry, rw, yc - ry, bottom, depth + 1);
-      decompose(rx, yc, rw, ry + rh - yc, top, depth + 1);
+      const halves = [
+        { x: rx, y: yc, w: rw, h: ry + rh - yc, items: top },
+        { x: rx, y: ry, w: rw, h: yc - ry, items: bottom },
+      ].sort((a, b) => b.w * b.h - a.w * a.h);
+      for (const s of halves) decompose(s.x, s.y, s.w, s.h, s.items, depth + 1);
     }
   };
 
   decompose(0, 0, binW, binH, rects.slice(), 0);
 
-  // Order "biggest cuts first" — all full-sheet (depth 0) cuts, then cuts
-  // within strips, etc. Matches the depth-sort packOne applies to the
-  // guillotine path, so a downstream re-sort is a no-op.
-  cuts.sort((a, b) => {
-    if (a.depth !== b.depth) return a.depth - b.depth;
-    if (a.parentY !== b.parentY) return a.parentY - b.parentY;
-    return a.parentX - b.parentX;
-  });
+  // Cuts stay in DEPTH-FIRST emission order — the physical work sequence:
+  // each cut acts on a piece an earlier cut just produced, the sheet is
+  // consumed top-to-bottom, and a freed strip is finished at the bench
+  // before the next rip. (Previously depth-sorted breadth-first, which had
+  // the operator hopping between loose strips.)
   return cuts;
 }
 
@@ -808,7 +915,12 @@ export interface MultiSheetResult {
  * Heuristic + initial order are deterministic for a given input; the
  * multi-restart wrapper varies both to explore the solution space.
  */
-export function packOne(job: PackJob, heur: Heuristic, order: PackInput[]): MultiSheetResult {
+export function packOne(job: PackJob, heur: Heuristic, order: PackInput[], binKind?: BinKind): MultiSheetResult {
+  const guillotine = isGuillotineStrategy(job.cutStrategy);
+  const kind: BinKind = binKind ?? (guillotine ? 'shelf' : 'maxrects');
+  if (kind.startsWith('beam')) {
+    return packBeam(job, order, parseInt(kind.slice(4), 10) || 24);
+  }
   const sheets: PackedSheet[] = [];
   const unplaced: PackInput[] = [];
   let totalUsed = 0;
@@ -842,9 +954,11 @@ export function packOne(job: PackJob, heur: Heuristic, order: PackInput[]): Mult
   // (MaxRects 'free'/'save-last' already honoured the passed order.)
 
   while (remaining.length > 0) {
-    const bin: BinPacker = job.cutStrategy === 'guillotine'
-      ? new ShelfBin(job.sheetW, job.sheetH)
-      : new MaxRectsBin(job.sheetW, job.sheetH);
+    const bin: BinPacker =
+      kind === 'shelf'   ? new ShelfBin(job.sheetW, job.sheetH) :
+      kind === 'shelf-v' ? new ShelfBinV(job.sheetW, job.sheetH) :
+      kind === 'sas'     ? new GuillotineBin(job.sheetW, job.sheetH) :
+                           new MaxRectsBin(job.sheetW, job.sheetH);
     const cur: PackedSheet = { placements: [], usedArea: 0, largestFree: null, cuts: [], fullySeparated: 0 };
     const carry: PackInput[] = []; // didn't fit on THIS bin → try next bin
     let anyPlacedThisBin = false;
@@ -877,15 +991,17 @@ export function packOne(job: PackJob, heur: Heuristic, order: PackInput[]): Mult
     }
 
     if (anyPlacedThisBin) {
-      if (bin instanceof ShelfBin) {
-        // ShelfBin defers cut + free-rect computation until all parts placed.
+      if (bin instanceof ShelfBin || bin instanceof ShelfBinV) {
+        // Shelf bins defer free-rect computation until all parts placed.
         bin.finalize();
-      } else {
-        // MaxRects records no cut tree — recover a guillotine one from the
-        // placements so the cut sequence shows real edge-to-edge cuts within
-        // each sub-piece instead of full-sheet lines that cross panels.
-        bin.cuts = deriveGuillotineCuts(placedInflated, job.sheetW, job.sheetH);
       }
+      // Recover the cut tree from the placements with the recursive
+      // decomposer — for every bin kind. For MaxRects it's the only tree
+      // there is; for the shelf/SAS bins it REPLACES their fixed emission
+      // order: the decomposer prefers full-span separating lines, so edges
+      // that align across strips become one through-cut and adjacent waste
+      // merges into one fragment (fewer cuts, the human sequence).
+      bin.cuts = deriveGuillotineCuts(placedInflated, job.sheetW, job.sheetH);
       // Snapshot the largest remaining free rectangle (by area).
       let best: { w: number; h: number; a: number } | null = null;
       for (const f of bin.free) {
@@ -893,15 +1009,9 @@ export function packOne(job: PackJob, heur: Heuristic, order: PackInput[]): Mult
         if (!best || a > best.a) best = { w: f.w, h: f.h, a };
       }
       cur.largestFree = best ? { w: best.w, h: best.h } : null;
-      // Capture cut tree, ordered by depth (big cuts on the full sheet
-      // first → smaller cuts within strips). Stable order within a depth.
-      cur.cuts = bin.cuts.slice().sort((a, b) => {
-        if (a.depth !== b.depth) return a.depth - b.depth;
-        // Tiebreak by position so multiple cuts at the same depth read
-        // left-to-right, top-to-bottom.
-        if (a.parentY !== b.parentY) return a.parentY - b.parentY;
-        return a.parentX - b.parentX;
-      });
+      // Keep the derived tree's depth-first order — it IS the physical
+      // top-to-bottom work sequence (see deriveGuillotineCuts).
+      cur.cuts = bin.cuts.slice();
       cur.fullySeparated = countFreedParts(cur.cuts, placedInflated, job.sheetW, job.sheetH);
       sheets.push(cur);
       totalUsed += cur.usedArea;
@@ -913,6 +1023,237 @@ export function packOne(job: PackJob, heur: Heuristic, order: PackInput[]): Mult
       break;
     }
     remaining = carry;
+  }
+
+  return { sheets, unplaced, totalUsed };
+}
+
+// ---------------------------------------------------------------------------
+// Beam search over guillotine cut trees ('guillotine-exact')
+//
+// The greedy bins (shelf / SAS) commit to one placement at a time with a
+// fixed split rule. The beam instead keeps the K most promising partial
+// layouts and branches on the three choices a human juggles at the saw:
+// WHICH part to cut next, in which ORIENTATION, and which AXIS the primary
+// full-span cut takes. Regions that fit nothing (or are better saved) are
+// discarded to waste — that branch is what lets waste consolidate.
+//
+// One sheet is searched at a time (maximise area placed, then fewest cuts);
+// the winner's leftover parts roll into the next sheet. Sheet count
+// dominates the objective upstream, so per-sheet area-first is the right
+// local goal, and the exact strategy also runs the full greedy trial pool —
+// the beam only has to beat it, never carry it.
+// ---------------------------------------------------------------------------
+interface BeamState {
+  free: FreeRect[];
+  waste: Rect[];            // discarded regions — remnants, counted for largestFree
+  used: Uint8Array;         // per-item flag into the items array
+  usedCount: number;
+  placements: PackPlacement[]; // bin frame, kerf-inflated
+  placedInflated: Rect[];
+  cuts: Cut[];
+  usedInflated: number;     // Σ inflated placement area — beam ranking proxy
+}
+
+function packBeam(job: PackJob, order: PackInput[], beamWidth: number): MultiSheetResult {
+  const sheets: PackedSheet[] = [];
+  const unplaced: PackInput[] = [];
+
+  // Oversize filter — identical to packOne's.
+  const items = order.filter((item) => {
+    const w = item.w + job.kerf;
+    const h = item.h + job.kerf;
+    const fits = (w <= job.sheetW && h <= job.sheetH) ||
+      (item.allowRotate && h <= job.sheetW && w <= job.sheetH);
+    if (!fits) unplaced.push(item);
+    return fits;
+  });
+
+  // Identical parts are interchangeable — branch once per distinct footprint.
+  const typeKey = (it: PackInput) => `${it.w.toFixed(1)}x${it.h.toFixed(1)}:${it.allowRotate ? 1 : 0}`;
+  const keys = items.map(typeKey);
+
+  const W = items.length > 60 ? Math.min(beamWidth, 8) : beamWidth;
+
+  // Largest surviving rectangle, counting discarded regions — a human's
+  // "keep the offcut in one piece". Tiebreaker after area and cut count.
+  const maxRemnant = (s: BeamState): number => {
+    let m = 0;
+    for (const f of s.free) m = Math.max(m, f.w * f.h);
+    for (const f of s.waste) m = Math.max(m, f.w * f.h);
+    return m;
+  };
+  // Two beam rankings, both run per sheet and arbitrated afterwards:
+  //  'debt' — cuts already spent + a lower bound on cuts still owed (≥1 per
+  //           unplaced part). Comparable across depths, and it rewards the
+  //           placements a human hunts for: a part that lands flush with a
+  //           region edge costs 0–1 cuts and pays off its own debt.
+  //  'area' — pack the sheet as full as possible, cuts second. Wins when the
+  //           job is tight and an extra sheet would swamp any cut savings.
+  const rankDebt = (a: BeamState, b: BeamState): number => {
+    const as = a.cuts.length + (items.length - a.usedCount);
+    const bs = b.cuts.length + (items.length - b.usedCount);
+    if (as !== bs) return as - bs;
+    if (a.usedInflated !== b.usedInflated) return b.usedInflated - a.usedInflated;
+    return maxRemnant(b) - maxRemnant(a);
+  };
+  const rankArea = (a: BeamState, b: BeamState): number => {
+    if (a.usedInflated !== b.usedInflated) return b.usedInflated - a.usedInflated;
+    if (a.cuts.length !== b.cuts.length) return a.cuts.length - b.cuts.length;
+    return maxRemnant(b) - maxRemnant(a);
+  };
+
+  let used: Uint8Array = new Uint8Array(items.length);
+  let usedCount = 0;
+  let totalUsed = 0;
+
+  // One beam pass over a single sheet under the given ranking. Returns the
+  // best finished state by (area desc, then fewest DERIVED cuts among the
+  // fullest) — through-cut merging can reorder close candidates.
+  const searchSheet = (
+    startUsed: Uint8Array,
+    startCount: number,
+    rank: (a: BeamState, b: BeamState) => number,
+  ): { state: BeamState; derived: number } | null => {
+    const init: BeamState = {
+      free: [{ x: 0, y: 0, w: job.sheetW, h: job.sheetH, depth: 0 }],
+      waste: [],
+      used: startUsed,
+      usedCount: startCount,
+      placements: [],
+      placedInflated: [],
+      cuts: [],
+      usedInflated: 0,
+    };
+    let states: BeamState[] = [init];
+    const done: BeamState[] = [];
+    let guard = items.length * 4 + 64;
+
+    while (states.length > 0 && guard-- > 0) {
+      const next: BeamState[] = [];
+      for (const s of states) {
+        if (s.usedCount >= items.length || s.free.length === 0) { done.push(s); continue; }
+        // Work the lowest-leftmost open region — i.e. finish the strip the
+        // last rip opened before starting a new one, like a human at the saw.
+        let ri = 0;
+        for (let i = 1; i < s.free.length; i++) {
+          const f = s.free[i], g = s.free[ri];
+          if (f.y < g.y - 0.001 || (Math.abs(f.y - g.y) <= 0.001 && f.x < g.x)) ri = i;
+        }
+        const region = s.free[ri];
+
+        const clone = (): BeamState => ({
+          free: s.free.filter((_, i) => i !== ri),
+          waste: s.waste,
+          used: s.used,
+          usedCount: s.usedCount,
+          placements: s.placements,
+          placedInflated: s.placedInflated,
+          cuts: s.cuts,
+          usedInflated: s.usedInflated,
+        });
+
+        const seenTypes = new Set<string>();
+        for (let i = 0; i < items.length; i++) {
+          if (s.used[i] || seenTypes.has(keys[i])) continue;
+          seenTypes.add(keys[i]);
+          const it = items[i];
+          const w = it.w + job.kerf;
+          const h = it.h + job.kerf;
+          const orients: [number, number, boolean][] = [[w, h, false]];
+          if (it.allowRotate && w !== h) orients.push([h, w, true]);
+          for (const [pw, ph, rot] of orients) {
+            if (pw > region.w + 0.001 || ph > region.h + 0.001) continue;
+            // Single-leftover placements make both axes equivalent — emit once.
+            const axes: ('H' | 'V')[] =
+              region.w - pw <= 0 || region.h - ph <= 0 ? ['H'] : ['H', 'V'];
+            for (const axis of axes) {
+              const c = clone();
+              c.used = s.used.slice();
+              c.used[i] = 1;
+              c.usedCount = s.usedCount + 1;
+              c.cuts = s.cuts.slice();
+              const depth = region.depth ?? 0;
+              recordCutsAxis(c.cuts, region, pw, ph, depth, axis);
+              c.free = c.free.concat(guillotineSplitAxis(region, pw, ph, depth + 1, axis));
+              c.placements = s.placements.concat([{ id: it.id, x: region.x, y: region.y, w: pw, h: ph, rotated: rot }]);
+              c.placedInflated = s.placedInflated.concat([{ x: region.x, y: region.y, w: pw, h: ph }]);
+              c.usedInflated = s.usedInflated + pw * ph;
+              next.push(c);
+            }
+          }
+        }
+        // Discard branch: write the region off as waste. Forced when nothing
+        // fits; optional otherwise (sometimes saving the region loses to
+        // freeing the beam slot for a layout with consolidated waste).
+        const skip = clone();
+        skip.waste = s.waste.concat([{ x: region.x, y: region.y, w: region.w, h: region.h }]);
+        next.push(skip);
+      }
+      if (next.length === 0) break;
+      next.sort(rank);
+      states = next.slice(0, W);
+    }
+    done.push(...states); // guard exhaustion — keep whatever is in flight
+
+    done.sort((a, b) => b.usedInflated - a.usedInflated || a.cuts.length - b.cuts.length);
+    let picked: BeamState | null = null;
+    let pickedDerived = Infinity;
+    for (const d of done.slice(0, 12)) {
+      if (picked && d.usedInflated < picked.usedInflated - 0.001) break;
+      const n = deriveGuillotineCuts(d.placedInflated, job.sheetW, job.sheetH).length;
+      if (!picked || n < pickedDerived) {
+        picked = d;
+        pickedDerived = n;
+      }
+    }
+    return picked ? { state: picked, derived: pickedDerived } : null;
+  };
+
+  while (usedCount < items.length) {
+    // Run the sheet under both rankings and keep the better sheet: fuller
+    // wins (sheet count dominates upstream), fewer derived cuts breaks ties.
+    const byArea = searchSheet(used, usedCount, rankArea);
+    const byDebt = searchSheet(used, usedCount, rankDebt);
+    let pick = byArea;
+    if (byDebt && (!pick ||
+      byDebt.state.usedInflated > pick.state.usedInflated + 0.001 ||
+      (byDebt.state.usedInflated > pick.state.usedInflated - 0.001 && byDebt.derived < pick.derived))) {
+      pick = byDebt;
+    }
+    const best = pick?.state ?? null;
+    if (!best || best.placements.length === 0) {
+      for (let i = 0; i < items.length; i++) if (!used[i]) unplaced.push(items[i]);
+      break;
+    }
+
+    // Materialise the sheet in the same frame packOne uses.
+    const halfKerf = job.kerf / 2;
+    const placements: PackPlacement[] = best.placements.map((p) => ({
+      id: p.id,
+      x: p.x + halfKerf,
+      y: p.y + halfKerf,
+      w: p.w - job.kerf,
+      h: p.h - job.kerf,
+      rotated: p.rotated,
+    }));
+    const usedArea = placements.reduce((a, p) => a + p.w * p.h, 0);
+    const cuts = deriveGuillotineCuts(best.placedInflated, job.sheetW, job.sheetH);
+    let bigFree: { w: number; h: number; a: number } | null = null;
+    for (const f of [...best.free, ...best.waste]) {
+      const a = f.w * f.h;
+      if (!bigFree || a > bigFree.a) bigFree = { w: f.w, h: f.h, a };
+    }
+    sheets.push({
+      placements,
+      usedArea,
+      largestFree: bigFree ? { w: bigFree.w, h: bigFree.h } : null,
+      cuts,
+      fullySeparated: countFreedParts(cuts, best.placedInflated, job.sheetW, job.sheetH),
+    });
+    totalUsed += usedArea;
+    used = best.used;
+    usedCount = best.usedCount;
   }
 
   return { sheets, unplaced, totalUsed };
@@ -996,7 +1337,7 @@ function repackLastSheetCorner(
  * free rects would break the shelf cut structure the strategy promises.
  */
 function consolidateSheets(result: MultiSheetResult, job: PackJob): MultiSheetResult {
-  if (job.cutStrategy === 'guillotine') return result;
+  if (isGuillotineStrategy(job.cutStrategy)) return result;
   if (result.sheets.length <= 1) return result;
   const byId = new Map(job.items.map((it) => [it.id, it] as const));
   const halfKerf = job.kerf / 2;
@@ -1083,28 +1424,69 @@ function consolidateSheets(result: MultiSheetResult, job: PackJob): MultiSheetRe
  * Trial schedule shared by every multi-restart driver (sync, animated and
  * the worker pool): every heuristic × (area-desc, longest-side-desc) orders,
  * then deterministic random shuffles up to the restarts budget.
+ *
+ * The min-cuts strategies get a richer schedule: every trial also picks a
+ * BIN KIND (horizontal shelves, vertical shelves, or the stacking SAS
+ * guillotine bin) plus dimension-grouped orders — same-height parts adjacent
+ * in the order land in the same strip, the "rip one strip, crosscut four
+ * identical parts" pattern a human uses. 'guillotine-exact' adds beam-search
+ * trials on top (see packBeam).
  */
-export interface PackTrial { order: PackInput[]; heur: Heuristic }
+export type BinKind = 'maxrects' | 'shelf' | 'shelf-v' | 'sas' | `beam${number}`;
+
+export interface PackTrial { order: PackInput[]; heur: Heuristic; binKind?: BinKind }
 
 export function buildTrialSchedule(job: PackJob, restarts: number, seedOffset = 0): PackTrial[] {
   const heuristics: Heuristic[] = ['BSSF', 'BLSF', 'BAF', 'BL'];
   const baseline = job.items.slice().sort((a, b) => b.w * b.h - a.w * a.h);
   const bySide = job.items.slice().sort((a, b) => Math.max(b.w, b.h) - Math.max(a.w, a.h));
   const trials: PackTrial[] = [];
-  for (const h of heuristics) trials.push({ order: baseline, heur: h });
-  for (const h of heuristics) trials.push({ order: bySide, heur: h });
-  // `seedOffset` shifts the shuffle stream so an "Optimize further" re-run
-  // explores NEW orderings rather than repeating the canonical search.
+
   let seed = (0x9e3779b1 ^ Math.imul(seedOffset + 1, 0x85ebca6b)) >>> 0;
   const rand = () => { seed = (seed * 1664525 + 1013904223) >>> 0; return seed / 0xffffffff; };
-  const phase3 = Math.max(0, restarts - heuristics.length * 2);
-  for (let i = 0; i < phase3; i++) {
+  const shuffle = (): PackInput[] => {
     const shuffled = baseline.slice();
     for (let k = shuffled.length - 1; k > 0; k--) {
       const j = Math.floor(rand() * (k + 1));
       [shuffled[k], shuffled[j]] = [shuffled[j], shuffled[k]];
     }
-    trials.push({ order: shuffled, heur: heuristics[i % heuristics.length] });
+    return shuffled;
+  };
+
+  if (isGuillotineStrategy(job.cutStrategy)) {
+    // Dimension-grouped orders: equal heights (or widths) adjacent → they
+    // share a strip and a single rip sizes them all.
+    const byHeight = job.items.slice().sort((a, b) => b.h - a.h || b.w - a.w);
+    const byWidth = job.items.slice().sort((a, b) => b.w - a.w || b.h - a.h);
+    const orders = [baseline, bySide, byHeight, byWidth];
+    const kinds: BinKind[] = ['shelf', 'shelf-v', 'sas'];
+    for (const order of orders) {
+      trials.push({ order, heur: 'BSSF', binKind: 'shelf' });
+      trials.push({ order, heur: 'BSSF', binKind: 'shelf-v' });
+      trials.push({ order, heur: 'BSSF', binKind: 'sas' });
+      trials.push({ order, heur: 'BAF', binKind: 'sas' });
+    }
+    if (job.cutStrategy === 'guillotine-exact') {
+      trials.push({ order: baseline, heur: 'BSSF', binKind: 'beam48' });
+      trials.push({ order: byHeight, heur: 'BSSF', binKind: 'beam48' });
+      trials.push({ order: byWidth, heur: 'BSSF', binKind: 'beam24' });
+      trials.push({ order: bySide, heur: 'BSSF', binKind: 'beam24' });
+    }
+    const budget = Math.max(0, restarts - trials.length);
+    for (let i = 0; i < budget; i++) {
+      const kind = kinds[i % kinds.length];
+      trials.push({ order: shuffle(), heur: kind === 'sas' ? heuristics[i % heuristics.length] : 'BSSF', binKind: kind });
+    }
+    return trials;
+  }
+
+  for (const h of heuristics) trials.push({ order: baseline, heur: h });
+  for (const h of heuristics) trials.push({ order: bySide, heur: h });
+  // `seedOffset` shifts the shuffle stream so an "Optimize further" re-run
+  // explores NEW orderings rather than repeating the canonical search.
+  const phase3 = Math.max(0, restarts - heuristics.length * 2);
+  for (let i = 0; i < phase3; i++) {
+    trials.push({ order: shuffle(), heur: heuristics[i % heuristics.length] });
   }
   return trials;
 }
@@ -1141,7 +1523,7 @@ export function packMulti(job: PackJob, restarts: number): MultiSheetResult {
   const objectiveStrategy: CutStrategy = job.cutStrategy ?? 'free';
   let best: MultiSheetResult | null = null;
   for (const t of buildTrialSchedule(job, restarts)) {
-    const r = packOne(optJob, t.heur, t.order);
+    const r = packOne(optJob, t.heur, t.order, t.binKind);
     if (!best || isBetter(r, best, objectiveStrategy)) best = r;
   }
   return finishPack(job, best!);
@@ -1181,7 +1563,7 @@ export async function packMultiAnimated(
   let best: MultiSheetResult | null = null;
   for (let i = 0; i < total; i++) {
     const t = trials[i];
-    const current = packOne(optJob, t.heur, t.order);
+    const current = packOne(optJob, t.heur, t.order, t.binKind);
     const isNewBest = !best || isBetter(current, best, objectiveStrategy);
     if (isNewBest) best = current;
     await onProgress({ i, total, current, best: best!, isNewBest });
@@ -1209,11 +1591,30 @@ export function isBetter(a: MultiSheetResult, b: MultiSheetResult, strategy: Cut
   const freed = (r: MultiSheetResult) => r.sheets.reduce((s, sh) => s + (sh.fullySeparated ?? 0), 0);
 
   switch (strategy) {
-    case 'guillotine': {
-      // Min cuts: PREFER FEWER CUTS. Tie-break on higher overall yield.
+    case 'guillotine':
+    case 'guillotine-exact': {
+      // Min cuts, track-saw practical: first minimise AWKWARD cuts (saw run
+      // over stock narrower than a rail can sit on — the thing users hate),
+      // then total cuts, then yield, then the widest narrowest-piece.
+      const awkward = (r: MultiSheetResult) => {
+        let n = 0;
+        for (const sh of r.sheets) for (const c of sh.cuts) {
+          if (Math.min(c.parentW, c.parentH) < AWKWARD_MM) n++;
+        }
+        return n;
+      };
+      const aa = awkward(a), ba = awkward(b);
+      if (aa !== ba) return aa < ba;
       const ac = totalCuts(a), bc = totalCuts(b);
       if (ac !== bc) return ac < bc;
-      return totalUsed(a) > totalUsed(b);
+      const at = totalUsed(a), bt = totalUsed(b);
+      if (at !== bt) return at > bt;
+      const narrowest = (r: MultiSheetResult) => {
+        let m = Infinity;
+        for (const sh of r.sheets) for (const c of sh.cuts) m = Math.min(m, c.parentW, c.parentH);
+        return m;
+      };
+      return narrowest(a) > narrowest(b);
     }
     case 'save-last': {
       // Save last: prefer LOWER fill on the last sheet (so the remnant is

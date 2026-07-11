@@ -114,8 +114,8 @@ export function indexToLetters(i: number): string {
  *     now carries one — the shelf packer builds it directly, and MaxRects
  *     ('free' / 'save-last') layouts get one recovered by deriveGuillotineCuts
  *     (see packRect.ts). Each step references its parent SUB-PIECE and the
- *     cut's local distance, ordered "biggest cuts first" by depth, so a cut
- *     never spans more than the piece it acts on.
+ *     cut's local distance, in depth-first top-to-bottom work order: rip the
+ *     top strip off, finish that strip at the bench, move down the sheet.
  *   - FALLBACK path: only if a sheet somehow has no recorded cuts, infer
  *     unique interior X/Y edges as full-sheet lines. This is an
  *     APPROXIMATION — such lines may cross neighbouring panels — kept solely

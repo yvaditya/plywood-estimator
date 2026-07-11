@@ -73,6 +73,7 @@ export async function packMultiParallel(
   const specs = buildTrialSchedule(job, restarts, seedOffset).map((t) => ({
     orderIds: t.order.map((o) => o.id),
     heur: t.heur,
+    binKind: t.binKind,
   }));
   const total = specs.length;
   const chunks = chunk(specs, poolSize(total));

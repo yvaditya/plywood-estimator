@@ -23,7 +23,7 @@
  */
 
 import type { Vec2 } from './geometry';
-import { packMulti, isCncStrategy, type PackInput, type PackPlacement, type CutStrategy, type Cut, type PackProgress } from './packRect';
+import { packMulti, isCncStrategy, isGuillotineStrategy, type PackInput, type PackPlacement, type CutStrategy, type Cut, type PackProgress } from './packRect';
 import { packCnc, polyArea, type CncInput, type CncSheet } from './cncNest';
 import { packMultiParallel, packCncParallel, packCncDeep } from './optPool';
 
@@ -104,9 +104,10 @@ export interface NestSheet {
   sheetW: number;
   /** Sheet length used for this sheet (post-auto-orient choice). */
   sheetL: number;
-  /** Physical cuts in dependency order (full-sheet first, then sub-piece
-   *  cuts). Coordinates are in the SAME frame as part placements
-   *  (post-margin offset). Empty for MaxRects packing. */
+  /** Physical cuts in dependency order — every cut acts on a piece an
+   *  earlier cut produced, sequenced depth-first top-to-bottom (finish a
+   *  strip before the next rip). Coordinates are in the SAME frame as part
+   *  placements (post-margin offset). Empty for CNC strategies. */
   cuts: Cut[];
 }
 
@@ -252,7 +253,7 @@ export function runNest(parts: NestPart[], config: NestConfig): NestResult {
       // unlocking the part's flip even if the rotation UI was set to
       // 'lock' (which is the default). For parts with an explicit grain
       // direction we leave the original policy untouched.
-      const allowFlip = (config.cutStrategy === 'guillotine' && p.grain === 'free')
+      const allowFlip = (isGuillotineStrategy(config.cutStrategy ?? 'free') && p.grain === 'free')
         ? true
         : policy.allowFlip;
       for (let inst = 1; inst <= p.qty; inst++) {
@@ -384,7 +385,7 @@ export async function runNestAnimated(
     for (const p of bucket) {
       const foot = buildFootprint(p);
       const policy = rotationPolicy(p.grain, p.rotation, foot.w0, foot.h0);
-      const allowFlip = (config.cutStrategy === 'guillotine' && p.grain === 'free')
+      const allowFlip = (isGuillotineStrategy(config.cutStrategy ?? 'free') && p.grain === 'free')
         ? true
         : policy.allowFlip;
       for (let inst = 1; inst <= p.qty; inst++) {

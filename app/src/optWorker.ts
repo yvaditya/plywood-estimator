@@ -11,7 +11,7 @@
  *                   CncResult.
  */
 
-import { packOne, type PackJob, type PackInput, type Heuristic } from './packRect';
+import { packOne, type PackJob, type PackInput, type Heuristic, type BinKind } from './packRect';
 import {
   cncRunPasses,
   cncRunExplicitOrders,
@@ -25,7 +25,7 @@ import {
 export interface RectJobMsg {
   kind: 'rect';
   job: PackJob;
-  trials: { orderIds: string[]; heur: Heuristic }[];
+  trials: { orderIds: string[]; heur: Heuristic; binKind?: BinKind }[];
 }
 export interface CncPassesMsg {
   kind: 'cnc-passes';
@@ -63,7 +63,7 @@ self.onmessage = (e: MessageEvent<OptWorkerMsg>) => {
     const byId = new Map(msg.job.items.map((it) => [it.id, it] as const));
     for (const t of msg.trials) {
       const order = t.orderIds.map((id) => byId.get(id)).filter(Boolean) as PackInput[];
-      const result = packOne(msg.job, t.heur, order);
+      const result = packOne(msg.job, t.heur, order, t.binKind);
       self.postMessage({ kind: 'rect-trial', result });
     }
     self.postMessage({ kind: 'done' });
