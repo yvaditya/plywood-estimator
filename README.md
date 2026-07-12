@@ -71,11 +71,23 @@ Requires Node 18 or newer.
   direction is axis-aligned with the sheet — angled cuts are minimized.
 
 ### Cut sheet nesting
-- **Two cut strategies**:
+- **Five cut strategies**:
   - **Max yield** — MaxRects bin packer (Jukka Jylänki), best yield.
-  - **Min cuts** — Guillotine bin packer (SAS variant). Every placement
-    is a single edge-to-edge cut — producible with a track saw or
-    panel saw.
+  - **Min cuts** — guillotine packing (shelf + SAS trials). Every cut
+    goes edge-to-edge — producible with a track saw or panel saw.
+  - **Min cuts+** — same objective plus a beam search over cut trees;
+    slower, often finds layouts the greedy pass can't.
+  - **Max yield, save last sheet** — the last sheet's parts cluster in
+    one corner so the remnant is a clean rectangle to keep.
+  - **CNC nest** — true-shape any-angle nesting for router / waterjet.
+- **Parallel-guide-friendly cut sequence** — cuts are ordered so repeat
+  cuts at the same flip-stop setting run back-to-back ("same setting"
+  notes in the PDF), rip↔crosscut rotations are minimized, big reusable
+  offcut strips come off first (whole, for the rack), and thin strips
+  are shaved off early while the stock still carries the rail.
+- **Three reference trims** — both long edges plus the datum-side short
+  edge; the far long-edge trim lands right at the last part so one cut
+  frees the leftover and squares the edge. Main datum: top-left corner.
 - **Per-thickness grouping** with 0.5 mm bucket tolerance so float-noise
   copies of the same part don't split into multiple sheet stacks.
 - **Auto-orient sheet** (landscape vs portrait) — the nester tries both
@@ -94,14 +106,20 @@ Requires Node 18 or newer.
   landscape and portrait both render correctly.
 - **DXF export** (R12 ASCII) per sheet — layers SHEET / MARGIN / PARTS /
   LABELS / DIMS. Opens in AutoCAD, Fusion, FreeCAD, LightBurn, etc.
-- **PDF report** with paper-size selector (Letter / Legal / Tabloid / A4,
-  portrait or landscape):
-  1. Summary page (sheets, yield, waste, edge-banding, cost).
-  2. **Parts overview** — IKEA-style grid of unique parts with A/B/C
-     letter labels, silhouettes, dimensions, and quantities.
-  3. One page per cut sheet, parts overlaid with letter labels.
-  4. **Cut instructions** — numbered rip-then-crosscut steps per sheet
-     with distances from the reference edges and a total cut count.
+- **PDF report** with paper-size selector (16:9 widescreen / Letter /
+  Legal / Tabloid / A4 / Phone one-cut-per-page):
+  1. Cover, contents, quick reference, shopping list.
+  2. **Panels table** — every panel size in the job: thumbnail, codes
+     (1a, 2b…), qty, length, width, thickness; identical sizes grouped.
+  3. Per sheet: layout overview → that sheet's panels table → numbered
+     **cut sequence** cards. Color language: green = edge the dimension
+     is measured from, blue = reference edges, red = this cut.
+  4. Assembly guide (per-cabinet exploded views + step pages).
+- **Phone PDF** button — one cut per page with big type, for the phone
+  at the saw.
+- **Parallel guide dims** toggle — quoted distances equal the flip-stop
+  setting (keeper width to the near side of the kerf), so the numbers
+  on the cards are the finished part dimensions.
 
 ### Shopping list (sidebar)
 Auto-generated from the latest nest result.

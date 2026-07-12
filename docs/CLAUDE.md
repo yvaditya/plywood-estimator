@@ -31,29 +31,29 @@ Quick orientation for a fresh session working on this repo.
 | `viewer.ts` | Three.js viewer, post chain, grain arrows, non-sheet ghost group, `snapshotFiltered(visibleIds, dirs, dist, frameIds?, target?)` for PDF snapshots |
 | `nest.ts` | Per-thickness bucketing wrapper. Has `runNest` (sync) + `runNestAnimated` (async, observable, used by the UI) |
 | `packRect.ts` | `MaxRectsBin` + `ShelfBin` + (legacy) `GuillotineBin` packers. Exports `packMulti` (sync) + `packMultiAnimated` (async with `onProgress`) |
-| `instructions.ts` | A/B/C letter labels + cut step generation (margin-trim cuts emitted as first 4 steps when `margin > 0`) |
+| `instructions.ts` | A/B/C letter labels + cut step generation (THREE reference trims first when `margin > 0`; tree cuts coinciding with a trim line are deduped; panel-size grouping for the PDF tables) |
 | `splitParts.ts` | CNC auto-split: parts too big for the sheet are split into dovetail-jointed segments (polygon booleans via polygon-clipping). Tail count scales with joint length; tail depth with thickness, capped at tail width |
 | `shoppingList.ts` | Buy/have rollup + CSV export, localStorage persistence |
 | `dxf.ts` | DXF R12 writer (layers SHEET / MARGIN / PARTS / LABELS / DIMS) |
-| `pdf.ts` | jsPDF report (cover → shopping → parts grouped by cabinet → per-sheet (overview + cut sequence) → per-cabinet (assembled + parts table) → IKEA-style step pages → final 'Assembled' frame) |
+| `pdf.ts` | jsPDF report (cover → contents → quick ref → shopping → job-wide Panels TABLE → per-sheet (overview + panels table + cut sequence) → per-cabinet assembly + IKEA-style step pages) |
 | `units.ts` | mm/inch conversion, fractional-inch formatting, money fmt |
 | `style.css` | Notion-style light theme |
 
 ## Cut strategies (`packRect.CutStrategy`)
+Five strategies (user trimmed the list 2026-07 — `cnc-save-last` removed):
 - **`free`** — MaxRects, max yield (any cuts).
-- **`guillotine`** — Shelf packer (FFDH). Min cuts; track-saw friendly.
-  Free-grain parts auto-unlock rotation under this strategy (the per-body
-  `rotation='lock'` default would otherwise block shelf optimisation).
+- **`guillotine`** — min cuts; trials sweep shelf / shelf-v / SAS bins.
+  Free-grain parts auto-unlock rotation under guillotine strategies (the
+  per-body `rotation='lock'` default would otherwise block shelf
+  optimisation).
+- **`guillotine-exact`** — same objective + `packBeam` beam search over
+  cut trees; slower, often beats the greedy pass.
 - **`save-last`** — MaxRects everywhere except the last sheet, which is
   re-packed Bottom-Left so parts cluster in one corner and the remnant is
   a clean usable rectangle.
-- **`cnc`** / **`cnc-save-last`** — true-shape any-angle nesting handled
-  by `cncNest.ts`, NOT this rectangle packer. `nest.ts` dispatches both via
-  `isCncStrategy()` before the rectangle path. `cnc-save-last` adds the
-  save-last behaviour to the raster nester: the pass objective
-  (`passBetter`, `saveLast` flag) tie-breaks equal-sheet layouts toward the
-  emptiest least-filled sheet, and a final `compactLastSheet` re-packs that
-  sheet's parts bottom-left so the remnant is one clean offcut.
+- **`cnc`** — true-shape any-angle nesting handled by `cncNest.ts`, NOT
+  this rectangle packer; `nest.ts` dispatches via `isCncStrategy()`. (The
+  engine's `saveLast` machinery still exists but no strategy sets it.)
 
 The multi-restart optimiser objective is strategy-aware (`isBetter` in
 `packRect.ts`):
@@ -67,6 +67,34 @@ Every strategy still tie-breaks first on (fewer unplaced → fewer sheets).
 (long edge along the bin's X axis). The portrait try was removed at user
 request so the sheet has a consistent orientation across the on-screen
 preview, the PDF overview, the cut-sequence cards, the SVG, and the DXF.
+
+## Parallel-guide cut sequence (user's workflow — don't regress)
+The user cuts with a track saw + TSO-style parallel guide. Setup cost is
+per distinct flip-stop SETTING and per rip↔cross ROTATION, not per cut.
+Everything below lives in `packRect.ts` / `instructions.ts` / `pdf.ts`:
+- `deriveGuillotineCuts` builds the tree explicitly, then a greedy
+  scheduler emits cuts: same axis+distance ≻ same axis ≻ child-of-prev ≻
+  larger parent. Readiness (parent piece exists) is the hard constraint
+  the PDF diagrams rely on.
+- `betterLine` priorities: reusable empty offcut strip first (both dims ≥
+  `REUSABLE_MM` 200, bigger wins) → shave a thin FINISHED strip off big
+  stock (`thinShave`) → separates → !thinBad → balance → pieceMin → dist.
+- `thinStripsTop` (applied before every cut derivation): mirrors the
+  layout vertically if thin strips sit below wide parts, then anchors the
+  layout flush to the reference corner (bin origin = display top-left).
+- THREE reference trims (`cutStepsForSheet`): both long edges + datum
+  short edge, datum top-left. The FAR long trim lands at the last part's
+  edge + kerf/2 — frees the leftover AND squares the edge; tree cuts on
+  the same line are deduped (fewer total cuts). Last trim matches the
+  first layout cut's direction. Both step functions take a `kerf` param.
+- `CutStep.sameSetting` → "· same setting" caption. PDF `quotedDistance`:
+  with the `#parallelGuide` toggle (default ON) layout cuts quote the
+  KEEPER width (distance − kerf = the flip-stop number = finished part
+  dim); trims quote the strip width coming off.
+- Diagram colors: GREEN = edge measured from (left for vertical cuts,
+  top for horizontal; captions "from L/T edge"), BLUE = reference edges
+  (drawn above the fade), RED = active cut + parent border, white =
+  prior cuts. Sheet cream stays the only brown.
 
 ## Async / animated optimiser
 `runNestAnimated` ⇒ `packMultiAnimated` is what the **Estimate** button
@@ -133,10 +161,13 @@ the expand state across renders.
 ## Build / test
 - `npx tsc --noEmit` from `app/` → must be clean before committing.
 - `npx vite build` from `app/` → production build to `app/dist/`.
-- `python tests/visual_check.py [filter]` → end-to-end Playwright run
-  against every sample STEP, generates PDFs + per-page PNGs in
-  `tests/_output/<sample>/`. The default cut strategy is Min cuts.
-  Each sample takes 30–80s.
+- `python tests/visual_check.py [filter] [--snap]` → end-to-end
+  Playwright run against every sample STEP, generates PDFs + per-page
+  PNGs in `tests/_output/<sample>/`. The default cut strategy is Min
+  cuts; `--snap` selects the "snap to nearest standard" thickness
+  override before estimating. Each sample takes 30–80s. The
+  "Start cabinets" sample is occasionally flaky at STEP-load — re-run
+  with a filter if it fails with a disabled-button screenshot.
 
 ## Visual / file-output testing
 - The Playwright MCP plugin is the live-control tool. Use it for grain /

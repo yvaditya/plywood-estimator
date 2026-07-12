@@ -43,6 +43,10 @@ export interface CutStep {
    *  before the real layout cuts begin. UI may render these differently
    *  (e.g. labelled "Trim L" instead of "Rip"). */
   isTrim?: boolean;
+  /** True when this cut uses the SAME axis and distance as the previous
+   *  step — with a parallel guide the flip stops are already set, so the
+   *  user just slides the stock against them and cuts. */
+  sameSetting?: boolean;
 }
 
 export interface SheetCuts {
@@ -126,32 +130,78 @@ export function cutStepsForSheet(
   sheetIndex: number,
   groupIndex: number,
   margin = 0,
+  kerf = 0,
 ): SheetCuts {
   const W = sheet.sheetW;
   const L = sheet.sheetL;
   const lengthIsY = L >= W;
 
-  // Margin trim cuts come first when margin > 0. We only need TWO trim cuts
-  // to establish a reference corner — one along a long edge and one
-  // perpendicular to it. The remaining margins (right + top) get absorbed
-  // naturally by the per-part separating cuts and the leftover strips fall
-  // off as waste; the user doesn't need to "square" all four edges.
+  // Margin trim cuts come first when margin > 0. THREE reference edges get
+  // trimmed — BOTH long edges plus the short edge nearest the datum — so the
+  // parallel-guide stops can register off either long edge, with the main
+  // datum at the sheet's top-left corner (the frame origin). The far short
+  // edge falls off naturally with the layout cuts.
+  //
+  // Trim ORDER adapts to the first layout cut: the last trim runs in the
+  // same direction as that cut, so the rip↔crosscut rotation isn't paid
+  // twice in a row.
   const trimSteps: CutStep[] = [];
   if (margin > 0) {
     const m = margin;
-    // Trim 1 — long edge along the sheet's LENGTH axis (rip).
-    trimSteps.push({
-      index: 1, axis: lengthIsY ? 'rip' : 'cross', distance: m,
-      parentX: 0, parentY: 0, parentW: W, parentH: L, depth: 0, isTrim: true,
+    // Physical line orientation of the first layout cut (V = constant X).
+    const firstIsVertical = sheet.cuts && sheet.cuts.length > 0
+      ? sheet.cuts[0].axis === 'V'
+      : false;
+    // Long edges run along the length axis: constant-X lines when the length
+    // axis is Y, constant-Y lines otherwise (the usual landscape frame).
+    const longVertical = lengthIsY;
+    const trim = (vertical: boolean, at: number, k: { x: number; y: number; w: number; h: number }): CutStep => ({
+      index: trimSteps.length + 1,
+      axis: vertical === lengthIsY ? 'rip' : 'cross',
+      distance: vertical ? at - k.x : at - k.y,
+      parentX: k.x, parentY: k.y, parentW: k.w, parentH: k.h,
+      depth: 0, isTrim: true,
     });
-    // Trim 2 — perpendicular short edge (crosscut), on the piece left
-    // after trim 1.
-    trimSteps.push({
-      index: 2, axis: lengthIsY ? 'cross' : 'rip', distance: m,
-      parentX: m, parentY: 0, parentW: W - m, parentH: L, depth: 0, isTrim: true,
-    });
+    // Running keeper rect — each trim acts on what the previous one left.
+    const k = { x: 0, y: 0, w: W, h: L };
+    const addV = (at: number, keepHigh: boolean) => {
+      trimSteps.push(trim(true, at, k));
+      if (keepHigh) { k.w = k.x + k.w - at; k.x = at; } else { k.w = at - k.x; }
+    };
+    const addH = (at: number, keepHigh: boolean) => {
+      trimSteps.push(trim(false, at, k));
+      if (keepHigh) { k.h = k.y + k.h - at; k.y = at; } else { k.h = at - k.y; }
+    };
+    // The FAR long-edge trim lands right at the last part's edge (kerf into
+    // the waste) instead of the sheet's far margin — one cut both frees the
+    // whole far leftover for the rack AND establishes the reference edge.
+    let farLongAt = longVertical ? W - m : L - m;
+    if (sheet.parts.length > 0) {
+      const ext = longVertical
+        ? Math.max(...sheet.parts.map((p) => p.x + p.w))
+        : Math.max(...sheet.parts.map((p) => p.y + p.h));
+      farLongAt = Math.min(farLongAt, ext + kerf / 2);
+    }
+    const longs = () => longVertical
+      ? (addV(m, true), addV(farLongAt, false))
+      : (addH(m, true), addH(farLongAt, false));
+    const short = () => longVertical ? addH(m, true) : addV(m, true);
+    // End the trims on the first layout cut's orientation.
+    if (firstIsVertical === longVertical) { short(); longs(); }
+    else { longs(); short(); }
   }
   const offset = trimSteps.length;
+
+  // Consecutive cuts at the same axis + distance reuse the parallel-guide
+  // setting — flag them so the PDF can tell the user the guide is already
+  // set (the cut sequence is ordered to maximise these runs).
+  const markSameSetting = (all: CutStep[]): CutStep[] => {
+    for (let i = 1; i < all.length; i++) {
+      const p = all[i - 1], c = all[i];
+      if (c.axis === p.axis && Math.abs(c.distance - p.distance) < 0.5) c.sameSetting = true;
+    }
+    return all;
+  };
 
   // Cut-tree path: a recorded tree exists (shelf packer, or recovered from a
   // MaxRects layout) — translate each Cut → CutStep within its sub-piece.
@@ -177,10 +227,23 @@ export function cutStepsForSheet(
         depth: c.depth,
       };
     });
+    // A tree cut that lands exactly on a trim line (typically the far-long
+    // trim placed at the last part's edge) is already made — drop it so the
+    // trim does double duty and the total cut count goes down.
+    const lineOf = (s: CutStep) => {
+      const vertical = lengthIsY ? s.axis === 'rip' : s.axis === 'cross';
+      return { vertical, coord: vertical ? s.parentX + s.distance : s.parentY + s.distance };
+    };
+    const trimLines = trimSteps.map(lineOf);
+    const deduped = steps.filter((s) => {
+      const l = lineOf(s);
+      return !trimLines.some((t) => t.vertical === l.vertical && Math.abs(t.coord - l.coord) < 0.75);
+    });
+    deduped.forEach((s, i) => { s.index = offset + i + 1; });
     return {
       sheetIndex, globalIndex: sheet.globalIndex || sheetIndex, groupIndex,
       thickness: sheet.thickness, sheetW: W, sheetL: L,
-      steps: [...trimSteps, ...steps],
+      steps: markSameSetting([...trimSteps, ...deduped]),
       isGuillotineTree: true,
     };
   }
@@ -211,17 +274,106 @@ export function cutStepsForSheet(
   return {
     sheetIndex, globalIndex: sheet.globalIndex || sheetIndex, groupIndex,
     thickness: sheet.thickness, sheetW: W, sheetL: L,
-    steps: [...trimSteps, ...steps],
+    steps: markSameSetting([...trimSteps, ...steps]),
     isGuillotineTree: false,
   };
 }
 
+/** One row of the per-sheet panel-dimensions table: all panels ON A SINGLE
+ *  SHEET that share the same (length, width, thickness) collapse into one
+ *  row. `codes` lists every instance's full panel id ("1a", "3b") so the
+ *  reader can find each one in the layout. */
+export interface PanelSizeRow {
+  /** Full panel ids for every instance in this group, e.g. ['1a', '1c']. */
+  codes: string[];
+  qty: number;
+  length: number;      // mm, long edge
+  width: number;       // mm, short edge
+  thickness: number;   // mm
+  /** Hex color of the panels (all instances share a partId → same color). */
+  color: string;
+  partName: string;
+}
+
+/** Accumulate one sheet's panels into a size-keyed row map (shared by the
+ *  per-sheet and job-wide groupings). */
+function accumulatePanelSizes(byKey: Map<string, PanelSizeRow>, sheet: NestSheet): void {
+  for (const p of sheet.parts) {
+    const longMm = Math.max(p.w, p.h);
+    const shortMm = Math.min(p.w, p.h);
+    // Round to 0.1mm so float noise doesn't split identical panels.
+    const key = `${Math.round(longMm * 10)}|${Math.round(shortMm * 10)}|${Math.round(sheet.thickness * 10)}`;
+    const code = `${sheet.globalIndex}${p.panelLabel}`;
+    const ex = byKey.get(key);
+    if (ex) {
+      ex.codes.push(code);
+      ex.qty += 1;
+    } else {
+      byKey.set(key, {
+        codes: [code],
+        qty: 1,
+        length: longMm,
+        width: shortMm,
+        thickness: sheet.thickness,
+        color: p.color,
+        partName: p.partName,
+      });
+    }
+  }
+}
+
+/** Sort codes within each row + order rows large-to-small; shared finisher. */
+function finishPanelSizeRows(byKey: Map<string, PanelSizeRow>): PanelSizeRow[] {
+  const rows = Array.from(byKey.values());
+  for (const r of rows) r.codes.sort(comparePanelCode);
+  rows.sort((a, b) => (b.length * b.width) - (a.length * a.width) || (b.length - a.length));
+  return rows;
+}
+
+/**
+ * Group ONE sheet's placed panels by identical (length, width, thickness).
+ * Returns rows sorted large-to-small (by area, then long edge). Panel codes
+ * within a row are the app's existing "{globalIndex}{panelLabel}" ids
+ * ("1a", "3b"), sorted naturally. Used by the per-sheet panel table.
+ */
+export function groupPanelsBySize(sheet: NestSheet): PanelSizeRow[] {
+  const byKey = new Map<string, PanelSizeRow>();
+  accumulatePanelSizes(byKey, sheet);
+  return finishPanelSizeRows(byKey);
+}
+
+/**
+ * Job-wide version: group EVERY placed panel across all sheets/groups by
+ * identical (length, width, thickness). A row's codes span sheets
+ * ("1a, 3a, 4b"). Used by the front-matter Panels table.
+ */
+export function groupAllPanelsBySize(result: NestResult): PanelSizeRow[] {
+  const byKey = new Map<string, PanelSizeRow>();
+  for (const g of result.groups) {
+    for (const s of g.sheets) accumulatePanelSizes(byKey, s);
+  }
+  return finishPanelSizeRows(byKey);
+}
+
+/** Natural-ish sort for panel ids like "1a", "2b", "10c": numeric sheet part
+ *  first, then the letter suffix. */
+function comparePanelCode(a: string, b: string): number {
+  const pa = /^(\d+)(.*)$/.exec(a);
+  const pb = /^(\d+)(.*)$/.exec(b);
+  if (pa && pb) {
+    const na = parseInt(pa[1], 10), nb = parseInt(pb[1], 10);
+    if (na !== nb) return na - nb;
+    return pa[2].localeCompare(pb[2]);
+  }
+  return a.localeCompare(b);
+}
+
 /** Generate cut step lists for every sheet in the job, in order. */
-export function allCutSteps(result: NestResult, margin = 0): SheetCuts[] {
+export function allCutSteps(result: NestResult, margin = 0, kerf = 0): SheetCuts[] {
   const out: SheetCuts[] = [];
   result.groups.forEach((g, gi) => {
     g.sheets.forEach((s, si) => {
-      out.push(cutStepsForSheet(s, si + 1, gi + 1, margin));
+      out.push(cutStepsForSheet(s, si + 1, gi + 1, margin, kerf));
     });
   });
   return out;

@@ -101,7 +101,6 @@
                 <option value="guillotine-exact">Min cuts+ (exhaustive search, slower)</option>
                 <option value="save-last">Max yield, save last sheet</option>
                 <option value="cnc">CNC nest (any angle · router / waterjet)</option>
-                <option value="cnc-save-last">CNC nest, save last sheet (any angle)</option>
               </select>
             </label>
             <label style="grid-column: 1 / -1">Thickness override
@@ -156,6 +155,10 @@
                 <option value="GBP">GBP</option>
                 <option value="AUD">AUD</option>
               </select>
+            </label>
+            <label class="check-row" style="grid-column: 1 / -1" title="Quote each cut as the flip-stop setting: from the registered edge to the near side of the kerf">
+              <input type="checkbox" id="parallelGuide" checked />
+              <span>Parallel guide dims (measure to cut edge)</span>
             </label>
             <label>PDF paper
               <select id="pdfPaper">
@@ -283,6 +286,13 @@
                     <path d="M12 15V3" />
                   </svg>
                   PDF
+                </button>
+                <button id="downloadPhonePdfBtn" class="ghost" disabled title="One cut per page, big type for the phone at the saw">
+                  <svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                    <rect x="7" y="2" width="10" height="20" rx="2" />
+                    <path d="M11 18h2" />
+                  </svg>
+                  Phone PDF
                 </button>
                 <button id="layoutMaxBtn" class="pane-max" title="Maximize / restore">
                   <svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">

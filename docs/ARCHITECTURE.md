@@ -195,7 +195,7 @@ rectangle packing (`packRect.ts`) or CNC true-shape (`cncNest.ts`). The
 animated path routes through the **multicore worker pool** (`optPool.ts` →
 `optWorker.ts`), with the single-core drivers as automatic fallback.
 
-### Rectangle path (free / guillotine / save-last)
+### Rectangle path (free / guillotine / guillotine-exact / save-last)
 
 1. **Bucket by thickness** at 0.5 mm tolerance. Each bucket nests
    independently into its own stack of sheets.
@@ -229,14 +229,23 @@ animated path routes through the **multicore worker pool** (`optPool.ts` →
 
 7. **Bin packer** (cut strategy):
    - **`MaxRectsBin`** — Jukka Jylänki's maximal-rectangles algorithm.
-   - **`ShelfBin`** — FFDH shelves; the true min-cuts strategy.
-   - (**`GuillotineBin`** — legacy SAS splitter, kept for reference.)
+   - **`ShelfBin`** — FFDH shelves; the min-cuts strategy (`guillotine`).
+   - **`GuillotineBin`** (SAS splitter) — one of the bin kinds `guillotine`
+     trials sweep, alongside shelf/shelf-v.
+   - **`packBeam`** — beam search over guillotine cut trees, added only for
+     **`guillotine-exact`** ("Min cuts+"): keeps the K most promising partial
+     layouts and branches on which part to cut next, its orientation, and the
+     axis of the next full-span cut, discarding regions to waste when that's
+     the better local call. One sheet is searched at a time (maximise area
+     placed, then fewest cuts); it also runs the full greedy trial pool
+     alongside it and only has to beat it. Slower than the greedy shelf/SAS
+     trials, often finds fewer cuts.
 
 8. **Finish** (`finishPack`): `consolidateSheets` rebuilds live bins from
    finished sheets and tries to dissolve the least-filled sheet into the
    others' free space; save-last then corner-packs the last sheet.
 
-### CNC path (cnc / cnc-save-last) — `cncNest.ts`
+### CNC path (`cnc`) — `cncNest.ts`
 
 Raster true-shape nesting: masks per part×angle on a ~5–8 mm grid
 (conservative rasterisation from simplified rings; exact contours carried on
@@ -250,6 +259,11 @@ alternates per-sheet shake with consolidation, then save-last compaction.
 orders (order-crossover + swap mutation, generations evaluated in
 parallel).
 
+(The dedicated **`cnc-save-last`** strategy was removed from the UI's
+strategy list; the engine's save-last compaction machinery above still
+exists internally but no longer has a strategy option that requests it
+specifically.)
+
 ### Output
 
 **Placement → PlacedPart** — each placement is mapped back to the original
@@ -259,6 +273,83 @@ SVG / DXF / PDF rendering.
 
 Returns a `NestResult` with `groups[].sheets[].parts[]` plus aggregate
 sheet count, yield, total area, and per-sheet `largestFree` offcut.
+
+### Cut-tree derivation (saw strategies) — `deriveGuillotineCuts` in `packRect.ts`
+
+Every saw-strategy layout (including MaxRects/`free` and `save-last`) has a
+guillotine cut tree recovered from its rectangle placements, called at every
+site that materializes a final sheet layout (`packOne`, `packBeam`, and the
+consolidation/save-last repack sites).
+
+1. **Layout normalization first** — `thinStripsTop(placements, inflated,
+   binH)` runs immediately before tree derivation. If the area-weighted
+   centroid of "thin" pieces (`min(w,h) < AWKWARD_MM`, 150 mm — narrower than
+   this is awkward under a track-saw rail) sits lower than the centroid of
+   the wide pieces, the whole layout is mirrored vertically (a guillotine
+   layout stays valid under a mirror). Then, unconditionally, the layout is
+   shifted so its tightest bounding rect is flush at `(0, 0)` — no waste is
+   left between the reference edges and the first parts, since measurements
+   run from those trimmed edges.
+
+2. **Tree building** — `decompose` recursively splits each region along the
+   best `Line` found by `betterLine`, building an explicit `CutNode` tree
+   (`{ cut, children }`) rather than emitting cuts as it recurses. Candidate
+   lines are ranked by `betterLine`, in priority order:
+   1. frees a **REUSABLE** empty offcut strip (`offcut`: both resulting dims
+      ≥ `REUSABLE_MM` = 200 mm) — bigger freed area wins; goes to the rack
+      whole before the parts around it are broken down;
+   2. shaves a thin **FINISHED** strip (`thinShave`: < `AWKWARD_MM`, needs no
+      further cuts) off big stock while the stock is still wide enough to
+      carry the saw rail;
+   3. `separates` (a real split with whole parts on both sides) before a
+      trim-only line;
+   4. avoids `thinBad` (a split that still leaves a sub-`AWKWARD_MM` piece
+      needing more cuts);
+   5. lower `balance` (parts-count difference between the two sides);
+   6. bigger `pieceMin` (the smaller resulting span — no sliver pieces);
+   7. lower `dist` from the working edge, as a tie-break.
+
+3. **Emission — dependency-aware greedy scheduler, not DFS.** A `ready`
+   queue holds `CutNode`s whose parent piece already exists (seeded with the
+   root, refilled with `node.children` once a node is scheduled). Each step
+   picks the best-ranked ready node by, in order:
+   1. same axis **and** same distance as the previous cut (within epsilon)
+      — the saw's parallel-guide/flip-stop setting is already correct;
+   2. same axis as the previous cut — no 180° rotation of the stock/rail;
+   3. is a child of the previous cut;
+   4. has the larger parent piece.
+
+   This is a greedy comparator that reuses guide settings and avoids
+   rotations where possible — not a numeric cost accumulator — modeling how
+   a human runs a track saw with a parallel guide: re-cutting at the same
+   stop, or on the same rip/cross axis, is far cheaper than resetting the
+   guide or spinning the stock 90°.
+
+### Reference trims — `cutStepsForSheet` / `allCutSteps` in `instructions.ts`
+
+Both functions now take a `kerf` parameter (`cutStepsForSheet(sheet,
+sheetIndex, groupIndex, margin, kerf)`, `allCutSteps(result, margin,
+kerf)`), used when computing the far long-edge trim below.
+
+When `margin > 0`, each sheet opens with **three** reference/trim cuts —
+both long edges of the sheet, plus the short edge nearest the datum corner
+(main datum = the sheet's top-left corner; the far short edge is left to
+fall off naturally with the layout cuts, so it's not cut explicitly):
+
+- The **near** long edge and the short edge trim at the plain margin line.
+- The **far** long-edge trim does double duty: instead of cutting at the
+  sheet's far margin, it lands at `max part extent along that axis +
+  kerf/2` (falling back to the margin line if there are no parts, or if the
+  margin line is tighter). One cut therefore frees the whole far leftover
+  strip *and* establishes the reference edge, rather than leaving a
+  separate untrimmed offcut.
+- **Trim order adapts**: the three trims are sequenced so the *last* trim
+  shares axis with the sheet's first layout cut (`sheet.cuts[0].axis`),
+  minimizing guide rotations between the trim phase and the layout phase.
+- **Dedup against the cut tree**: after trims are computed, any tree cut
+  whose line coincides with a trim line (within 0.75 mm) is dropped, and
+  the remaining steps are renumbered — a cut the trims already made isn't
+  listed twice.
 
 ---
 
@@ -304,10 +395,17 @@ user-selected paper size:
 1. **Summary** — job name, sheet metrics, per-thickness breakdown,
    inventory check (from shopping list).
 2. **Shopping list** page.
-3. **Parts overview** — IKEA-style grid (SKIPPED in CNC mode).
-4. **One page per sheet** — sheet diagram with parts overlaid + letter
-   labels; followed by per-sheet cut-sequence cards (SKIPPED in CNC mode —
-   `opt.cnc`; a router follows contours).
+3. **Panels** — job-wide dimensions table (`groupAllPanelsBySize` →
+   `drawPanelTable`): thumbnail · codes · qty · length · width · thick,
+   with identical sizes grouped and their codes comma-listed in one row.
+   Replaces the older IKEA-style parts-overview card grid. SKIPPED in CNC
+   mode.
+4. **One page per sheet**, in one pagination section per sheet: sheet
+   overview (diagram with parts overlaid + letter labels) → **Sheet N
+   panels** table (`drawSheetPanelTable`, same column layout as the
+   job-wide Panels table but scoped to that sheet) → **Sheet N cut
+   sequence** cards (SKIPPED in CNC mode — `opt.cnc`; a router follows
+   contours).
 5. **Join split parts** (only when the CNC auto-split fired) — each split
    parent drawn reassembled from its segments, labelled `i / ii / …` with
    the sheet panel id (`1a-i`) each piece nests under (`drawSplitJoins`,
@@ -316,6 +414,40 @@ user-selected paper size:
 
 Shopping list rows flow into the PDF's inventory check section as
 `InventoryCheck[]`.
+
+**Phone PDF.** `buildMobilePdf(result, opt)` (dispatched from `buildPdf`
+when `paper === 'mobile'`, fixed page size `396×704`) renders one cut per
+page in large type for reading at the saw. The Cut Layout header's
+**Phone PDF** button (`downloadPhonePdfBtn` in `main.ts`) calls the same
+`exportPdf(btn, paper)` helper as the regular PDF button, forcing
+`paper='mobile'`; the download filename gets an `_phone` suffix.
+
+**Quoted cut distances — parallel-guide mode.** `quotedDistance(cur, sc,
+opt)` computes the number printed on each cut caption:
+- **Trim cuts** always report `min(distance, span − distance)` — the width
+  of the strip coming off, not the keeper — regardless of the
+  parallel-guide setting.
+- **Layout cuts**, when `opt.parallelGuide` is on (checkbox `#parallelGuide`
+  in `index.html`, default ON): `distance − kerf` (floored at 0) — the
+  **keeper** dimension, i.e. what you'd actually dial on a parallel-guide's
+  flip stops, measured from the registered edge to the near side of the
+  kerf. Off: the raw kerf-centreline distance.
+
+**Same-setting hint.** `CutStep.sameSetting` (set by `markSameSetting` in
+`instructions.ts` when a step shares axis and distance with the previous
+step, within 0.5 mm) renders as `· same setting` appended to the desktop
+cut-card caption, and as a separate hint line on the mobile/phone layout
+("same guide setting — slide stock to the stops and cut").
+
+**Cut diagram color language** (`drawCutDiagram`): white = prior cuts
+already made (drawn thin, then dimmed under an 80%-opacity fade over
+everything outside the active parent piece); **blue** = established
+reference/trim edges, drawn on top of the fade so the datum corner stays
+identifiable; **red** = the active cut (bold, with arrow caps) and the
+active parent piece's border; **green** = the edge the printed dimension
+is measured from — the parent's left edge for a vertical cut, top edge for
+a horizontal cut — drawn last, with captions reading "from L edge" /
+"from T edge".
 
 ### STEP (unplaced parts)
 `buildStep()` in `src/stepExport.ts` — one extruded-prism solid per

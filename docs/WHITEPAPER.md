@@ -94,10 +94,10 @@ the work yields to the browser so the page never freezes.
 | Strategy | Machine | Packer | Objective |
 |---|---|---|---|
 | Max yield | anything | MaxRects | highest material use |
-| **Min cuts** (default) | track / panel saw | Shelf (FFDH) | fewest edge-to-edge cuts |
+| **Min cuts** (default) | track / panel saw | Shelf (FFDH) + SAS | fewest edge-to-edge cuts |
+| Min cuts+ | track / panel saw | Min cuts + beam search | fewest cuts, exhaustive (slower) |
 | Max yield, save last sheet | anything | MaxRects + corner repack | clean reusable remnant |
 | **CNC nest** | router / waterjet | raster true-shape | fewest sheets, any angle |
-| CNC nest, save last sheet | router / waterjet | raster true-shape | + clean remnant |
 
 The saw strategies pack each part's **bounding rectangle** (saws cut
 straight lines), and every layout comes with a real, ordered cut sequence.
@@ -280,9 +280,17 @@ reassembled from its labelled segments:
   placement splits the free space into up to four overlapping free
   rectangles, dominated ones pruned. Typically 85–95% yield on cabinet
   parts.
-- **Shelf / FFDH** (Min cuts): parts pack into horizontal shelves; every
-  shelf boundary is one full-sheet rip and every part boundary one
-  crosscut — the fewest cuts a panel saw can achieve.
+- **Shelf / FFDH + SAS** (Min cuts): parts pack into horizontal shelves or a
+  split-and-shelve layout; every shelf boundary is one full-sheet rip and
+  every part boundary one crosscut — the fewest cuts a panel saw can
+  typically achieve with a fast, greedy pass.
+- **Min cuts+**: the same fewest-cuts objective, but adds a **beam search**
+  over possible cut trees — at each step it keeps the several most promising
+  partial layouts instead of committing to one, branching on which part to
+  cut next, which way to turn it, and which direction the next full-span
+  cut runs. It also still runs the full Min cuts trial pool alongside the
+  beam and only has to beat it. Slower, but it sometimes finds a layout with
+  fewer cuts than the greedy pass settles for.
 - **Skip-on-fail**: when a part doesn't fit the current sheet, the packer
   tries the *next part* rather than closing the sheet — one tall part
   shouldn't end a sheet with room left.
@@ -293,6 +301,38 @@ reassembled from its labelled segments:
   MaxRects layouts, so the PDF's cut sequence is physically executable
   edge-to-edge cuts that never slice a neighbouring panel.
 
+### 6.1 Turning the cut tree into a sequence a person can follow
+
+Recovering *a* valid cut tree isn't the hard part — ordering its cuts the
+way someone actually runs a track saw with a parallel guide is. Two things
+happen before a layout's cuts are handed to the PDF:
+
+- **Thin strips migrate to the top edge.** A guillotine layout is still
+  valid if you flip it top-to-bottom, so if the narrow, fiddly offcuts ended
+  up along the bottom of the sheet, the whole layout is mirrored vertically
+  so they sit at the top instead — the saw's rail always rests on the wide,
+  stable stock for as long as possible. The layout is then shifted snug
+  against the reference corner, so there's no unexplained gap between the
+  trimmed edges and the first parts.
+- **Picking which line to cut next favors two things a shop actually wants**
+  before falling back to the older balance/size rules: first, a cut that
+  frees a good-size clean rectangle of *empty* offcut (200 mm or more on
+  both sides) gets taken immediately, so that scrap goes straight to the
+  rack instead of getting chopped up incidentally later. Second, a cut that
+  shaves a thin *finished* strip (under 150 mm) off a big piece of stock
+  gets taken early too, while there's still enough width for the rail to
+  sit on safely.
+- **The cut order itself is scheduled, not just recursively emitted.** Once
+  the tree of cuts is built, a separate pass decides what order to actually
+  cut them in, and it behaves like someone standing at the saw: it strongly
+  prefers the next cut to be at the exact same guide setting as the one just
+  made (free — the stop hasn't moved), then a cut on the same axis (no need
+  to spin the stock 90°), then a cut on the piece that was just produced,
+  and only after all of that does it fall back to picking the larger
+  remaining piece. This is why the printed cut sequence tends to read as
+  "rip, rip again at the same mark, flip, crosscut, crosscut again" instead
+  of jumping all over the sheet.
+
 ---
 
 ## 7. Exports
@@ -300,12 +340,45 @@ reassembled from its labelled segments:
 | Output | Details |
 |---|---|
 | **DXF** | Strict **R12** — classic `POLYLINE`/`VERTEX`/`SEQEND` (no R14 entities), full LTYPE/STYLE/BLOCKS tables, `$EXTMIN/$EXTMAX`. Two flavours: annotated (labels + dimensions) and **cut file** (contours only, for CAM). Validated against the strictest open-source DXF parser — old waterjet importers were rejecting a doubled `ENDSEC` the previous writer emitted. |
-| **PDF** | Cover summary → shopping list → parts overview (saw modes) → one page per sheet (+ cut-sequence cards in saw modes) → join-split-parts guide (when parts were split) → per-cabinet assembly pages with IKEA-style step snapshots. CNC mode drops the saw-only sections. |
+| **PDF** | Cover summary → shopping list → a job-wide **Panels** table (dimensions, not a card grid; saw modes) → one page per sheet (overview → that sheet's own panels table → cut-sequence cards, saw modes only) → join-split-parts guide (when parts were split) → per-cabinet assembly pages with IKEA-style step snapshots. CNC mode drops the saw-only sections. A one-tap **Phone PDF** button exports the same job as one-cut-per-page, large-type pages sized for reading off a phone at the saw. |
 | **CSV** | Shopping list (thickness, need/have/buy, cost). |
 | **STEP** | Unplaced parts only, regenerated from their exact outlines as extruded solids — re-nest them elsewhere. |
 
 All geometry is **millimetres internally**; the UI converts at the
 boundary (fractional inches at 1/16" by default). The world is Z-up.
+
+### 7.1 Setting up the sheet before the layout cuts start
+
+When a margin is set, every sheet's cut sequence opens with three reference
+cuts rather than jumping straight into the layout: both long edges of the
+sheet, plus the short edge nearest the datum corner (top-left). The fourth
+edge — the far short edge — is left alone, because the layout cuts trim it
+away on their own.
+
+The trim on the *far* long edge does double duty: rather than cutting at
+the sheet's plain margin line, it cuts right at the edge of the farthest
+part (plus half a kerf), so that single cut both frees the whole leftover
+strip beyond the parts **and** sets the reference edge everything else is
+measured from. And if a layout cut would have landed on exactly the same
+line as one of these three trims, it's dropped from the printed sequence
+(and the remaining steps renumbered) rather than repeating the same cut
+twice.
+
+### 7.2 Reading a cut-sequence page
+
+Each cut diagram in the PDF and on-screen cut cards uses a small,
+consistent color language: **green** marks the edge a dimension is measured
+from (so a caption reads "40 3/8" from L edge" or "from T edge"); **blue**
+marks the reference edges the trim cuts already established; **red** is the
+cut you're about to make right now, plus the outline of the piece of stock
+it's being made on; **white** lines are cuts already completed. With a
+parallel guide (on by default), the printed number is the *keeper*
+measurement — what you'd actually dial on the guide's flip stops — rather
+than the raw distance to the middle of the saw kerf; trim-cut captions
+instead show the width of the strip coming off. Consecutive cuts that share
+the same guide setting are flagged "same setting" (or, on the phone PDF, a
+plain-language reminder to just slide the stock down and cut again) so you
+know when the fence doesn't need to move.
 
 ---
 

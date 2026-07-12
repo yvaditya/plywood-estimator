@@ -12,7 +12,7 @@
 import { jsPDF } from 'jspdf';
 import type { NestResult, NestSheet, PlacedPart } from './nest';
 import { fmtDim, fmtArea, type Units } from './units';
-import { assignPartLabels, allCutSteps, type PartLabel } from './instructions';
+import { assignPartLabels, allCutSteps, groupPanelsBySize, groupAllPanelsBySize, type PartLabel, type PanelSizeRow } from './instructions';
 
 export type PdfPaper =
   | 'widescreen-16-9'
@@ -30,6 +30,10 @@ export interface PdfOptions {
   margin: number;       // mm
   kerf: number;         // mm
   units: Units;
+  /** Parallel-guide mode: quote each cut as the KEEPER dimension — the
+   *  number dialed on the flip stops, measured from the registered edge to
+   *  the near side of the kerf (distance − kerf). Off = kerf-centre line. */
+  parallelGuide?: boolean;
   inventoryCheck?: InventoryCheck[];
   jobName?: string;
   paper?: PdfPaper;
@@ -238,13 +242,16 @@ export function buildPdf(result: NestResult, opt: PdfOptions): jsPDF {
   nav.toc.push({ title: 'Shopping list', desc: 'Materials to buy before starting.', target: 'Shopping list' });
   drawShoppingListPage(doc, opt, dims);
 
-  // 5. PARTS OVERVIEW — all panels grouped by unique part, dimensions.
-  //    Skipped for CNC jobs (the machine cuts straight from the sheet
-  //    contours; the saw-shop parts grid is dead weight there).
+  // 5. PANELS — ONE job-wide dimensions table: every placed panel across
+  //    all sheets, grouped by identical (length × width × thickness). Same
+  //    format as the per-sheet tables; codes ("1a, 3a, 4b") point back at
+  //    the sheet layouts. Skipped for CNC jobs (the machine cuts straight
+  //    from the sheet contours; the saw-shop dimensions table is dead
+  //    weight there).
   if (!opt.cnc) {
-    addPage('Parts');
-    nav.toc.push({ title: 'Parts overview', desc: 'One card per unique panel, with dimensions.', target: 'Parts' });
-    drawPartsOverview(doc, labels, opt, dims, tagSection, nav, curPage);
+    addPage('Panels');
+    nav.toc.push({ title: 'Panels', desc: 'Every panel size in the job — codes point to the sheet layouts.', target: 'Panels' });
+    drawPanelTable(doc, 'Panels', groupAllPanelsBySize(result), opt, dims, () => addPage('Panels'));
   }
 
   // 6. CUT SHEETS grouped by thickness — divider page per group when the job
@@ -268,12 +275,18 @@ export function buildPdf(result: NestResult, opt: PdfOptions): jsPDF {
     }
     for (const sheet of group.sheets) {
       const sectionName = `Sheet ${sheet.globalIndex}`;
+      // Per-sheet order the reader follows: (a) layout overview, (b) panel
+      // dimensions table, (c) cut sequence. All three share the one
+      // "Sheet 3 (2 of 3)" pagination section.
       addPage(sectionName);
       drawSheet(doc, sheet, opt, dims, labels, cabinetByPanelId, nav, curPage);
-      // The sheet's cuts come on the next page(s) — same section so they
-      // share the "Sheet 3 (2 of 3)" pagination header. CNC jobs skip the
-      // cards entirely: a router/waterjet follows the part contours, so a
-      // panel-saw cut sequence would be fiction.
+      // (b) Panel dimensions for THIS sheet, grouped by identical size.
+      if (sheet.parts.length > 0) {
+        drawSheetPanelTable(doc, sheet, opt, dims, () => { addPage(sectionName); });
+      }
+      // (c) The sheet's cuts. CNC jobs skip the cards entirely: a
+      // router/waterjet follows the part contours, so a panel-saw cut
+      // sequence would be fiction.
       if (!opt.cnc) {
         drawCutsForSingleSheet(doc, sheet, opt, dims,
           () => { addPage(sectionName); });
@@ -599,7 +612,7 @@ function drawQuickReference(
     }
     if (shown < legendItems.length) {
       doc.setTextColor(140);
-      doc.text(`+${legendItems.length - shown} more — see Parts overview`, lx + 12, ly);
+      doc.text(`+${legendItems.length - shown} more — see Panels`, lx + 12, ly);
     }
     doc.setTextColor(0);
   }
@@ -708,15 +721,15 @@ function buildMobilePdf(result: NestResult, opt: PdfOptions): jsPDF {
     doc.setTextColor(0);
   }
 
-  // SHEETS — layout page (with a part list standing in for the desktop
-  // Parts overview), then one page per cut.
+  // SHEETS — layout page (with a grouped panel table standing in for the
+  // desktop Panels section), then one page per cut.
   for (const group of result.groups) {
     for (const sheet of group.sheets) {
       const section = `Sheet ${sheet.globalIndex}`;
       addPage(section);
       drawMobileSheetPage(doc, sheet, opt, dims);
       if (!opt.cnc) {
-        const sc = (allCutSteps({ groups: [{ thickness: sheet.thickness, sheets: [sheet], unplaced: [] }] } as any, opt.margin))[0];
+        const sc = (allCutSteps({ groups: [{ thickness: sheet.thickness, sheets: [sheet], unplaced: [] }] } as any, opt.margin, opt.kerf))[0];
         if (sc) {
           for (let i = 0; i < sc.steps.length; i++) {
             addPage(section);
@@ -809,24 +822,48 @@ function drawMobileSheetPage(doc: jsPDF, sheet: NestSheet, opt: PdfOptions, dims
   }
   y += dH + 22;
 
-  // Part list — id · name · long × short. Stands in for the desktop
-  // Parts overview grid. Big rows with hairline separators.
-  doc.setFontSize(13);
-  for (const p of sheet.parts) {
-    if (y > PAGE_H - PAGE_PAD - 10) break;
+  // Panel dimensions table — same grouping as the desktop per-sheet table:
+  // identical-size panels collapse into one row with a comma-separated code
+  // list, a color thumbnail, qty and long × short. Big rows with hairline
+  // separators for reading at the saw.
+  const rows = groupPanelsBySize(sheet);
+  const thumbCell = 34;
+  for (const r of rows) {
+    if (y > PAGE_H - PAGE_PAD - 8) break;
+    const rowMid = y - 4;
+    // Thumbnail — aspect-correct color rectangle, long edge horizontal.
+    const aspect = r.width / r.length;
+    let tw = thumbCell, th = tw * aspect;
+    const thumbMaxH = 23;
+    if (th > thumbMaxH) { th = thumbMaxH; tw = th / aspect; }
+    const [pr, pg, pb] = hexToRgb(r.color);
+    const GS = (doc as any).GState;
+    if (GS) (doc as any).setGState(new GS({ opacity: 0.50 }));
+    doc.setFillColor(pr, pg, pb);
+    doc.rect(PAGE_PAD, rowMid - th / 2, tw, th, 'F');
+    if (GS) (doc as any).setGState(new GS({ opacity: 1 }));
+    doc.setDrawColor(Math.floor(pr * 0.55), Math.floor(pg * 0.55), Math.floor(pb * 0.55));
+    doc.setLineWidth(0.5);
+    doc.rect(PAGE_PAD, rowMid - th / 2, tw, th, 'S');
+    // Code list + qty
+    doc.setFontSize(13);
     doc.setFont('helvetica', 'bold');
     doc.setTextColor(30);
-    doc.text(`${sheet.globalIndex}${p.panelLabel}`, PAGE_PAD, y);
+    const codeX = PAGE_PAD + thumbCell + 10;
+    doc.text(r.codes.join(', '), codeX, y, { maxWidth: innerW - thumbCell - 130 });
+    if (r.qty > 1) {
+      doc.setFont('helvetica', 'normal');
+      doc.setTextColor(120);
+      doc.text(`×${r.qty}`, codeX, y + 12);
+    }
+    // Dims — long × short × thick, right-aligned.
     doc.setFont('helvetica', 'normal');
-    doc.setTextColor(100);
-    const name = p.partName.length > 16 ? p.partName.slice(0, 13) + '…' : p.partName;
-    doc.text(name, PAGE_PAD + 38, y);
     doc.setTextColor(40);
     doc.text(
-      `${fmtDim(Math.max(p.w, p.h), opt.units)} × ${fmtDim(Math.min(p.w, p.h), opt.units)}`,
+      `${fmtDim(r.length, opt.units)} × ${fmtDim(r.width, opt.units)} × ${fmtDim(r.thickness, opt.units)}`,
       PAGE_W - PAGE_PAD, y, { align: 'right' },
     );
-    y += 10;
+    y += r.qty > 1 ? 20 : 12;
     doc.setDrawColor(235);
     doc.setLineWidth(0.4);
     doc.line(PAGE_PAD, y, PAGE_W - PAGE_PAD, y);
@@ -867,18 +904,27 @@ function drawMobileCutPage(
     edgeRef = 'reference edge';
   } else {
     label = cur.axis === 'rip' ? 'Rip' : 'Crosscut';
-    edgeRef = cur.axis === 'rip' ? 'from the LEFT edge' : 'from the BOTTOM edge';
+    // Distances run from the parent's datum corner (top-left): vertical
+    // lines measure from the LEFT edge, horizontal lines from the TOP.
+    const vertical = (sc.sheetL >= sc.sheetW) ? cur.axis === 'rip' : cur.axis === 'cross';
+    edgeRef = vertical ? 'from the LEFT edge' : 'from the TOP edge';
   }
   doc.setFont('helvetica', 'bold');
   doc.setFontSize(26);
   doc.setTextColor(25);
-  doc.text(`${label}  ${fmtDim(cur.distance, opt.units)}`, PAGE_PAD, y);
+  doc.text(`${label}  ${fmtDim(quotedDistance(cur, sc, opt), opt.units)}`, PAGE_PAD, y);
   y += 20;
   doc.setFont('helvetica', 'normal');
   doc.setFontSize(13.5);
   doc.setTextColor(90);
   doc.text(edgeRef, PAGE_PAD, y, { maxWidth: innerW });
   y += 14;
+  if (cur.sameSetting) {
+    doc.setFontSize(11);
+    doc.setTextColor(140);
+    doc.text('same guide setting — slide stock to the stops and cut', PAGE_PAD, y, { maxWidth: innerW });
+    y += 14;
+  }
 
   // Diagram fills the rest of the page (same orientation as the desktop
   // cut cards). Sits just under the instruction — not vertically centered —
@@ -935,7 +981,7 @@ function drawAssemblyGuide(
   doc.setFontSize(10);
   doc.setTextColor(120);
   doc.text(
-    'Each panel keeps its 3D color — find the matching letter on the Parts overview page. The exploded view shows the direction each panel comes from when assembling.',
+    'Each panel keeps its 3D color — find the matching code on the Panels page. The exploded view shows the direction each panel comes from when assembling.',
     PAGE_PAD, PAGE_PAD + 24, { maxWidth: PAGE_W - 2 * PAGE_PAD },
   );
   doc.setTextColor(0);
@@ -1515,6 +1561,180 @@ export function downloadPdf(filename: string, doc: jsPDF) {
 }
 
 // ---------------------------------------------------------------------------
+// PANEL DIMENSIONS table — shared renderer for the per-sheet tables and the
+// job-wide front-matter "Panels" section. Panels of identical size
+// (length × width × thickness) collapse into ONE row: the qty column shows
+// the count and the code cell lists every instance's id ("1a, 1c, 3b").
+// Columns: image (color thumbnail, aspect-correct) · code · qty · length ·
+// width · thickness. Rows sorted large-to-small.
+// ---------------------------------------------------------------------------
+
+/** Per-sheet wrapper: its own page, sitting between the sheet's layout
+ *  overview and its cut sequence. */
+function drawSheetPanelTable(
+  doc: jsPDF,
+  sheet: NestSheet,
+  opt: PdfOptions,
+  dims: { w: number; h: number },
+  openNewPage: () => void,
+) {
+  const rows = groupPanelsBySize(sheet);
+  if (rows.length === 0) return;
+  // Fresh page — keeps the layout page clean and matches the cut-sequence
+  // page starting on its own page too.
+  openNewPage();
+  drawPanelTable(doc, `Sheet ${sheet.globalIndex} panels`, rows, opt, dims, openNewPage);
+}
+
+/** Draw a panel-dimensions table starting on the CURRENT page (title +
+ *  header + rows), spilling to `openNewPage()` pages with a repeated
+ *  column header when the rows overflow. */
+function drawPanelTable(
+  doc: jsPDF,
+  title: string,
+  rows: PanelSizeRow[],
+  opt: PdfOptions,
+  dims: { w: number; h: number },
+  openNewPage: () => void,
+) {
+  const PAGE_W = dims.w;
+  const PAGE_H = dims.h;
+  if (rows.length === 0) return;
+
+  // Header — title left; part totals right.
+  doc.setFont('helvetica', 'bold');
+  doc.setFontSize(13);
+  doc.setTextColor(20);
+  doc.text(title, PAGE_PAD, PAGE_PAD + 10);
+  doc.setFont('helvetica', 'normal');
+  doc.setFontSize(9);
+  doc.setTextColor(120);
+  const uniqueN = rows.length;
+  const totalN = rows.reduce((a, r) => a + r.qty, 0);
+  doc.text(
+    `${totalN} ${totalN === 1 ? 'panel' : 'panels'}  ·  ${uniqueN} unique size${uniqueN === 1 ? '' : 's'}`,
+    PAGE_W - PAGE_PAD, PAGE_PAD + 10, { align: 'right' },
+  );
+  doc.setTextColor(0);
+
+  // Column geometry. The table is bounded to a comfortable reading width
+  // (it does NOT span the whole widescreen page — that would scatter the
+  // columns into far-apart clusters). Image cell on the left, then code,
+  // then the right-aligned numeric columns (qty · length · width · thick).
+  const left = PAGE_PAD;
+  const imgColW = 62;                 // thumbnail cell width
+  const rowH = 34;                    // generous rows — the thumbnail needs height
+  const tableW = Math.min(PAGE_W - 2 * PAGE_PAD, 620);
+  const right = left + tableW;        // table's right edge (numeric column anchor)
+  const cImg   = left;
+  const cCode  = left + imgColW + 14; // code column left edge
+  // Right-aligned numeric columns, evenly spaced from the table's right edge.
+  const cThick = right;               // right-aligned at table edge
+  const cWid   = right - 110;
+  const cLen   = right - 220;
+  const cQty   = right - 330;         // qty right edge
+
+  const drawHeader = (y: number): number => {
+    doc.setFont('helvetica', 'bold');
+    doc.setFontSize(8.5);
+    doc.setTextColor(110);
+    doc.text('PANEL', cImg, y);
+    doc.text('CODE', cCode, y);
+    doc.text('QTY', cQty, y, { align: 'right' });
+    doc.text('LENGTH', cLen, y, { align: 'right' });
+    doc.text('WIDTH', cWid, y, { align: 'right' });
+    doc.text('THICK', cThick, y, { align: 'right' });
+    doc.setDrawColor(215);
+    doc.setLineWidth(0.5);
+    doc.line(left, y + 5, right, y + 5);
+    doc.setTextColor(0);
+    return y + 5 + 16;
+  };
+
+  const TOP = PAGE_PAD + 24;
+  const BOTTOM = PAGE_H - PAGE_PAD;
+  let y = drawHeader(TOP);
+
+  for (const r of rows) {
+    if (y + rowH > BOTTOM) {
+      openNewPage();
+      doc.setFont('helvetica', 'bold');
+      doc.setFontSize(13);
+      doc.setTextColor(20);
+      doc.text(`${title} (cont.)`, PAGE_PAD, PAGE_PAD + 10);
+      doc.setTextColor(0);
+      y = drawHeader(TOP);
+    }
+    drawPanelRow(doc, r, opt, {
+      rowTop: y - 12, rowH, cImg, imgColW, cCode, cQty, cLen, cWid, cThick,
+    });
+    // Hairline divider under the row.
+    doc.setDrawColor(235);
+    doc.setLineWidth(0.4);
+    doc.line(left, y + rowH - 12, right, y + rowH - 12);
+    y += rowH;
+  }
+  doc.setTextColor(0);
+}
+
+/** One row of the panel table: aspect-correct color thumbnail + code list +
+ *  qty + length + width + thickness, all vertically centered in the row
+ *  band. */
+function drawPanelRow(
+  doc: jsPDF,
+  r: PanelSizeRow,
+  opt: PdfOptions,
+  g: {
+    rowTop: number; rowH: number; cImg: number; imgColW: number;
+    cCode: number; cQty: number; cLen: number; cWid: number; cThick: number;
+  },
+) {
+  const midY = g.rowTop + g.rowH / 2;
+  const textY = midY + 3; // optical baseline for helvetica ~10pt
+
+  // Thumbnail — the panel rectangle in its color, aspect-correct, long edge
+  // horizontal (matching every other view), letterboxed inside the image
+  // cell. Filled at 50% opacity with a darker border, same convention as the
+  // layout panels.
+  const thumbMaxW = g.imgColW;
+  const thumbMaxH = g.rowH - 5;
+  const aspect = r.width / r.length; // h/w with long edge horizontal
+  let tw = thumbMaxW;
+  let th = tw * aspect;
+  if (th > thumbMaxH) { th = thumbMaxH; tw = th / aspect; }
+  const tx = g.cImg + (g.imgColW - tw) / 2;
+  const ty = midY - th / 2;
+  const [pr, pg, pb] = hexToRgb(r.color);
+  const GS = (doc as any).GState;
+  if (GS) (doc as any).setGState(new GS({ opacity: 0.50 }));
+  doc.setFillColor(pr, pg, pb);
+  doc.rect(tx, ty, tw, th, 'F');
+  if (GS) (doc as any).setGState(new GS({ opacity: 1 }));
+  doc.setDrawColor(Math.floor(pr * 0.55), Math.floor(pg * 0.55), Math.floor(pb * 0.55));
+  doc.setLineWidth(0.6);
+  doc.rect(tx, ty, tw, th, 'S');
+
+  // Code list — bold, comma-separated. Wraps within the code column width if
+  // there are many instances (stops short of the qty column).
+  doc.setFont('helvetica', 'bold');
+  doc.setFontSize(10);
+  doc.setTextColor(30);
+  const codeText = r.codes.join(', ');
+  const codeMaxW = g.cQty - 40 - g.cCode;
+  doc.text(codeText, g.cCode, textY, { maxWidth: Math.max(40, codeMaxW) });
+
+  // Qty · Length · Width · Thickness — right-aligned numeric columns.
+  doc.setFont('helvetica', 'normal');
+  doc.setFontSize(10);
+  doc.setTextColor(40);
+  doc.text(String(r.qty), g.cQty, textY, { align: 'right' });
+  doc.text(fmtDim(r.length, opt.units), g.cLen, textY, { align: 'right' });
+  doc.text(fmtDim(r.width, opt.units), g.cWid, textY, { align: 'right' });
+  doc.text(fmtDim(r.thickness, opt.units), g.cThick, textY, { align: 'right' });
+  doc.setTextColor(0);
+}
+
+// ---------------------------------------------------------------------------
 // Cut cards for ONE sheet, starting on the current page (after the layout
 // has been drawn at the top, the cards flow below it). Calls `openNewPage`
 // to spillover so the caller can tag the new page with the right section.
@@ -1530,7 +1750,7 @@ function drawCutsForSingleSheet(
   const PAGE_H = dims.h;
   // Generate a SheetCuts wrapper (cutStepsForSheet handles guillotine vs
   // fallback). We need the same shape drawCutCard expects.
-  const sc = (allCutSteps({ groups: [{ thickness: sheet.thickness, sheets: [sheet], unplaced: [] }] } as any, opt.margin))[0];
+  const sc = (allCutSteps({ groups: [{ thickness: sheet.thickness, sheets: [sheet], unplaced: [] }] } as any, opt.margin, opt.kerf))[0];
   if (!sc || sc.steps.length === 0) return;
 
   // Start a new page for the cut cards — keeps the sheet layout page clean.
@@ -2120,212 +2340,6 @@ function drawHeaderFooter(
   doc.setTextColor(0);
 }
 
-// ---------------------------------------------------------------------------
-// Parts overview
-//   - Sections grouped by STEP file (one per cabinet)
-//   - Each section: cabinet name + grid of part cards
-//   - Cards use the SAME sheet-relative panel IDs (1a, 1b, 2a, ...) as the
-//     per-sheet layouts + assembly pages — labels match across the PDF.
-//   - Falls back to a flat A/B/C list if cabinet data isn't supplied.
-// ---------------------------------------------------------------------------
-function drawPartsOverview(
-  doc: jsPDF,
-  labels: Map<string, PartLabel>,
-  opt: PdfOptions,
-  dims: { w: number; h: number },
-  tagSection?: (s: string) => void,
-  nav?: NavCtx,
-  curPage?: () => number,
-) {
-  const PAGE_W = dims.w;
-  const PAGE_H = dims.h;
-
-  // Header
-  doc.setFont('helvetica', 'bold');
-  doc.setFontSize(20);
-  doc.text('Parts overview', PAGE_PAD, PAGE_PAD + 6);
-  doc.setFont('helvetica', 'normal');
-  doc.setFontSize(10);
-  doc.setTextColor(120);
-
-  // Build the list of cabinets to render.
-  const cabinets = (opt.cabinets ?? []).filter((c) => c.panels && c.panels.length > 0);
-
-  // Total piece count subtitle.
-  let totalPieces = 0;
-  if (cabinets.length > 0) {
-    for (const c of cabinets) totalPieces += c.panels!.length;
-    doc.text(
-      `${cabinets.length} ${cabinets.length === 1 ? 'cabinet' : 'cabinets'} · ${totalPieces} panels`,
-      PAGE_W - PAGE_PAD, PAGE_PAD + 6, { align: 'right' },
-    );
-  } else {
-    const items = Array.from(labels.values());
-    totalPieces = items.reduce((a, x) => a + x.totalQty, 0);
-    doc.text(
-      `${items.length} unique parts · ${totalPieces} pieces total`,
-      PAGE_W - PAGE_PAD, PAGE_PAD + 6, { align: 'right' },
-    );
-  }
-  doc.setTextColor(0);
-
-  // Card-grid metrics shared by both layouts.
-  const cols = PAGE_W > 800 ? 4 : 3;
-  const gutter = 18;
-  const innerW = PAGE_W - 2 * PAGE_PAD;
-  const cardW = (innerW - gutter * (cols - 1)) / cols;
-  const cardH = 130;
-  const sectionHeaderH = 26;
-
-  // ----------- Grouped layout: cabinets ---------------------------------
-  if (cabinets.length > 0) {
-    let y = PAGE_PAD + 36;
-    const bottom = PAGE_H - PAGE_PAD;
-    const newPage = () => {
-      doc.addPage(dims === PAPER_DIMS['letter-portrait'] ? 'letter' : undefined as any);
-      tagSection?.('Parts');
-      y = PAGE_PAD + 16;
-    };
-
-    for (const cab of cabinets) {
-      // Dedup panels by id so multiples of the same id collapse into one card.
-      const byId = new Map<string, { panel: CabinetPanel; qty: number }>();
-      for (const p of cab.panels!) {
-        const ex = byId.get(p.id);
-        if (ex) ex.qty += 1;
-        else byId.set(p.id, { panel: p, qty: 1 });
-      }
-      const panels = Array.from(byId.values()).sort((a, b) => a.panel.id.localeCompare(b.panel.id));
-
-      // Section header — fits on a fresh page if we're tight on space.
-      if (y + sectionHeaderH + cardH > bottom) newPage();
-      doc.setFont('helvetica', 'bold');
-      doc.setFontSize(12);
-      doc.setTextColor(20);
-      doc.text(cab.name, PAGE_PAD, y);
-      doc.setFont('helvetica', 'normal');
-      doc.setFontSize(9.5);
-      doc.setTextColor(140);
-      doc.text(
-        `${panels.length} ${panels.length === 1 ? 'panel' : 'panels'}`,
-        PAGE_W - PAGE_PAD, y, { align: 'right' },
-      );
-      doc.setTextColor(0);
-      // Hairline under the section title for separation.
-      doc.setDrawColor(225);
-      doc.setLineWidth(0.4);
-      doc.line(PAGE_PAD, y + 6, PAGE_W - PAGE_PAD, y + 6);
-      y += sectionHeaderH;
-
-      // Cards for this cabinet.
-      let col = 0;
-      for (const { panel, qty } of panels) {
-        if (y + cardH > bottom) newPage();
-        const x = PAGE_PAD + col * (cardW + gutter);
-        // Synthesize a PartLabel-shaped record using the panel ID as letter.
-        const label: PartLabel = {
-          partId: panel.id,
-          letter: panel.id,
-          partName: panel.name,
-          thickness: panel.thickness,
-          length: panel.length,
-          width: panel.width,
-          totalQty: qty,
-          color: panel.color,
-        };
-        drawPartCard(doc, label, x, y, cardW, cardH, opt);
-        // Panel ids embed their sheet number ("3a" → sheet 3) — make the
-        // whole card a link to that sheet's layout page.
-        const sheetNo = parseInt(panel.id, 10);
-        if (nav && curPage && Number.isFinite(sheetNo)) {
-          nav.links.push({ page: curPage(), x, y, w: cardW, h: cardH, target: `Sheet ${sheetNo}` });
-        }
-        col++;
-        if (col >= cols) { col = 0; y += cardH + gutter; }
-      }
-      // Advance past the last partial row before the next cabinet.
-      if (col !== 0) { y += cardH + gutter; }
-      y += 6; // breathing room between cabinets
-    }
-    return;
-  }
-
-  // ----------- Flat fallback (no cabinet data) --------------------------
-  const items = Array.from(labels.values());
-  const top = PAGE_PAD + 28;
-  const rowsPerPage = Math.max(1, Math.floor((PAGE_H - top - PAGE_PAD) / (cardH + gutter)));
-  const perPage = cols * rowsPerPage;
-  for (let i = 0; i < items.length; i++) {
-    const onPage = i % perPage;
-    if (i > 0 && onPage === 0) {
-      doc.addPage(dims === PAPER_DIMS['letter-portrait'] ? 'letter' : undefined as any);
-      tagSection?.('Parts');
-    }
-    const col = onPage % cols;
-    const row = Math.floor(onPage / cols);
-    const x = PAGE_PAD + col * (cardW + gutter);
-    const y = top + row * (cardH + gutter);
-    drawPartCard(doc, items[i], x, y, cardW, cardH, opt);
-  }
-}
-
-function drawPartCard(
-  doc: jsPDF,
-  p: PartLabel,
-  x: number,
-  y: number,
-  w: number,
-  h: number,
-  opt: PdfOptions,
-) {
-  // Letter — big bold in top-left corner
-  doc.setFont('helvetica', 'bold');
-  doc.setFontSize(32);
-  doc.setTextColor(40);
-  doc.text(p.letter, x + 4, y + 30);
-
-  // Quantity — only when > 1; subtle gray.
-  if (p.totalQty > 1) {
-    doc.setFont('helvetica', 'normal');
-    doc.setFontSize(10);
-    doc.setTextColor(140);
-    doc.text(`× ${p.totalQty}`, x + w - 4, y + 14, { align: 'right' });
-  }
-
-  // Silhouette — uses the panel's color at low opacity so the card stays
-  // light. Border in a darker shade of the same color for context.
-  const silX = x + 54;
-  const silY = y + 8;
-  const silMaxW = w - 54 - 8;
-  const silMaxH = h - 52;
-  const scale = Math.min(silMaxW / p.length, silMaxH / p.width);
-  const drawW = p.length * scale;
-  const drawH = p.width * scale;
-  const [pr, pg, pb] = hexToRgb(p.color);
-  const GS = (doc as any).GState;
-  if (GS) (doc as any).setGState(new GS({ opacity: 0.40 }));
-  doc.setFillColor(pr, pg, pb);
-  doc.rect(silX, silY, drawW, drawH, 'F');
-  if (GS) (doc as any).setGState(new GS({ opacity: 1 }));
-  doc.setDrawColor(Math.floor(pr * 0.55), Math.floor(pg * 0.55), Math.floor(pb * 0.55));
-  doc.setLineWidth(0.5);
-  doc.rect(silX, silY, drawW, drawH, 'S');
-
-  // Name + dims at the bottom — no separator border, just text on the card.
-  doc.setFont('helvetica', 'normal');
-  doc.setFontSize(9.5);
-  doc.setTextColor(110);
-  const name = p.partName.length > 36 ? p.partName.slice(0, 33) + '…' : p.partName;
-  doc.text(name, x + 4, y + h - 18);
-  doc.setFont('helvetica', 'bold');
-  doc.setFontSize(10.5);
-  doc.setTextColor(25);
-  doc.text(
-    `${fmtDim(p.length, opt.units)} × ${fmtDim(p.width, opt.units)} × ${fmtDim(p.thickness, opt.units)}`,
-    x + 4, y + h - 4,
-  );
-}
-
 /**
  * Draw one cut-step card: caption above, sheet diagram below with
  * placed parts overlaid in their colors, the active parent piece
@@ -2358,16 +2372,41 @@ function drawCutCard(
   let label: string;
   let edgeRef: string;
   if (cur.isTrim) {
-    label = 'Trim margin';
+    label = 'Trim';
     edgeRef = '(reference edge)';
   } else {
     label = cur.axis === 'rip' ? 'Rip' : 'Crosscut';
-    edgeRef = cur.axis === 'rip' ? 'from L edge' : 'from B edge';
+    // Distances run from the parent's datum corner (top-left): vertical
+    // lines measure from the LEFT edge, horizontal lines from the TOP.
+    const vertical = (sc.sheetL >= sc.sheetW) ? cur.axis === 'rip' : cur.axis === 'cross';
+    edgeRef = vertical ? 'from L edge' : 'from T edge';
   }
-  doc.text(`${label}  ${fmtDim(cur.distance, opt.units)}  ${edgeRef}`, x, y + 20);
+  const settingNote = cur.sameSetting ? '  ·  same setting' : '';
+  doc.text(`${label}  ${fmtDim(quotedDistance(cur, sc, opt), opt.units)}  ${edgeRef}${settingNote}`, x, y + 20);
   doc.setTextColor(0);
 
   drawCutDiagram(doc, sc, parts, cutIdx, x, y + 24, cardW, diagH, opt);
+}
+
+/**
+ * The dimension quoted to the user for a cut step.
+ *   - Trim cuts: always the margin width (a far-long-edge trim's raw
+ *     distance is nearly the whole span — the meaningful number is the
+ *     sliver coming off).
+ *   - Layout cuts in parallel-guide mode: the KEEPER dimension = what the
+ *     flip stops are set to (raw distance minus the kerf allowance).
+ *   - Otherwise: the raw kerf-centre distance.
+ */
+function quotedDistance(
+  cur: { isTrim?: boolean; distance: number; axis: 'rip' | 'cross'; parentW: number; parentH: number },
+  sc: { sheetW: number; sheetL: number },
+  opt: PdfOptions,
+): number {
+  const lengthIsY = sc.sheetL >= sc.sheetW;
+  const vertical = lengthIsY ? cur.axis === 'rip' : cur.axis === 'cross';
+  const span = vertical ? cur.parentW : cur.parentH;
+  if (cur.isTrim) return Math.min(cur.distance, span - cur.distance);
+  return opt.parallelGuide ? Math.max(0, cur.distance - opt.kerf) : cur.distance;
 }
 
 /**
@@ -2455,10 +2494,12 @@ function drawCutDiagram(
     }
   }
 
-  // Prior cuts as thin white lines.
+  // Prior cuts as thin white lines (trim/reference cuts drawn separately in
+  // color after the fade overlay, so the datum edges stay visible).
   doc.setLineWidth(0.4);
   doc.setDrawColor(255, 255, 255);
   for (let i = 0; i < cutIdx; i++) {
+    if (sc.steps[i].isTrim) continue;
     drawCutLineInParent(doc, sc.steps[i], sc.sheetW, sc.sheetL, orient, ox, oy, scale);
   }
 
@@ -2482,6 +2523,15 @@ function drawCutDiagram(
   if (pX + pW < ox + dW - 0.5) doc.rect(pX + pW, pY, (ox + dW) - (pX + pW), pH, 'F');
   if (GS) (doc as any).setGState(new GS({ opacity: 1 }));
 
+  // Reference edges (made by the trim cuts) in BLUE, on top of the fade so
+  // the datum — top-left corner — is always identifiable at the saw.
+  doc.setLineWidth(0.7);
+  doc.setDrawColor(43, 108, 176);
+  for (let i = 0; i < cutIdx; i++) {
+    if (!sc.steps[i].isTrim) continue;
+    drawCutLineInParent(doc, sc.steps[i], sc.sheetW, sc.sheetL, orient, ox, oy, scale);
+  }
+
   // Highlight the active parent piece with a thin red border.
   doc.setDrawColor(224, 62, 62);
   doc.setLineWidth(0.7);
@@ -2491,6 +2541,15 @@ function drawCutDiagram(
   doc.setLineWidth(2.0);
   doc.setDrawColor(224, 62, 62);
   drawCutLineInParent(doc, cur, sc.sheetW, sc.sheetL, orient, ox, oy, scale, true);
+
+  // The edge the distance is MEASURED FROM, in green — mirrors the caption
+  // ("from the LEFT/TOP edge"): left edge for vertical cuts, top for
+  // horizontal. This is where the parallel-guide stops register.
+  const measVertical = (sc.sheetL >= sc.sheetW) ? cur.axis === 'rip' : cur.axis === 'cross';
+  doc.setDrawColor(47, 133, 90);
+  doc.setLineWidth(1.6);
+  if (measVertical) doc.line(pX, pY, pX, pY + pH);
+  else doc.line(pX, pY, pX + pW, pY);
 }
 
 /**

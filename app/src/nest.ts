@@ -727,7 +727,6 @@ export function runCncNest(parts: NestPart[], config: NestConfig): NestResult {
     const { items, meta } = buildCncItems(buckets.get(t)!, config.deepSearch ?? false);
     const res = packCnc(items, usableL, usableW, kerf, {
       restarts: config.restarts,
-      saveLast: config.cutStrategy === 'cnc-save-last',
       seed: config.seed,
       extraEffort: config.deepSearch,
     });
@@ -790,7 +789,6 @@ export async function runCncNestAnimated(
     // search over placement orders.
     const cncOpts = {
       restarts: config.restarts,
-      saveLast: config.cutStrategy === 'cnc-save-last',
       seed: config.seed,
       extraEffort: config.deepSearch,
     };

@@ -183,6 +183,7 @@ const splitNote = $('splitNote');
 const downloadDxfBtn = $<HTMLButtonElement>('downloadDxfBtn');
 const downloadCutDxfBtn = $<HTMLButtonElement>('downloadCutDxfBtn');
 const downloadPdfBtn = $<HTMLButtonElement>('downloadPdfBtn');
+const downloadPhonePdfBtn = $<HTMLButtonElement>('downloadPhonePdfBtn');
 
 const shopList = $('shoppingList');
 const shopCount = $('shopCount');
@@ -192,6 +193,7 @@ const shopTotals = $('shopTotals');
 const jobNameInput = $<HTMLInputElement>('jobName');
 const currencySelect = $<HTMLSelectElement>('currency');
 const pdfPaperSelect = $<HTMLSelectElement>('pdfPaper');
+const parallelGuideCheck = $<HTMLInputElement>('parallelGuide');
 
 // --------------------------------------------------------------------------
 // Viewer
@@ -978,6 +980,7 @@ async function runEstimate(opts: { seed?: number; deepSearch?: boolean } = {}) {
   downloadDxfBtn.disabled = true;
   downloadCutDxfBtn.disabled = true;
   downloadPdfBtn.disabled = true;
+  downloadPhonePdfBtn.disabled = true;
   replayBtn.disabled = true;
 
   // Capture trial frames for the replay button. We do NOT paint frames live
@@ -1286,6 +1289,7 @@ function renderResults() {
   downloadDxfBtn.disabled = false;
   downloadCutDxfBtn.disabled = false;
   downloadPdfBtn.disabled = false;
+  downloadPhonePdfBtn.disabled = false;
   const totalSheets = result.groups.reduce((a, g) => a + g.sheets.length, 0);
 
   // Stacked sheet list — every sheet rendered one below the other.
@@ -1818,17 +1822,20 @@ downloadCutDxfBtn.addEventListener('click', () => {
   downloadDxf(`sheet_${sel.groupIdx + 1}_${sel.sheetIdx + 1}_cut.dxf`, dxf);
 });
 
-downloadPdfBtn.addEventListener('click', async () => {
+// Shared by the PDF button (paper format from the settings dropdown) and the
+// Phone PDF button (forces the one-cut-per-page mobile format).
+async function exportPdf(btn: HTMLButtonElement, paper: string) {
   if (!state.lastNest || !state.lastSheet) return;
   // Mark the button busy + show a progress indicator so the user knows the
   // (multi-second) snapshot capture + PDF assembly is running. We yield to
   // the browser between phases via requestAnimationFrame + await so the
   // progress bar actually updates between heavy synchronous work.
-  const originalLabel = downloadPdfBtn.innerHTML;
+  const originalLabel = btn.innerHTML;
   downloadPdfBtn.disabled = true;
-  downloadPdfBtn.classList.add('busy');
+  downloadPhonePdfBtn.disabled = true;
+  btn.classList.add('busy');
   const setProgress = (label: string, pct: number) => {
-    downloadPdfBtn.innerHTML = `<span class="progress-bar"><span class="progress-fill" style="width:${pct.toFixed(0)}%"></span></span><span class="progress-label">${label}</span>`;
+    btn.innerHTML = `<span class="progress-bar"><span class="progress-fill" style="width:${pct.toFixed(0)}%"></span></span><span class="progress-label">${label}</span>`;
   };
   const yieldFrame = () => new Promise<void>((r) => requestAnimationFrame(() => r()));
   setProgress('Preparing…', 5);
@@ -2011,7 +2018,8 @@ downloadPdfBtn.addEventListener('click', async () => {
     units: state.units,
     inventoryCheck: invChecks,
     jobName: state.jobName || 'Plywood cut estimate',
-    paper: pdfPaperSelect.value as any,
+    paper: paper as any,
+    parallelGuide: parallelGuideCheck.checked,
     currency: state.currency,
     jobCost: totalCost(state.shopping),
     edgeBandingMm: edgeMm,
@@ -2025,15 +2033,19 @@ downloadPdfBtn.addEventListener('click', async () => {
   await yieldFrame();
   const tSave0 = performance.now();
   const safe = (state.jobName || 'plywood_cut_estimate').replace(/[^a-z0-9_-]+/gi, '_').toLowerCase();
-  downloadPdf(`${safe}.pdf`, doc);
+  downloadPdf(`${safe}${paper === 'mobile' ? '_phone' : ''}.pdf`, doc);
   console.log(
     `pdf: snapshots ${(tBuild0 - tCapture0).toFixed(0)}ms · build ${(tSave0 - tBuild0).toFixed(0)}ms · save ${(performance.now() - tSave0).toFixed(0)}ms`,
   );
-  // Restore button
-  downloadPdfBtn.innerHTML = originalLabel;
-  downloadPdfBtn.classList.remove('busy');
+  // Restore buttons
+  btn.innerHTML = originalLabel;
+  btn.classList.remove('busy');
   downloadPdfBtn.disabled = false;
-});
+  downloadPhonePdfBtn.disabled = false;
+}
+
+downloadPdfBtn.addEventListener('click', () => exportPdf(downloadPdfBtn, pdfPaperSelect.value));
+downloadPhonePdfBtn.addEventListener('click', () => exportPdf(downloadPhonePdfBtn, 'mobile'));
 
 // --------------------------------------------------------------------------
 // Helpers

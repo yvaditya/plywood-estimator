@@ -36,20 +36,16 @@ export type Heuristic = 'BSSF' | 'BLSF' | 'BAF' | 'BL';
  *                  (handled by cncNest.ts, NOT this rectangle packer). Listed
  *                  here so the strategy type is shared; nest.ts dispatches it
  *                  before the rectangle path runs.
- * 'cnc-save-last'= same any-angle CNC nest, but the optimiser concentrates the
- *                  leftover parts so the least-filled (last) sheet is as empty
- *                  as possible and its parts cluster in one corner — leaving a
- *                  clean offcut to save for another job.
  * 'guillotine-exact' = same min-cuts objective as 'guillotine', but the trial
  *                  pool additionally runs a beam search over guillotine cut
  *                  trees (part choice × orientation × split axis) — slower,
  *                  often finds layouts a greedy shelf/SAS pass can't.
  */
-export type CutStrategy = 'free' | 'guillotine' | 'guillotine-exact' | 'save-last' | 'cnc' | 'cnc-save-last';
+export type CutStrategy = 'free' | 'guillotine' | 'guillotine-exact' | 'save-last' | 'cnc';
 
-/** True for any CNC (true-shape) strategy — dispatched to cncNest.ts. */
+/** True for the CNC (true-shape) strategy — dispatched to cncNest.ts. */
 export function isCncStrategy(s: CutStrategy): boolean {
-  return s === 'cnc' || s === 'cnc-save-last';
+  return s === 'cnc';
 }
 
 /** True for any min-cuts (panel-saw) strategy — both share the same
@@ -604,24 +600,70 @@ function guillotineSplitAxis(f: FreeRect, w: number, h: number, childDepth: numb
  *  the user run the saw over such pieces when an alternative exists. */
 const AWKWARD_MM = 150;
 
+/** An empty strip at least this wide (both dimensions) is a REUSABLE offcut —
+ *  the sequence frees it first, whole, so it can be racked for a later job. */
+const REUSABLE_MM = 200;
+
+/**
+ * Put thin strips toward the sheet TOP (bin y=0 renders as the display top):
+ * if the thin parts sit below the wide ones, mirror the whole layout
+ * vertically. A guillotine layout stays guillotine under a mirror, and the
+ * cut sequence then shaves the fiddly strips off the top edge while the
+ * stock underneath is still big enough to carry the rail.
+ * Mutates `placements` (part frame) and `inflated` (kerf frame) in step.
+ */
+function thinStripsTop(placements: PackPlacement[], inflated: Rect[], binH: number): void {
+  if (placements.length === 0) return;
+  let thinA = 0, thinY = 0, wideA = 0, wideY = 0;
+  for (const p of placements) {
+    const a = p.w * p.h, cy = p.y + p.h / 2;
+    if (Math.min(p.w, p.h) < AWKWARD_MM) { thinA += a; thinY += a * cy; }
+    else { wideA += a; wideY += a * cy; }
+  }
+  if (thinA > 0 && wideA > 0 && thinY / thinA > wideY / wideA) {
+    for (const p of placements) p.y = binH - p.y - p.h;
+    for (const r of inflated) r.y = binH - r.y - r.h;
+  }
+  // Anchor the layout flush to the reference corner: measurements run from
+  // the two trimmed reference edges, so no waste may sit between them and
+  // the first parts (a uniform shift keeps any guillotine tree valid).
+  let minX = Infinity, minY = Infinity;
+  for (const r of inflated) { minX = Math.min(minX, r.x); minY = Math.min(minY, r.y); }
+  if (minX > 0.001 || minY > 0.001) {
+    for (const p of placements) { p.x -= minX; p.y -= minY; }
+    for (const r of inflated) { r.x -= minX; r.y -= minY; }
+  }
+}
+
 function deriveGuillotineCuts(rects: Rect[], binW: number, binH: number): Cut[] {
-  const cuts: Cut[] = [];
   const EPS = 0.5; // mm — tolerant of STEP-tessellation float noise on edges
   // A clean tree needs < 2·N cuts; cap well above that so a pathological
   // input can never spin (every cut is expected to make progress anyway).
   const maxCuts = rects.length * 6 + 16;
+  let nodeCount = 0;
 
   interface Line {
     axis: 'H' | 'V';
     coord: number;     // absolute cut coordinate (X for V, Y for H)
     separates: boolean; // whole parts on BOTH sides (vs. trimming waste)
     thinBad: boolean;  // creates a piece thinner than AWKWARD_MM that still needs cuts
+    offcut: number;    // area of a clean REUSABLE strip this line frees (0 = none)
+    thinShave: boolean; // frees a FINISHED thin part in one pass off big stock
     balance: number;   // |partsOnOneSide − partsOnOther|, lower = more even
     pieceMin: number;  // the split's smaller span — bigger = no sliver piece
     dist: number;      // distance from the WORK edge (TOP for H, left for V)
   }
 
   const betterLine = (a: Line, b: Line): boolean => {
+    // Free a big unused strip FIRST — it goes to the offcut rack clean and
+    // whole instead of staying attached (or getting crossed) while the parts
+    // are broken down. Bigger saved strip wins.
+    if ((a.offcut > 0) !== (b.offcut > 0)) return a.offcut > 0;
+    if (a.offcut > 0 && Math.abs(a.offcut - b.offcut) > EPS) return a.offcut > b.offcut;
+    // Then shave thin finished strips off while the stock is still big — the
+    // rail rests on the wide remainder and the strip falls away done. Waiting
+    // only shrinks the piece the track has to sit on.
+    if (a.thinShave !== b.thinShave) return a.thinShave;
     if (a.separates !== b.separates) return a.separates;               // real splits before trims
     if (a.thinBad !== b.thinBad) return !a.thinBad;                    // don't strand cuts on skinny stock
     if (Math.abs(a.balance - b.balance) > EPS) return a.balance < b.balance; // even split
@@ -670,10 +712,29 @@ function deriveGuillotineCuts(rects: Rect[], binW: number, binH: number): Cut[] 
         (spanHi < AWKWARD_MM && (axis === 'V'
           ? needsCuts(hiItems, coord, ry, spanHi, rh)
           : needsCuts(hiItems, rx, coord, rw, spanHi)));
+      // A side with NO parts and a decent width is a reusable offcut — worth
+      // freeing before anything else so it can be saved for a later job.
+      // Strips narrower than REUSABLE_MM are just waste; don't chase them.
+      const crossSpan = axis === 'V' ? rh : rw;
+      let offcut = 0;
+      if (!thinBad) {
+        if (loItems.length === 0 && Math.min(spanLo, crossSpan) >= REUSABLE_MM) offcut = spanLo * crossSpan;
+        else if (hiItems.length === 0 && Math.min(spanHi, crossSpan) >= REUSABLE_MM) offcut = spanHi * crossSpan;
+      }
+      // A thin side holding a FINISHED part (no further cuts needed on it) is
+      // a shave: one pass frees the strip while the rail rides the big side.
+      const shaveLo = spanLo < AWKWARD_MM && loItems.length > 0 && !(axis === 'V'
+        ? needsCuts(loItems, rx, ry, spanLo, rh)
+        : needsCuts(loItems, rx, ry, rw, spanLo));
+      const shaveHi = spanHi < AWKWARD_MM && hiItems.length > 0 && !(axis === 'V'
+        ? needsCuts(hiItems, coord, ry, spanHi, rh)
+        : needsCuts(hiItems, rx, coord, rw, spanHi));
       const line: Line = {
         axis, coord,
         separates: loItems.length > 0 && hiItems.length > 0,
         thinBad,
+        offcut,
+        thinShave: !thinBad && (shaveLo || shaveHi),
         balance: Math.abs(loItems.length - hiItems.length),
         // Both sub-pieces keep the region's other span; the cut only narrows
         // one axis — its smaller side is the sliver risk.
@@ -689,46 +750,90 @@ function deriveGuillotineCuts(rects: Rect[], binW: number, binH: number): Cut[] 
     return best;
   };
 
-  const decompose = (rx: number, ry: number, rw: number, rh: number, items: Rect[], depth: number) => {
-    if (items.length === 0 || cuts.length >= maxCuts) return;
+  // The tree is built with explicit children so the emission pass below can
+  // reorder cuts for a parallel-guide workflow without losing the hard
+  // constraint that a cut's parent piece must already exist.
+  interface CutNode { cut: Cut; children: CutNode[] }
+
+  const decompose = (rx: number, ry: number, rw: number, rh: number, items: Rect[], depth: number): CutNode | null => {
+    if (items.length === 0 || nodeCount >= maxCuts) return null;
     const line = pickLine(rx, ry, rw, rh, items);
     // null → a single part fills this region (done), or ≥2 parts interlock
     // with no clean line (irreducible non-guillotine block) — leave intact.
-    if (!line) return;
-    // Recurse into the BIGGER piece first — the pro workflow: break the
-    // sheet into manageable sub-panels and process those while they're
-    // large; fiddly narrow strips wait until the end of the sequence.
+    if (!line) return null;
+    nodeCount++;
+    let node: CutNode;
+    let halves: { x: number; y: number; w: number; h: number; items: Rect[] }[];
     if (line.axis === 'V') {
       const xc = line.coord;
-      cuts.push({ parentX: rx, parentY: ry, parentW: rw, parentH: rh, axis: 'V', distance: xc - rx, depth });
+      node = { cut: { parentX: rx, parentY: ry, parentW: rw, parentH: rh, axis: 'V', distance: xc - rx, depth }, children: [] };
       // No straddlers (the line is clean), so an edge test partitions exactly.
       const left: Rect[] = [], right: Rect[] = [];
       for (const it of items) (it.x + it.w <= xc + EPS ? left : right).push(it);
-      const halves = [
+      halves = [
         { x: rx, y: ry, w: xc - rx, h: rh, items: left },
         { x: xc, y: ry, w: rx + rw - xc, h: rh, items: right },
-      ].sort((a, b) => b.w * b.h - a.w * a.h);
-      for (const s of halves) decompose(s.x, s.y, s.w, s.h, s.items, depth + 1);
+      ];
     } else {
       const yc = line.coord;
-      cuts.push({ parentX: rx, parentY: ry, parentW: rw, parentH: rh, axis: 'H', distance: yc - ry, depth });
+      node = { cut: { parentX: rx, parentY: ry, parentW: rw, parentH: rh, axis: 'H', distance: yc - ry, depth }, children: [] };
       const bottom: Rect[] = [], top: Rect[] = [];
       for (const it of items) (it.y + it.h <= yc + EPS ? bottom : top).push(it);
-      const halves = [
+      halves = [
         { x: rx, y: yc, w: rw, h: ry + rh - yc, items: top },
         { x: rx, y: ry, w: rw, h: yc - ry, items: bottom },
-      ].sort((a, b) => b.w * b.h - a.w * a.h);
-      for (const s of halves) decompose(s.x, s.y, s.w, s.h, s.items, depth + 1);
+      ];
     }
+    // Bigger piece first — keeps tie-breaks in the scheduler leaning toward
+    // breaking down large stock before fiddling with narrow strips.
+    halves.sort((a, b) => b.w * b.h - a.w * a.h);
+    for (const s of halves) {
+      const child = decompose(s.x, s.y, s.w, s.h, s.items, depth + 1);
+      if (child) node.children.push(child);
+    }
+    return node;
   };
 
-  decompose(0, 0, binW, binH, rects.slice(), 0);
+  const root = decompose(0, 0, binW, binH, rects.slice(), 0);
 
-  // Cuts stay in DEPTH-FIRST emission order — the physical work sequence:
-  // each cut acts on a piece an earlier cut just produced, the sheet is
-  // consumed top-to-bottom, and a freed strip is finished at the bench
-  // before the next rip. (Previously depth-sorted breadth-first, which had
-  // the operator hopping between loose strips.)
+  // Emission order = PARALLEL-GUIDE work order. With flip-stop parallel
+  // guides the expensive operations are changing the stop offset and
+  // rotating the work 180° between rip and crosscut; repeating a cut at the
+  // current setting is just slide-against-the-stops-and-cut. So among the
+  // cuts whose parent piece already exists we greedily prefer, in order:
+  //   1. same axis AND same distance as the previous cut — the guide is
+  //      already set, the cut is nearly free;
+  //   2. same axis — no 180° rotation, only the stops move;
+  //   3. a child of the previous cut — keep working the piece in hand;
+  //   4. the larger parent piece — big breakdown cuts early, while the
+  //      stock is manageable; fiddly strips wait until the end.
+  // Readiness (parent exists) is the hard constraint the PDF diagrams rely
+  // on: every cut acts on a piece an earlier cut produced.
+  const cuts: Cut[] = [];
+  const ready: CutNode[] = root ? [root] : [];
+  let prev: Cut | null = null;
+  let prevChildren: CutNode[] = [];
+  while (ready.length > 0) {
+    let best = 0;
+    for (let i = 1; i < ready.length; i++) {
+      const a = ready[i].cut, b = ready[best].cut;
+      if (prev) {
+        const setA = a.axis === prev.axis && Math.abs(a.distance - prev.distance) < EPS;
+        const setB = b.axis === prev.axis && Math.abs(b.distance - prev.distance) < EPS;
+        if (setA !== setB) { if (setA) best = i; continue; }
+        const axA = a.axis === prev.axis, axB = b.axis === prev.axis;
+        if (axA !== axB) { if (axA) best = i; continue; }
+        const chA = prevChildren.includes(ready[i]), chB = prevChildren.includes(ready[best]);
+        if (chA !== chB) { if (chA) best = i; continue; }
+      }
+      if (a.parentW * a.parentH > b.parentW * b.parentH + EPS) best = i;
+    }
+    const node = ready.splice(best, 1)[0];
+    cuts.push(node.cut);
+    prev = node.cut;
+    prevChildren = node.children;
+    ready.push(...node.children);
+  }
   return cuts;
 }
 
@@ -1001,6 +1106,7 @@ export function packOne(job: PackJob, heur: Heuristic, order: PackInput[], binKi
       // order: the decomposer prefers full-span separating lines, so edges
       // that align across strips become one through-cut and adjacent waste
       // merges into one fragment (fewer cuts, the human sequence).
+      thinStripsTop(cur.placements, placedInflated, job.sheetH);
       bin.cuts = deriveGuillotineCuts(placedInflated, job.sheetW, job.sheetH);
       // Snapshot the largest remaining free rectangle (by area).
       let best: { w: number; h: number; a: number } | null = null;
@@ -1238,6 +1344,7 @@ function packBeam(job: PackJob, order: PackInput[], beamWidth: number): MultiShe
       rotated: p.rotated,
     }));
     const usedArea = placements.reduce((a, p) => a + p.w * p.h, 0);
+    thinStripsTop(placements, best.placedInflated, job.sheetH);
     const cuts = deriveGuillotineCuts(best.placedInflated, job.sheetW, job.sheetH);
     let bigFree: { w: number; h: number; a: number } | null = null;
     for (const f of [...best.free, ...best.waste]) {
@@ -1311,6 +1418,9 @@ function repackLastSheetCorner(
   }
   // Recover a guillotine cut tree from the corner-clustered layout so its
   // cut sequence is edge-to-edge per sub-piece (not full-sheet lines).
+  // (A vertical mirror keeps the cluster in a corner, so the remnant stays
+  // one clean rectangle — save-last's promise is unaffected.)
+  thinStripsTop(placements, placedInflated, job.sheetH);
   const cuts = deriveGuillotineCuts(placedInflated, job.sheetW, job.sheetH);
   return {
     placements,
@@ -1355,6 +1465,7 @@ function consolidateSheets(result: MultiSheetResult, job: PackJob): MultiSheetRe
 
   const finalizeSheet = (placements: PackPlacement[], bin: MaxRectsBin): PackedSheet => {
     const placedInflated = placements.map(inflate);
+    thinStripsTop(placements, placedInflated, job.sheetH);
     const cuts = deriveGuillotineCuts(placedInflated, job.sheetW, job.sheetH);
     let bestFree: { w: number; h: number; a: number } | null = null;
     for (const f of bin.free) {

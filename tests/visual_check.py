@@ -16,6 +16,7 @@ Dependencies (host):
 Usage:
   python tests/visual_check.py                 # all samples
   python tests/visual_check.py "Dishwasher"    # filter by substring
+  python tests/visual_check.py "workbench" --snap   # thickness override: snap to standard
 """
 from __future__ import annotations
 
@@ -96,7 +97,7 @@ def kill_dev_server(proc: subprocess.Popen) -> None:
 # ----------------------------------------------------------------------------
 # Single-sample run
 # ----------------------------------------------------------------------------
-def run_sample(page, sample_path: Path, port: int, out_dir: Path) -> Path:
+def run_sample(page, sample_path: Path, port: int, out_dir: Path, snap: bool = False) -> Path:
     """Drive one sample through the app, return the saved PDF path."""
     name = sample_path.stem
     sample_out = out_dir / name
@@ -120,6 +121,10 @@ def run_sample(page, sample_path: Path, port: int, out_dir: Path) -> Path:
 
     page.click("#selectAllBtn")
     page.wait_for_timeout(200)
+
+    if snap:
+        page.select_option("#thicknessOverride", "snap")
+        page.wait_for_timeout(200)
 
     page.click("#nestBtn")
     # Estimate complete → PDF button enabled
@@ -158,6 +163,8 @@ def pdf_to_pngs(pdf_path: Path, dpi: int = 110) -> int:
 # ----------------------------------------------------------------------------
 def main(argv: Optional[List[str]] = None) -> int:
     argv = argv or sys.argv[1:]
+    snap = "--snap" in argv
+    argv = [a for a in argv if a != "--snap"]
     filter_substr = argv[0].lower() if argv else ""
 
     samples = sorted([p for p in SAMPLES_DIR.glob("*.stp") if filter_substr in p.stem.lower()])
@@ -177,7 +184,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                 console_lines: List[str] = []
                 page.on("console", lambda m: console_lines.append(f"[{m.type}] {m.text}"))
                 try:
-                    pdf = run_sample(page, sample, port, OUT_DIR)
+                    pdf = run_sample(page, sample, port, OUT_DIR, snap=snap)
                     pages = pdf_to_pngs(pdf)
                     (pdf.parent / "console.log").write_text(
                         "\n".join(console_lines[-300:]), encoding="utf-8"
