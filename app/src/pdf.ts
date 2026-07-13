@@ -63,48 +63,59 @@ export interface PdfOptions {
   splitJoins?: SplitJoinGroup[];
   /** Quick-CAE structural screening rows for the Structure section. One row
    *  per panel size; sag is the formula-screening estimate under the default
-   *  uniform load. Only present when the user actually ran CAE this session —
-   *  otherwise the whole Structure/Analysis feature is absent from the PDF. */
+   *  uniform load. Only present when the user actually ran an ASSEMBLY solve
+   *  this session — otherwise the whole Structure/Analysis feature is absent
+   *  from the PDF. */
   structure?: StructureRow[];
-  /** One entry per SOLVED panel — a full CAE analysis page (heatmap image +
-   *  inputs/results block). Rendered right after the Structure table. */
-  analyses?: CaePanelAnalysis[];
+  /** The whole-cabinet Assembly analysis page (heatmap + joints + loads +
+   *  result). Present only when an assembly was solved this session. */
+  assembly?: AssemblyAnalysisPage;
 }
 
-/** A load line for the Analysis page inputs block. */
-export interface CaeAnalysisLoad {
-  /** Human magnitude, e.g. "25 kg". */
+/** A load line for the Assembly analysis page. */
+export interface AssemblyAnalysisLoad {
+  /** Human magnitude, e.g. "50 kg". */
   magDisplay: string;
   shape: 'square' | 'round';
   /** Footprint size in mm. */
   sizeMm: number;
   /** True → downward force (↓); false → upward reaction (↑). */
   down: boolean;
-  /** Placement in outline mm. */
-  x: number;
-  y: number;
+  /** Which panel it sits on, e.g. "1a". */
+  panelLabel: string;
 }
 
-/** Everything needed to render one panel's Analysis page. */
-export interface CaePanelAnalysis {
-  /** Panel code(s), e.g. "1a, 3b" (empty for standalone bodies not nested). */
-  code: string;
-  /** Panel display name. */
-  name: string;
-  /** Heatmap snapshot (deflection fringe over the body, white bg). */
+/** A joint row for the Assembly analysis page. */
+export interface AssemblyAnalysisJoint {
+  /** Panel pair, e.g. "1a ⟂ 1e". */
+  pair: string;
+  /** Contact length (mm). */
+  length: number;
+  /** rigid / semi-rigid / hinged. */
+  stiffness: string;
+}
+
+/** Everything needed to render the whole-assembly Analysis page. */
+export interface AssemblyAnalysisPage {
+  /** Cabinet (STEP file) tag. */
+  cabinet: string;
+  /** Whole-cabinet deflection heatmap snapshot (white bg). */
   image: SnapshotImage;
-  materialName: string;
-  loads: CaeAnalysisLoad[];
-  /** Uniform load in kg (0 = none). */
-  uniformKg: number;
-  supports: { top: string; bottom: string; left: string; right: string };
-  pinCount: number;
-  /** Max sag (mm) and its location in outline mm. */
+  panelCount: number;
+  joints: AssemblyAnalysisJoint[];
+  loads: AssemblyAnalysisLoad[];
+  /** Floor-grounded node count. */
+  groundedNodes: number;
+  /** Max deflection (mm) + which panel + where. */
   maxSagMm: number;
+  maxPanelLabel: string;
   maxAt: [number, number];
-  /** Free span (mm) used for the verdict. */
+  /** Governing panel free span (mm), for the verdict. */
   spanMm: number;
   verdict: string;
+  /** Solver resolution log line. */
+  resolutionLog: string;
+  iterations: number;
 }
 
 export interface StructureRow {
@@ -331,20 +342,18 @@ export function buildPdf(result: NestResult, opt: PdfOptions): jsPDF {
     drawStructureTable(doc, opt.structure, opt, dims, () => addPage('Structure'));
   }
 
-  // 5c. ANALYSIS — one page per SOLVED panel (heatmap + inputs/results). Only
-  //     present when the user ran CAE this session (opt.analyses non-empty).
-  if (opt.analyses && opt.analyses.length > 0) {
-    opt.analyses.forEach((an, i) => {
-      const sectionName = `Analysis ${i + 1}`;
-      addPage(sectionName);
-      const codeLabel = an.code ? ` ${an.code}` : '';
-      nav.toc.push({
-        title: `Analysis${codeLabel} · ${an.name}`,
-        desc: 'Deflection heatmap with load and support inputs.',
-        target: sectionName,
-      });
-      drawAnalysisPage(doc, an, opt, dims);
+  // 5c. ASSEMBLY ANALYSIS — one page for the whole solved cabinet (deflection
+  //     heatmap across all panels + joints table + loads + result). Present
+  //     only when the user ran an assembly solve this session.
+  if (opt.assembly) {
+    const sectionName = 'Assembly analysis';
+    addPage(sectionName);
+    nav.toc.push({
+      title: 'Assembly analysis',
+      desc: 'Whole-cabinet deflection under the placed loads, joints and grounding.',
+      target: sectionName,
     });
+    drawAssemblyAnalysisPage(doc, opt.assembly, opt, dims);
   }
 
   // 6. CUT SHEETS grouped by thickness — divider page per group when the job
@@ -1943,12 +1952,12 @@ function drawStructureTable(
 }
 
 // ---------------------------------------------------------------------------
-// CAE Analysis page — heatmap image + a compact inputs/results block in the
-// same hairline table style as Structure. One page per solved panel.
+// Assembly analysis page — whole-cabinet deflection heatmap + joints table +
+// loads + result, in the same hairline table style as Structure.
 // ---------------------------------------------------------------------------
-function drawAnalysisPage(
+function drawAssemblyAnalysisPage(
   doc: jsPDF,
-  an: CaePanelAnalysis,
+  an: AssemblyAnalysisPage,
   opt: PdfOptions,
   dims: { w: number; h: number },
 ) {
@@ -1959,19 +1968,18 @@ function drawAnalysisPage(
   doc.setFont('helvetica', 'bold');
   doc.setFontSize(13);
   doc.setTextColor(20);
-  const title = an.code ? `Analysis — ${an.code} · ${an.name}` : `Analysis — ${an.name}`;
-  doc.text(clip(doc, title, PAGE_W - 2 * PAGE_PAD - 200), PAGE_PAD, PAGE_PAD + 10);
+  const title = an.cabinet ? `Assembly analysis — ${an.cabinet}` : 'Assembly analysis';
+  doc.text(clip(doc, title, PAGE_W - 2 * PAGE_PAD - 220), PAGE_PAD, PAGE_PAD + 10);
   doc.setFont('helvetica', 'normal');
   doc.setFontSize(9);
   doc.setTextColor(120);
-  doc.text('Predicted deflection under the placed loads and supports.', PAGE_W - PAGE_PAD, PAGE_PAD + 10, { align: 'right' });
+  doc.text('Coupled-shell deflection across the whole cabinet under the placed loads.', PAGE_W - PAGE_PAD, PAGE_PAD + 10, { align: 'right' });
   doc.setTextColor(0);
 
   const TOP = PAGE_PAD + 30;
   const BOTTOM = PAGE_H - PAGE_PAD;
-  // Left column: heatmap image. Right column: inputs/results table.
   const gutter = 20;
-  const imgColW = Math.min((PAGE_W - 2 * PAGE_PAD) * 0.56, 640);
+  const imgColW = Math.min((PAGE_W - 2 * PAGE_PAD) * 0.56, 700);
   const imgLeft = PAGE_PAD;
   const tableLeft = imgLeft + imgColW + gutter;
   const tableRight = PAGE_W - PAGE_PAD;
@@ -2013,19 +2021,42 @@ function drawAnalysisPage(
     doc.text(k, tableLeft, y);
     doc.setFont('helvetica', 'bold');
     if (color) doc.setTextColor(...color); else doc.setTextColor(30);
-    doc.text(clip(doc, v, tableRight - tableLeft - 130), tableRight, y, { align: 'right' });
+    doc.text(clip(doc, v, tableRight - tableLeft - 120), tableRight, y, { align: 'right' });
     doc.setTextColor(0);
     line();
     y += rowH;
   };
 
-  section('Inputs');
-  kv('Material', an.materialName);
-  const supLabel: Record<string, string> = { free: 'free', simple: 'supported', fixed: 'fixed' };
-  kv('Edges (T/B/L/R)',
-    `${supLabel[an.supports.top]} / ${supLabel[an.supports.bottom]} / ${supLabel[an.supports.left]} / ${supLabel[an.supports.right]}`);
-  kv('Pins', an.pinCount > 0 ? `${an.pinCount}` : 'none');
-  if (an.uniformKg > 0) kv('Uniform load', `${an.uniformKg.toFixed(0)} kg over face`);
+  section('Model');
+  kv('Panels', `${an.panelCount}`);
+  kv('Joints', `${an.joints.length}`);
+  kv('Floor supports', `${an.groundedNodes} nodes`);
+  kv('Resolution', an.resolutionLog.replace(/ · target.*$/, ''));
+
+  // Joints sub-list (ASCII — jsPDF core font has no ⟂ glyph).
+  if (an.joints.length > 0) {
+    doc.setFont('helvetica', 'bold'); doc.setFontSize(8.5); doc.setTextColor(110);
+    doc.text('JOINTS', tableLeft, y);
+    doc.setDrawColor(235); doc.setLineWidth(0.4); doc.line(tableLeft, y + 4, tableRight, y + 4);
+    doc.setTextColor(0); y += rowH;
+    const maxJoints = Math.min(an.joints.length, 12);
+    for (let i = 0; i < maxJoints; i++) {
+      const j = an.joints[i];
+      const label = j.pair.replace('⟂', 'x');
+      const detail = `${fmtDim(j.length, opt.units)} · ${j.stiffness}`;
+      doc.setFont('helvetica', 'normal'); doc.setFontSize(9); doc.setTextColor(60);
+      doc.text(clip(doc, label, (tableRight - tableLeft) * 0.5), tableLeft, y);
+      doc.text(clip(doc, detail, (tableRight - tableLeft) * 0.45), tableRight, y, { align: 'right' });
+      doc.setDrawColor(240); doc.setLineWidth(0.35); doc.line(tableLeft, y + 4, tableRight, y + 4);
+      y += rowH - 3;
+    }
+    if (an.joints.length > maxJoints) {
+      doc.setFont('helvetica', 'italic'); doc.setFontSize(8.5); doc.setTextColor(130);
+      doc.text(`+ ${an.joints.length - maxJoints} more`, tableLeft, y);
+      y += rowH - 3;
+    }
+    y += 4;
+  }
 
   // Loads sub-list.
   if (an.loads.length > 0) {
@@ -2034,39 +2065,39 @@ function drawAnalysisPage(
     doc.setDrawColor(235); doc.setLineWidth(0.4); doc.line(tableLeft, y + 4, tableRight, y + 4);
     doc.setTextColor(0); y += rowH;
     an.loads.forEach((ld, i) => {
-      // jsPDF's core Helvetica has no Unicode arrows/shapes — use ASCII labels.
       const dir = ld.down ? 'down' : 'up';
       const shape = ld.shape === 'round' ? 'round' : 'square';
-      const label = `${i + 1}. ${ld.magDisplay} ${dir}`;
-      const detail = `${shape} ${fmtDim(ld.sizeMm, opt.units)} @ (${fmtDim(ld.x, opt.units)}, ${fmtDim(ld.y, opt.units)})`;
+      const label = `${i + 1}. ${ld.magDisplay} ${dir} on ${ld.panelLabel}`;
+      const detail = `${shape} ${fmtDim(ld.sizeMm, opt.units)}`;
       doc.setFont('helvetica', 'normal'); doc.setFontSize(9); doc.setTextColor(60);
-      doc.text(clip(doc, label, (tableRight - tableLeft) * 0.42), tableLeft, y);
-      doc.text(clip(doc, detail, (tableRight - tableLeft) * 0.55), tableRight, y, { align: 'right' });
+      doc.text(clip(doc, label, (tableRight - tableLeft) * 0.62), tableLeft, y);
+      doc.text(clip(doc, detail, (tableRight - tableLeft) * 0.35), tableRight, y, { align: 'right' });
       doc.setDrawColor(240); doc.setLineWidth(0.35); doc.line(tableLeft, y + 4, tableRight, y + 4);
-      y += rowH - 2;
+      y += rowH - 3;
     });
     y += 4;
   }
 
   y += 6;
-  section('Results');
+  section('Result');
   const verdictColor: Record<string, [number, number, number]> = {
     ok: [15, 123, 108], OK: [15, 123, 108],
     borderline: [217, 115, 13], weak: [192, 57, 43],
   };
-  kv('Max sag', fmtSag(an.maxSagMm, opt.units));
+  kv('Max deflection', fmtSag(an.maxSagMm, opt.units));
+  kv('On panel', an.maxPanelLabel);
   kv('At', `(${fmtDim(an.maxAt[0], opt.units)}, ${fmtDim(an.maxAt[1], opt.units)})`);
   kv('Span', fmtDim(an.spanMm, opt.units));
   kv('Verdict', an.verdict.toUpperCase(), verdictColor[an.verdict] ?? [30, 30, 30]);
   doc.setTextColor(0);
 }
 
-/** Standalone one-page Analysis PDF for a single body. */
-export function buildAnalysisPdf(an: CaePanelAnalysis, opt: PdfOptions): jsPDF {
+/** Standalone one-page Assembly analysis PDF for the current cabinet. */
+export function buildAssemblyAnalysisPdf(an: AssemblyAnalysisPage, opt: PdfOptions): jsPDF {
   const paper = opt.paper ?? 'widescreen-16-9';
   const dims = PAPER_DIMS[paper === 'mobile' ? 'widescreen-16-9' : paper];
   const doc = new jsPDF({ orientation: dims.orient, unit: 'pt', format: dims.format });
-  drawAnalysisPage(doc, an, opt, dims);
+  drawAssemblyAnalysisPage(doc, an, opt, dims);
   return doc;
 }
 

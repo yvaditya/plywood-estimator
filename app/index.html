@@ -31,6 +31,14 @@
           </div>
         </header>
 
+        <!-- Mode switch: Cut planning vs whole-cabinet structural Analysis -->
+        <div class="mode-switch" role="tablist" aria-label="Sidebar mode">
+          <button id="modeCutBtn" class="mode-tab active" role="tab" type="button" aria-selected="true">Cut planning</button>
+          <button id="modeAnalysisBtn" class="mode-tab" role="tab" type="button" aria-selected="false">
+            Analysis<span id="modeAnalysisDot" class="mode-solved-dot" hidden aria-hidden="true"></span>
+          </button>
+        </div>
+
         <section class="panel panel--dropzone" id="dropzone">
           <div class="drop-inner">
             <span class="drop-icon" aria-hidden="true">
@@ -52,7 +60,7 @@
           <div id="loadStatus" class="status"></div>
         </section>
 
-        <section class="panel panel--group" data-group="stock">
+        <section class="panel panel--group" data-group="stock" data-modes="cut">
           <h2><span class="panel-dot" aria-hidden="true"></span>Stock</h2>
           <div class="grid2">
             <label>Width <input id="sheetW" type="text" inputmode="decimal" value="48" /><span class="dim-sub" id="sheetWSub"></span></label>
@@ -85,7 +93,7 @@
           </div>
         </section>
 
-        <section class="panel panel--group" data-group="cutting">
+        <section class="panel panel--group" data-group="cutting" data-modes="cut">
           <h2><span class="panel-dot" aria-hidden="true"></span>Cutting</h2>
           <div class="grid2">
             <label>Edge margin <input id="margin" type="text" inputmode="decimal" value="0.5" /><span class="dim-sub" id="marginSub"></span></label>
@@ -146,7 +154,7 @@
           </div>
         </section>
 
-        <section class="panel panel--group" data-group="parts">
+        <section class="panel panel--group" data-group="parts" data-modes="both">
           <div class="row-between">
             <h2><span class="panel-dot" aria-hidden="true"></span>Parts <span id="bodyCount" class="count-pill">0</span></h2>
             <div class="row-gap">
@@ -169,7 +177,7 @@
           </div>
         </section>
 
-        <section class="panel panel--group" data-group="job">
+        <section class="panel panel--group" data-group="job" data-modes="both">
           <h2><span class="panel-dot" aria-hidden="true"></span>Job &amp; export</h2>
           <div class="grid2">
             <label style="grid-column: 1 / -1">Name <input id="jobName" type="text" placeholder="Kitchen — dishwasher base" /></label>
@@ -197,7 +205,7 @@
           </div>
         </section>
 
-        <section class="panel panel--group" id="shoppingPanel" data-group="shopping">
+        <section class="panel panel--group" id="shoppingPanel" data-group="shopping" data-modes="cut">
           <div class="row-between">
             <h2><span class="panel-dot" aria-hidden="true"></span>Shopping list <span id="shopCount" class="count-pill">0</span></h2>
             <div class="row-gap">
@@ -221,13 +229,51 @@
           <div id="shopTotals" class="shop-totals" hidden></div>
         </section>
 
-        <section class="panel panel--cta">
+        <section class="panel panel--cta" data-modes="cut">
           <button id="nestBtn" class="primary" disabled>
             <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
               <path d="M3 3h7v7H3zM14 3h7v7h-7zM3 14h7v7H3zM14 14h7v7h-7z" />
             </svg>
             <span>Estimate cut sheets</span>
           </button>
+        </section>
+
+        <!-- Structural analysis of the whole cabinet (coupled shell FE) -->
+        <section class="panel panel--group" data-group="analysis" data-modes="analysis">
+          <h2><span class="panel-dot" aria-hidden="true"></span>Analysis</h2>
+
+          <div class="asm-detect-row">
+            <label style="display:none">Cabinet
+              <select id="asmCabinet"></select>
+            </label>
+            <button id="asmDetectBtn" class="ghost" disabled>Detect joints</button>
+            <label class="asm-tol">Join tol
+              <input id="asmTol" type="number" min="0" step="0.5" value="2" />
+            </label>
+          </div>
+
+          <div class="asm-subtitle">Joints</div>
+          <div id="asmJointsList" class="asm-joints-list">
+            <div class="asm-hint">Detect joints to list touching panel edges.</div>
+          </div>
+
+          <div class="asm-subtitle">Loads</div>
+          <div class="asm-presets">
+            <button id="asmPreset50" class="ghost" type="button">50 kg on top</button>
+            <button id="asmPresetShelf" class="ghost" type="button">20 kg per shelf</button>
+            <button id="asmPresetClear" class="ghost" type="button">Clear loads</button>
+          </div>
+          <div id="asmLoadsList" class="asm-loads-list"></div>
+          <button id="asmAddLoad" class="ghost asm-add" type="button">+ Add load</button>
+
+          <div class="asm-actions">
+            <button id="asmSolveBtn" class="ghost" type="button" disabled>Solve assembly</button>
+            <button id="asmClearBtn" class="ghost" type="button">Clear</button>
+            <button id="asmExportBtn" class="ghost" type="button" disabled>Export analysis PDF</button>
+          </div>
+          <div id="asmResult" class="asm-result">
+            <span class="asm-hint">Detect joints, add loads, then Solve assembly.</span>
+          </div>
         </section>
       </aside>
 

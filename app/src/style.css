@@ -186,6 +186,7 @@ body {
   --tint-parts:   hsl(142, 40%, 96.3%);  /* faint green    */
   --tint-job:     hsl(268, 44%, 96.6%);  /* faint violet   */
   --tint-shopping:hsl(38, 70%, 95.8%);   /* faint amber    */
+  --tint-analysis:hsl(352, 54%, 96.2%);  /* faint rose     */
 }
 .panel--group {
   margin-left: -12px;
@@ -204,6 +205,55 @@ body {
 .panel--group[data-group="parts"]    { background: var(--tint-parts); }
 .panel--group[data-group="job"]      { background: var(--tint-job); }
 .panel--group[data-group="shopping"] { background: var(--tint-shopping); }
+.panel--group[data-group="analysis"] { background: var(--tint-analysis); }
+
+/* ---------------------------------------------------------------------------
+   Sidebar MODE SWITCH — Cut planning vs Analysis. A minimal segmented control
+   under the brand header. Sections are tagged data-modes="cut|analysis|both";
+   the active mode hides the others. State is shared across modes (no reset).
+   --------------------------------------------------------------------------- */
+.mode-switch {
+  display: flex;
+  gap: 2px;
+  margin: 2px 0 8px;
+  padding: 2px;
+  background: var(--bg-input-2);
+  border: 1px solid var(--line);
+  border-radius: 7px;
+}
+.mode-tab {
+  flex: 1;
+  border: none;
+  background: none;
+  border-radius: 5px;
+  padding: 6px 8px;
+  font-size: 10.5px;
+  font-weight: 600;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  color: var(--muted);
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 5px;
+}
+.mode-tab:hover { color: var(--text-2); }
+.mode-tab.active {
+  background: var(--bg);
+  color: var(--text);
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.06);
+}
+.mode-solved-dot {
+  width: 6px; height: 6px; border-radius: 50%;
+  background: var(--good);
+  display: inline-block;
+}
+.mode-solved-dot[hidden] { display: none; }
+
+/* Mode gating — hide sections that don't belong to the active mode. */
+#sidebar.mode-cut      [data-modes="analysis"] { display: none; }
+#sidebar.mode-analysis [data-modes="cut"]      { display: none; }
 
 /* Group headings — distinct from body text: right-indexed (right-aligned),
    colored to the group's own hue so each zone labels itself. #sidebar bumps
@@ -229,6 +279,7 @@ body {
 #sidebar .panel--group[data-group="parts"] h2    { color: hsl(142, 40%, 34%); }
 #sidebar .panel--group[data-group="job"] h2      { color: hsl(268, 35%, 44%); }
 #sidebar .panel--group[data-group="shopping"] h2 { color: hsl(38, 60%, 36%); }
+#sidebar .panel--group[data-group="analysis"] h2 { color: hsl(352, 45%, 40%); }
 
 
 .panel h2 {
@@ -704,7 +755,7 @@ button.primary:disabled {
 .body-row .body-extra input,
 .body-row .body-extra select { padding: 5px 7px; font-size: 12px; }
 
-/* -- Quick CAE: structure line + bending analysis panel -- */
+/* -- Structure screening line (read-only, per body) -- */
 .body-row .body-cae {
   grid-column: 1 / -1;
   margin-top: 8px;
@@ -724,50 +775,8 @@ button.primary:disabled {
 .cae-verdict.cae-ok { color: var(--good); }
 .cae-verdict.cae-borderline { color: var(--warn); }
 .cae-verdict.cae-weak { color: #C0392B; font-weight: 600; }
-.cae-toggle { margin-top: 6px; padding: 3px 0; font-size: 11.5px; }
-.cae-toggle.armed { color: var(--accent); }
 
-.cae-panel {
-  margin-top: 8px;
-  padding: 10px;
-  border: 1px solid var(--line);
-  border-radius: 6px;
-  background: var(--bg-input-2);
-  display: flex;
-  flex-direction: column;
-  gap: 9px;
-}
-.cae-panel .cae-row { font-size: 11.5px; color: var(--text-2); }
-.cae-panel .cae-mat { color: var(--muted); }
-.cae-panel .cae-mat strong { color: var(--text-2); font-weight: 600; }
-.cae-force label { display: flex; align-items: center; gap: 8px; text-transform: none; letter-spacing: 0; font-size: 11.5px; color: var(--muted); }
-.cae-force-input { display: inline-flex; gap: 5px; }
-.cae-force-input input { width: 62px; padding: 4px 6px; font-size: 12px; }
-.cae-force-input select { padding: 4px 6px; font-size: 12px; }
-.cae-edges-title { display: block; font-size: 10px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); font-weight: 600; margin-bottom: 5px; }
-.cae-edge-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 5px; }
-.cae-edge {
-  background: var(--bg);
-  border: 1px solid var(--line);
-  border-radius: 5px;
-  padding: 5px 7px;
-  font-size: 11px;
-  color: var(--muted);
-  text-align: left;
-  cursor: pointer;
-}
-.cae-edge:hover { background: var(--hover-wash); }
-.cae-edge strong { color: var(--text-2); font-weight: 600; }
-.cae-actions { display: flex; gap: 4px; flex-wrap: wrap; }
-.cae-actions .ghost { border: 1px solid var(--line); border-radius: 5px; padding: 4px 9px; font-size: 11.5px; }
-.cae-actions .ghost.armed { color: var(--accent); border-color: var(--accent-ring); }
-.cae-result { font-family: var(--font-mono); font-variant-numeric: tabular-nums; font-size: 11px; color: var(--text-2); line-height: 1.45; }
-.cae-result .cae-hint { color: var(--faint); font-family: var(--font-sans, inherit); }
-
-/* Multiple-load + pin lists */
-.cae-subtitle { display: block; font-size: 10px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); font-weight: 600; margin-bottom: 5px; }
-.cae-loads .cae-hint, .cae-edges-title .cae-hint { font-size: 9.5px; text-transform: none; letter-spacing: 0; font-weight: 400; }
-.cae-load-list { display: flex; flex-direction: column; gap: 5px; }
+/* -- Shared load-row atoms (reused by the Analysis section) -- */
 .cae-load-row { display: flex; align-items: center; gap: 4px; flex-wrap: wrap; }
 .cae-load-row input[data-lf="val"], .cae-load-row input[data-lf="size"] { width: 46px; padding: 3px 5px; font-size: 11.5px; }
 .cae-load-row select { padding: 3px 4px; font-size: 11.5px; }
@@ -778,19 +787,48 @@ button.primary:disabled {
 .cae-dir:hover { background: var(--hover-wash); }
 .cae-place-load { padding: 3px 7px !important; font-size: 11px !important; border: 1px solid var(--line); border-radius: 5px; }
 .cae-place-load.armed { color: var(--accent); border-color: var(--accent-ring); }
-.cae-load-at, .cae-pin-at { font-family: var(--font-mono); font-size: 10px; color: var(--muted); }
+.cae-load-at { font-family: var(--font-mono); font-size: 10px; color: var(--muted); }
 .cae-x {
   border: none; background: none; color: var(--faint); cursor: pointer; font-size: 15px;
   line-height: 1; padding: 0 4px; margin-left: auto;
 }
 .cae-x:hover { color: #C0392B; }
-.cae-add { border: 1px solid var(--line); border-radius: 5px; padding: 3px 9px; font-size: 11px; margin-top: 6px; }
-.cae-add.armed { color: var(--accent); border-color: var(--accent-ring); }
-.cae-uniform { display: flex; align-items: center; gap: 6px; margin-top: 8px; font-size: 11.5px; color: var(--muted); text-transform: none; letter-spacing: 0; }
-.cae-uniform input { width: 52px; padding: 3px 5px; font-size: 11.5px; }
-.cae-pin-list { display: flex; flex-direction: column; gap: 4px; }
-.cae-pin-row { display: flex; align-items: center; gap: 6px; }
-.cae-actions .ghost[disabled] { opacity: 0.45; cursor: default; }
+
+/* -- Analysis section (whole-assembly structural analysis) -- */
+.panel--group[data-group="analysis"] .asm-detect-row {
+  display: flex; align-items: flex-end; gap: 8px; flex-wrap: wrap; margin-bottom: 10px;
+}
+.panel--group[data-group="analysis"] .asm-detect-row select { padding: 4px 6px; font-size: 12px; }
+.asm-tol { display: flex; flex-direction: column; gap: 3px; font-size: 10px; text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted); font-weight: 600; }
+.asm-tol input { width: 58px; padding: 4px 6px; font-size: 12px; }
+.panel--group[data-group="analysis"] .asm-detect-row .ghost {
+  border: 1px solid var(--line); border-radius: 5px; padding: 5px 10px; font-size: 12px;
+}
+.asm-subtitle { display: block; font-size: 10px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); font-weight: 600; margin: 10px 0 6px; }
+.asm-hint { font-size: 11px; color: var(--faint); }
+.asm-joints-list { display: flex; flex-direction: column; gap: 4px; }
+.asm-joint-row {
+  display: grid; grid-template-columns: 1fr auto auto; align-items: center; gap: 8px;
+  font-size: 11.5px; color: var(--text-2);
+}
+.asm-joint-name { font-weight: 500; }
+.asm-joint-len { font-family: var(--font-mono); font-size: 10.5px; color: var(--muted); }
+.asm-joint-row select { padding: 3px 4px; font-size: 11px; }
+.asm-presets { display: flex; gap: 4px; flex-wrap: wrap; margin-bottom: 8px; }
+.asm-presets .ghost { border: 1px solid var(--line); border-radius: 5px; padding: 4px 8px; font-size: 11px; }
+.asm-loads-list { display: flex; flex-direction: column; gap: 5px; }
+.asm-add { border: 1px solid var(--line); border-radius: 5px; padding: 3px 9px; font-size: 11px; margin-top: 6px; }
+.asm-actions { display: flex; gap: 4px; flex-wrap: wrap; margin-top: 12px; }
+.asm-actions .ghost { border: 1px solid var(--line); border-radius: 5px; padding: 5px 10px; font-size: 12px; }
+.asm-actions .ghost[disabled] { opacity: 0.45; cursor: default; }
+.asm-result {
+  margin-top: 10px; font-family: var(--font-mono); font-variant-numeric: tabular-nums;
+  font-size: 11px; color: var(--text-2); line-height: 1.45;
+}
+.asm-result .asm-hint { font-family: var(--font-sans, inherit); }
+.asm-result.cae-ok { color: var(--good); }
+.asm-result.cae-borderline { color: var(--warn); }
+.asm-result.cae-weak { color: #C0392B; }
 
 .swatch {
   width: 12px;
