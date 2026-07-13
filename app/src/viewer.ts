@@ -52,6 +52,18 @@ export interface GrainArrowConfig {
 const COLOR_HOVER = new THREE.Color('#7ef3c0');
 const DIM_OPACITY = 0.22;
 
+/** Outline-frame geometry for the in-3D edge picker: the world (0,0) corner of
+ *  the outline bbox plus the two in-face unit axes and the bbox extents. Lets
+ *  the viewer project a world click onto (ox, oy) and decide which edge (if
+ *  any) it lands near. */
+export interface EdgePickFrame {
+  origin: [number, number, number];
+  uAxis: [number, number, number]; // along outline width w
+  vAxis: [number, number, number]; // along outline height h
+  w: number;
+  h: number;
+}
+
 export interface BodyHandle {
   id: number;
   name: string;
@@ -112,9 +124,19 @@ export class Viewer {
   private caeGroup = new THREE.Group();
   private caeWeakOutlines = new Map<number, THREE.LineSegments>();
   private caeOverlays = new Map<number, THREE.Object3D>();
+  /** Per-body-id → load-index → arrow+footprint group (for multiple loads). */
+  private caeLoadMarkers = new Map<number, Map<number, THREE.Object3D>>();
+  /** Per-body-id group of pin markers. */
+  private caePinMarkers = new Map<number, THREE.Object3D>();
+  /** Per-body-id group of edge-support state lines. */
+  private caeEdgeLines = new Map<number, THREE.Object3D>();
   /** When set, the next body-face click is captured for force placement
    *  instead of toggling selection. */
   private caePlacePick: { bodyId: number; cb: (p: THREE.Vector3, n: THREE.Vector3) => void } | null = null;
+  /** When set, clicking near an EDGE of this body cycles that edge's support
+   *  state (free→simple→fixed). Fired instead of selection when a click lands
+   *  within `edgePickFrac` of an AABB edge on the analyzed face. */
+  private caeEdgePick: { bodyId: number; cb: (edge: 'top' | 'bottom' | 'left' | 'right') => void; frame: EdgePickFrame } | null = null;
   private grainArrows = new Map<number, THREE.Group>();
   private grainConfigs = new Map<number, GrainArrowConfig>();
   private grainStates = new Map<number, GrainLock>();
@@ -448,7 +470,9 @@ export class Viewer {
   }
 
   /** Enter "place force" mode for a body — the next click on that body's face
-   *  fires `cb(point, faceNormal)` (world coords) instead of selecting. */
+   *  (NOT near an edge that's armed for edge-picking) fires `cb(point,
+   *  faceNormal)` (world coords) instead of selecting. Placement modes take
+   *  priority over the edge picker. */
   beginForcePlacement(bodyId: number, cb: (point: [number, number, number], normal: [number, number, number]) => void) {
     this.caePlacePick = {
       bodyId,
@@ -457,23 +481,167 @@ export class Viewer {
   }
   cancelForcePlacement() { this.caePlacePick = null; }
 
-  /** Draw a red arrow at `point`, pointing along `-dir` (into the face). */
-  showForceArrow(bodyId: number, point: [number, number, number], dir: [number, number, number], len: number) {
-    this.clearForceArrow(bodyId);
+  /** Arm the in-3D edge picker for a body. While armed, a click that lands
+   *  within ~8% of the panel span from an AABB edge (on the analyzed face)
+   *  cycles that edge's support via `cb`. Cleared when the CAE panel closes. */
+  beginEdgePick(bodyId: number, frame: EdgePickFrame, cb: (edge: 'top' | 'bottom' | 'left' | 'right') => void) {
+    this.caeEdgePick = { bodyId, frame, cb };
+  }
+  cancelEdgePick(bodyId?: number) {
+    if (bodyId == null || this.caeEdgePick?.bodyId === bodyId) this.caeEdgePick = null;
+  }
+
+  /**
+   * Draw the marker for ONE load: a footprint outline (square or circle, red
+   * hairline) on the face plus an arrow. Down loads (N>0) point INTO the face;
+   * up loads (reactions, N<0) point OUT of it. Keyed per (bodyId, index) so
+   * multiple loads coexist.
+   */
+  showLoadMarker(
+    bodyId: number,
+    index: number,
+    point: [number, number, number],
+    normal: [number, number, number],
+    len: number,
+    footprint: { shape: 'square' | 'round'; size: number; uAxis: [number, number, number]; vAxis: [number, number, number] },
+    down: boolean,
+  ) {
+    let perBody = this.caeLoadMarkers.get(bodyId);
+    if (!perBody) { perBody = new Map(); this.caeLoadMarkers.set(bodyId, perBody); }
+    const existing = perBody.get(index);
+    if (existing) { this.caeGroup.remove(existing); disposeObject3D(existing); perBody.delete(index); }
+
+    const group = new THREE.Group();
     const origin = new THREE.Vector3(...point);
-    const d = new THREE.Vector3(...dir).normalize();
-    // Arrow points INTO the face: start above the surface, aim at the point.
-    const start = origin.clone().addScaledVector(d, len);
-    const arrow = new THREE.ArrowHelper(d.clone().negate(), start, len, 0xd6353b, len * 0.28, len * 0.16);
-    arrow.userData.caeArrowFor = bodyId;
+    const n = new THREE.Vector3(...normal).normalize();
+    // Float the marker a hair off the face.
+    const base = origin.clone().addScaledVector(n, 0.6);
+
+    // Arrow: down → point into the face (along −n, starting proud); up → point
+    // out (along +n).
+    const dir = down ? n.clone().negate() : n.clone();
+    const start = down ? origin.clone().addScaledVector(n, len) : base.clone();
+    const arrow = new THREE.ArrowHelper(dir, start, len, down ? 0xd6353b : 0x2f7fd6, len * 0.28, len * 0.16);
     (arrow.line.material as THREE.LineBasicMaterial).linewidth = 2;
     arrow.renderOrder = 6;
-    this.caeGroup.add(arrow);
-    this.caeOverlays.set(-bodyId - 1, arrow); // negative key so it doesn't clash with heatmap
+    group.add(arrow);
+
+    // Footprint outline (red hairline) in the face plane.
+    if (footprint.size > 0) {
+      const u = new THREE.Vector3(...footprint.uAxis).normalize();
+      const v = new THREE.Vector3(...footprint.vAxis).normalize();
+      const half = footprint.size / 2;
+      const pts: THREE.Vector3[] = [];
+      if (footprint.shape === 'round') {
+        const seg = 40;
+        for (let i = 0; i <= seg; i++) {
+          const a = (i / seg) * Math.PI * 2;
+          pts.push(base.clone().addScaledVector(u, Math.cos(a) * half).addScaledVector(v, Math.sin(a) * half));
+        }
+      } else {
+        const corners: [number, number][] = [[-half, -half], [half, -half], [half, half], [-half, half], [-half, -half]];
+        for (const [su, sv] of corners) pts.push(base.clone().addScaledVector(u, su).addScaledVector(v, sv));
+      }
+      const geom = new THREE.BufferGeometry().setFromPoints(pts);
+      const line = new THREE.Line(geom, new THREE.LineBasicMaterial({ color: 0xd6353b, transparent: true, opacity: 0.95, depthTest: true }));
+      line.renderOrder = 6;
+      group.add(line);
+    }
+
+    group.userData.caeLoadFor = bodyId;
+    this.caeGroup.add(group);
+    perBody.set(index, group);
   }
-  clearForceArrow(bodyId: number) {
-    const a = this.caeOverlays.get(-bodyId - 1);
-    if (a) { this.caeGroup.remove(a); disposeObject3D(a); this.caeOverlays.delete(-bodyId - 1); }
+  /** Remove ALL load markers for a body. */
+  clearLoadMarkers(bodyId: number) {
+    const perBody = this.caeLoadMarkers.get(bodyId);
+    if (!perBody) return;
+    for (const g of perBody.values()) { this.caeGroup.remove(g); disposeObject3D(g); }
+    this.caeLoadMarkers.delete(bodyId);
+  }
+
+  /** Render shelf pins as small dark cones sitting on the analyzed face. */
+  showPins(
+    bodyId: number,
+    pins: { point: [number, number, number]; normal: [number, number, number] }[],
+    scale: number,
+  ) {
+    this.clearPins(bodyId);
+    const group = new THREE.Group();
+    const r = Math.max(3, scale * 0.5);
+    const hgt = r * 2.4;
+    for (const pin of pins) {
+      const n = new THREE.Vector3(...pin.normal).normalize();
+      const geom = new THREE.ConeGeometry(r, hgt, 16);
+      const mat = new THREE.MeshBasicMaterial({ color: 0x23282e });
+      const cone = new THREE.Mesh(geom, mat);
+      // Cone default axis is +Y; orient its tip toward the face (−n), base out.
+      const q = new THREE.Quaternion().setFromUnitVectors(new THREE.Vector3(0, 1, 0), n);
+      cone.quaternion.copy(q);
+      const p = new THREE.Vector3(...pin.point).addScaledVector(n, hgt / 2 + 0.4);
+      cone.position.copy(p);
+      cone.renderOrder = 6;
+      group.add(cone);
+    }
+    group.userData.caePinFor = bodyId;
+    this.caeGroup.add(group);
+    this.caePinMarkers.set(bodyId, group);
+  }
+  clearPins(bodyId: number) {
+    const g = this.caePinMarkers.get(bodyId);
+    if (g) { this.caeGroup.remove(g); disposeObject3D(g); this.caePinMarkers.delete(bodyId); }
+  }
+
+  /**
+   * Draw the edge-support state on the body: each supported edge gets a blue
+   * line along it; fixed edges get a thicker double line. Free edges draw
+   * nothing. `edges` gives the per-edge kind; `frame` locates the outline.
+   */
+  showEdgeSupports(
+    bodyId: number,
+    frame: EdgePickFrame & { normal: [number, number, number] },
+    edges: { top: string; bottom: string; left: string; right: string },
+  ) {
+    this.clearEdgeSupports(bodyId);
+    const o = new THREE.Vector3(...frame.origin);
+    const u = new THREE.Vector3(...frame.uAxis).normalize();
+    const v = new THREE.Vector3(...frame.vAxis).normalize();
+    const n = new THREE.Vector3(...frame.normal).normalize();
+    const group = new THREE.Group();
+    const off = 0.7;
+    const corner = (su: number, sv: number) =>
+      o.clone().addScaledVector(u, su).addScaledVector(v, sv).addScaledVector(n, off);
+    const edgeEnds: Record<'top' | 'bottom' | 'left' | 'right', [THREE.Vector3, THREE.Vector3, THREE.Vector3]> = {
+      // [a, b, inwardDir] — inward used to offset the second (double) line for fixed.
+      bottom: [corner(0, 0), corner(frame.w, 0), v.clone()],
+      top: [corner(0, frame.h), corner(frame.w, frame.h), v.clone().negate()],
+      left: [corner(0, 0), corner(0, frame.h), u.clone()],
+      right: [corner(frame.w, 0), corner(frame.w, frame.h), u.clone().negate()],
+    };
+    const span = Math.max(frame.w, frame.h);
+    const gap = span * 0.012;
+    for (const key of ['top', 'bottom', 'left', 'right'] as const) {
+      const kind = edges[key];
+      if (kind === 'free') continue;
+      const [a, b, inward] = edgeEnds[key];
+      const mkLine = (pa: THREE.Vector3, pb: THREE.Vector3) => {
+        const geom = new THREE.BufferGeometry().setFromPoints([pa, pb]);
+        const line = new THREE.Line(geom, new THREE.LineBasicMaterial({ color: 0x2f6fe0, transparent: true, opacity: 0.95, depthTest: true }));
+        line.renderOrder = 6;
+        group.add(line);
+      };
+      mkLine(a, b);
+      if (kind === 'fixed') {
+        mkLine(a.clone().addScaledVector(inward, gap), b.clone().addScaledVector(inward, gap));
+      }
+    }
+    group.userData.caeEdgeFor = bodyId;
+    this.caeGroup.add(group);
+    this.caeEdgeLines.set(bodyId, group);
+  }
+  clearEdgeSupports(bodyId: number) {
+    const g = this.caeEdgeLines.get(bodyId);
+    if (g) { this.caeGroup.remove(g); disposeObject3D(g); this.caeEdgeLines.delete(bodyId); }
   }
 
   /**
@@ -536,10 +704,13 @@ export class Viewer {
     if (m) { this.caeGroup.remove(m); disposeObject3D(m); this.caeOverlays.delete(bodyId); }
   }
 
-  /** Remove ALL CAE overlays for a body (heatmap + arrow), keep weak tint. */
+  /** Remove ALL CAE overlays for a body (heatmap + load markers + pins + edge
+   *  lines), keep weak tint. */
   clearCae(bodyId: number) {
     this.clearDeflectionOverlay(bodyId);
-    this.clearForceArrow(bodyId);
+    this.clearLoadMarkers(bodyId);
+    this.clearPins(bodyId);
+    this.clearEdgeSupports(bodyId);
     this.cancelForcePlacement();
   }
 
@@ -575,9 +746,18 @@ export class Viewer {
     // CAE overlays
     for (const o of this.caeOverlays.values()) { this.caeGroup.remove(o); disposeObject3D(o); }
     this.caeOverlays.clear();
+    for (const perBody of this.caeLoadMarkers.values()) {
+      for (const g of perBody.values()) { this.caeGroup.remove(g); disposeObject3D(g); }
+    }
+    this.caeLoadMarkers.clear();
+    for (const g of this.caePinMarkers.values()) { this.caeGroup.remove(g); disposeObject3D(g); }
+    this.caePinMarkers.clear();
+    for (const g of this.caeEdgeLines.values()) { this.caeGroup.remove(g); disposeObject3D(g); }
+    this.caeEdgeLines.clear();
     for (const ls of this.caeWeakOutlines.values()) { this.caeGroup.remove(ls); disposeObject3D(ls); }
     this.caeWeakOutlines.clear();
     this.caePlacePick = null;
+    this.caeEdgePick = null;
   }
 
   /**
@@ -1252,6 +1432,31 @@ export class Viewer {
     }
   };
 
+  /** Project a world click point onto the outline frame and decide which edge
+   *  (if any) it's near — within ~8% of the panel span from an AABB edge.
+   *  Returns null when the click is in the interior. When the click is near two
+   *  edges (a corner), the closer edge wins. */
+  private classifyEdge(point: THREE.Vector3, frame: EdgePickFrame): 'top' | 'bottom' | 'left' | 'right' | null {
+    const o = new THREE.Vector3(...frame.origin);
+    const u = new THREE.Vector3(...frame.uAxis).normalize();
+    const v = new THREE.Vector3(...frame.vAxis).normalize();
+    const rel = point.clone().sub(o);
+    const ox = rel.dot(u);
+    const oy = rel.dot(v);
+    const span = Math.max(frame.w, frame.h);
+    const band = span * 0.08;
+    const dLeft = ox;
+    const dRight = frame.w - ox;
+    const dBottom = oy;
+    const dTop = frame.h - oy;
+    const cands: [('top' | 'bottom' | 'left' | 'right'), number][] = [
+      ['left', dLeft], ['right', dRight], ['bottom', dBottom], ['top', dTop],
+    ];
+    cands.sort((a, b) => a[1] - b[1]);
+    const [edge, dist] = cands[0];
+    return dist <= band ? edge : null;
+  }
+
   private handleClick = (ev: MouseEvent) => {
     if ((ev as any).detail === 0) return;
     const rect = this.renderer.domElement.getBoundingClientRect();
@@ -1279,6 +1484,25 @@ export class Viewer {
       }
       // click missed the body — stay in place mode, ignore this click.
       return;
+    }
+
+    // Edge-pick mode: when the CAE panel is open (and no placement is armed), a
+    // click near a panel EDGE cycles that edge's support. A click NOT near an
+    // edge falls through to normal selection so the user can still orbit-select.
+    if (this.caeEdgePick) {
+      const pick = this.caeEdgePick;
+      const body = this.bodies.find((b) => b.id === pick.bodyId);
+      if (body) {
+        const hit = this.raycaster.intersectObject(body.mesh, false)[0];
+        if (hit) {
+          const edge = this.classifyEdge(hit.point, pick.frame);
+          if (edge) {
+            pick.cb(edge);
+            return;
+          }
+        }
+      }
+      // not near an edge — fall through to normal selection.
     }
 
     // Test grain-arrow hits first so the arrow can intercept clicks that

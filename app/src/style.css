@@ -738,6 +738,34 @@ button.primary:disabled {
 .cae-result { font-family: var(--font-mono); font-variant-numeric: tabular-nums; font-size: 11px; color: var(--text-2); line-height: 1.45; }
 .cae-result .cae-hint { color: var(--faint); font-family: var(--font-sans, inherit); }
 
+/* Multiple-load + pin lists */
+.cae-subtitle { display: block; font-size: 10px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); font-weight: 600; margin-bottom: 5px; }
+.cae-loads .cae-hint, .cae-edges-title .cae-hint { font-size: 9.5px; text-transform: none; letter-spacing: 0; font-weight: 400; }
+.cae-load-list { display: flex; flex-direction: column; gap: 5px; }
+.cae-load-row { display: flex; align-items: center; gap: 4px; flex-wrap: wrap; }
+.cae-load-row input[data-lf="val"], .cae-load-row input[data-lf="size"] { width: 46px; padding: 3px 5px; font-size: 11.5px; }
+.cae-load-row select { padding: 3px 4px; font-size: 11.5px; }
+.cae-dir {
+  width: 24px; height: 24px; border: 1px solid var(--line); border-radius: 5px;
+  background: var(--bg); color: var(--text-2); font-size: 13px; cursor: pointer; line-height: 1;
+}
+.cae-dir:hover { background: var(--hover-wash); }
+.cae-place-load { padding: 3px 7px !important; font-size: 11px !important; border: 1px solid var(--line); border-radius: 5px; }
+.cae-place-load.armed { color: var(--accent); border-color: var(--accent-ring); }
+.cae-load-at, .cae-pin-at { font-family: var(--font-mono); font-size: 10px; color: var(--muted); }
+.cae-x {
+  border: none; background: none; color: var(--faint); cursor: pointer; font-size: 15px;
+  line-height: 1; padding: 0 4px; margin-left: auto;
+}
+.cae-x:hover { color: #C0392B; }
+.cae-add { border: 1px solid var(--line); border-radius: 5px; padding: 3px 9px; font-size: 11px; margin-top: 6px; }
+.cae-add.armed { color: var(--accent); border-color: var(--accent-ring); }
+.cae-uniform { display: flex; align-items: center; gap: 6px; margin-top: 8px; font-size: 11.5px; color: var(--muted); text-transform: none; letter-spacing: 0; }
+.cae-uniform input { width: 52px; padding: 3px 5px; font-size: 11.5px; }
+.cae-pin-list { display: flex; flex-direction: column; gap: 4px; }
+.cae-pin-row { display: flex; align-items: center; gap: 6px; }
+.cae-actions .ghost[disabled] { opacity: 0.45; cursor: default; }
+
 .swatch {
   width: 12px;
   height: 12px;

@@ -165,6 +165,28 @@ export interface EdgeSupports {
   right: EdgeSupport;
 }
 
+/** A footprint-sized load. `N` is SIGNED: +N pushes into the face (a downward
+ *  force), −N pulls out (a reaction / upward support push). The load is spread
+ *  as a uniform pressure over the active nodes inside its footprint. */
+export interface PatchLoad {
+  /** Position in outline mm coords. */
+  x: number;
+  y: number;
+  /** Signed magnitude in Newtons (+down / −up). */
+  N: number;
+  /** Footprint shape. */
+  shape: 'square' | 'round';
+  /** Footprint size in mm — side length (square) or diameter (round). */
+  size: number;
+}
+
+/** A shelf-pin point support: clamps w=0 on the nearest node patch (rotations
+ *  left free). Position in outline mm coords. */
+export interface PointSupport {
+  x: number;
+  y: number;
+}
+
 export interface SolveOptions {
   outline: PolygonOutline;
   thicknessMm: number;
@@ -172,10 +194,19 @@ export interface SolveOptions {
   /** True → the part's outline X-axis (length) runs along the face grain. */
   grainAlongLength: boolean;
   supports: EdgeSupports;
+  /** Footprint-sized point loads. Each is spread over the active nodes inside
+   *  its footprint. */
+  loads?: PatchLoad[];
+  /** Optional uniform load spread over the whole active area, in kilograms. */
+  uniform?: { totalKg: number };
+  /** Shelf-pin point supports (clamp w=0 near each). */
+  pointSupports?: PointSupport[];
+  // --- Legacy single-point-load API (validation harness / back-compat). When
+  //     `loads` is absent, a single load is synthesised from these. ---
   /** Point load in Newtons, applied at (loadX, loadY) in outline mm coords. */
-  forceN: number;
-  loadX: number;
-  loadY: number;
+  forceN?: number;
+  loadX?: number;
+  loadY?: number;
   /** Target active node count (grid is auto-sized to hit ~this). */
   targetNodes?: number;
 }
@@ -379,6 +410,8 @@ interface AssembleOptions {
   material: MaterialCard;
   grainAlongLength: boolean;
   supports: EdgeSupports;
+  /** Shelf-pin point supports (clamp w=0 near each). */
+  pointSupports?: PointSupport[];
   targetNodes?: number;
 }
 
@@ -394,39 +427,77 @@ interface GridCtx {
 }
 
 export function solvePlate(opts: SolveOptions): SolveResult {
+  // Normalise the load list: prefer `loads`; else synthesise one point-ish load
+  // from the legacy forceN/loadX/loadY API (a tiny footprint ≈ a point load).
+  const loads: PatchLoad[] = opts.loads
+    ? opts.loads
+    : (opts.forceN != null
+        ? [{ x: opts.loadX ?? 0, y: opts.loadY ?? 0, N: opts.forceN, shape: 'round', size: 0 }]
+        : []);
+  const uniform = opts.uniform;
+
   return assembleAndSolve(opts, (F, g) => {
-    // --- Point force spread over a ~3×3 node patch (inverse-distance) ---
+    // --- Uniform load: spread its total weight over the whole active area as a
+    //     pressure, built as consistent nodal loads per active cell ---
+    if (uniform && uniform.totalKg > 0) {
+      const { activeCells, dofOf, nx, dx, dy } = g;
+      const totalArea = activeCells.length * dx * dy; // mm²
+      if (totalArea > 0) {
+        const totalN = uniform.totalKg * G;
+        const pressure = totalN / totalArea;          // N/mm²
+        const cellLoad = pressure * dx * dy;          // N per cell
+        for (const [ix, iy] of activeCells) {
+          const nodes = [iy * nx + ix, iy * nx + ix + 1, (iy + 1) * nx + ix + 1, (iy + 1) * nx + ix];
+          for (const n of nodes) {
+            const wdof = dofOf[n * 3];
+            if (wdof >= 0) F[wdof] += cellLoad / 4;
+          }
+        }
+      }
+    }
+
+    // --- Footprint loads: each spread as a UNIFORM pressure over the active
+    //     nodes inside its footprint (snap to nearest active node if empty) ---
     const { dofOf, active, nx, ny, nNodes, dx, dy, originX, originY, bboxW, bboxH } = g;
-    const lx = Math.min(Math.max(opts.loadX - originX, 0), bboxW);
-    const ly = Math.min(Math.max(opts.loadY - originY, 0), bboxH);
-    const cix = Math.round(lx / dx);
-    const ciy = Math.round(ly / dy);
-    const patch: { n: number; wt: number }[] = [];
-    let wsum = 0;
-    for (let jy = ciy - 1; jy <= ciy + 1; jy++) {
-      for (let jx = cix - 1; jx <= cix + 1; jx++) {
-        if (jx < 0 || jy < 0 || jx >= nx || jy >= ny) continue;
-        const n = jy * nx + jx;
-        if (!active[n]) continue;
-        const d = Math.hypot(jx * dx - lx, jy * dy - ly);
-        const wt = 1 / (d + dx * 0.5);
-        patch.push({ n, wt });
-        wsum += wt;
+    for (const load of loads) {
+      if (!load.N) continue;
+      const lx = Math.min(Math.max(load.x - originX, 0), bboxW);
+      const ly = Math.min(Math.max(load.y - originY, 0), bboxH);
+      // Nodes whose position falls inside the footprint.
+      const inFoot: number[] = [];
+      const half = load.size / 2;
+      const j0x = Math.max(0, Math.floor((lx - half) / dx) - 1);
+      const j1x = Math.min(nx - 1, Math.ceil((lx + half) / dx) + 1);
+      const j0y = Math.max(0, Math.floor((ly - half) / dy) - 1);
+      const j1y = Math.min(ny - 1, Math.ceil((ly + half) / dy) + 1);
+      for (let jy = j0y; jy <= j1y; jy++) {
+        for (let jx = j0x; jx <= j1x; jx++) {
+          const n = jy * nx + jx;
+          if (!active[n]) continue;
+          const px = jx * dx, py = jy * dy;
+          const within = load.shape === 'round'
+            ? Math.hypot(px - lx, py - ly) <= half + 1e-6
+            : Math.abs(px - lx) <= half + 1e-6 && Math.abs(py - ly) <= half + 1e-6;
+          if (within) inFoot.push(n);
+        }
       }
-    }
-    if (patch.length === 0) {
-      let best = -1, bestD = Infinity;
-      for (let i = 0; i < nNodes; i++) {
-        if (!active[i]) continue;
-        const jx = i % nx, jy = (i / nx) | 0;
-        const d = Math.hypot(jx * dx - lx, jy * dy - ly);
-        if (d < bestD) { bestD = d; best = i; }
+      // Fallback: snap to the single nearest active node.
+      if (inFoot.length === 0) {
+        let best = -1, bestD = Infinity;
+        for (let i = 0; i < nNodes; i++) {
+          if (!active[i]) continue;
+          const jx = i % nx, jy = (i / nx) | 0;
+          const d = Math.hypot(jx * dx - lx, jy * dy - ly);
+          if (d < bestD) { bestD = d; best = i; }
+        }
+        if (best >= 0) inFoot.push(best);
       }
-      if (best >= 0) { patch.push({ n: best, wt: 1 }); wsum = 1; }
-    }
-    for (const { n, wt } of patch) {
-      const wdof = dofOf[n * 3];
-      if (wdof >= 0) F[wdof] += (opts.forceN * wt) / wsum;
+      if (inFoot.length === 0) continue;
+      const share = load.N / inFoot.length;
+      for (const n of inFoot) {
+        const wdof = dofOf[n * 3];
+        if (wdof >= 0) F[wdof] += share;
+      }
     }
   });
 }
@@ -584,6 +655,24 @@ function assembleAndSolve(
     if (y <= tol) constrainNode(i, supports.bottom);
     if (x <= tol) constrainNode(i, supports.left);
     if (x >= bboxW - tol) constrainNode(i, supports.right);
+  }
+
+  // --- Point supports (shelf pins): clamp w=0 on the nearest active node to
+  //     each pin (rotations left free — a pin resists lift, not tilt). ---
+  for (const pin of opts.pointSupports ?? []) {
+    const px = Math.min(Math.max(pin.x - originX, 0), bboxW);
+    const py = Math.min(Math.max(pin.y - originY, 0), bboxH);
+    let best = -1, bestD = Infinity;
+    for (let i = 0; i < nNodes; i++) {
+      if (!active[i]) continue;
+      const ix = i % nx, iy = (i / nx) | 0;
+      const d = Math.hypot(ix * dx - px, iy * dy - py);
+      if (d < bestD) { bestD = d; best = i; }
+    }
+    if (best >= 0) {
+      const wdof = dofOf[best * 3];
+      if (wdof >= 0) fixed[wdof] = 1; // w = 0, rotations free
+    }
   }
 
   // Apply Dirichlet BCs by zeroing fixed rows/cols and setting diagonal 1,

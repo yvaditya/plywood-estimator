@@ -132,10 +132,40 @@ function caseC() {
   report(`(c) Fixed strip, centre P  [${res.activeNodes} nodes, ${res.iterations} it]`, res.maxAbsW, theory, 20);
 }
 
+// ---------------------------------------------------------------------------
+// Case (d): same strip, all four edges FREE, but two PINS (point supports) at
+//   the mid-height of each short end, centre point load. Two pins at the span
+//   ends ≈ a simply-supported beam: wmax = P L³ / (48 E I).
+//   Coarser than the edge-supported case (a single node carries each reaction),
+//   so allow 20%.
+// ---------------------------------------------------------------------------
+function caseD() {
+  const L = 1000;
+  const b = L / 8;
+  const t = 12;
+  const E = 8000;
+  const P = 200;
+  const I = (b * t * t * t) / 12;
+  const theory = (P * L * L * L) / (48 * E * I);
+
+  const res = solvePlate({
+    outline: rectOutline(L, b),
+    thicknessMm: t,
+    material: iso(E, 0.3),
+    grainAlongLength: true,
+    supports: { top: 'free', bottom: 'free', left: 'free', right: 'free' },
+    pointSupports: [{ x: 0, y: b / 2 }, { x: L, y: b / 2 }],
+    loads: [{ x: L / 2, y: b / 2, N: P, shape: 'round', size: 0 }],
+    targetNodes: 4500,
+  });
+  report(`(d) Two-pin strip, centre P  [${res.activeNodes} nodes, ${res.iterations} it]`, res.maxAbsW, theory, 20);
+}
+
 console.log('=== plate solver validation ===');
 void bendingDForTest; // keep the import referenced
 caseA();
 caseB();
 caseC();
+caseD();
 console.log(anyFail ? '\nRESULT: FAIL' : '\nRESULT: all cases PASS');
 process.exit(anyFail ? 1 : 0);

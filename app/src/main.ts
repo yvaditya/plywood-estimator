@@ -27,7 +27,7 @@ import {
 } from './nest';
 import { sheetToDxf, downloadDxf } from './dxf';
 import { buildStep, type StepPart } from './stepExport';
-import { buildPdf, downloadPdf, type InventoryCheck } from './pdf';
+import { buildPdf, buildAnalysisPdf, downloadPdf, type InventoryCheck, type CaePanelAnalysis } from './pdf';
 import {
   buildShoppingList,
   setHave,
@@ -76,16 +76,50 @@ interface BodyState {
   material: string | null;
   /** Whether the inline "Analyze bending" CAE block is expanded. */
   caeOpen?: boolean;
-  /** Force placement point in outline (2D mm) coords for the plate solve.
-   *  null → default to the panel centre. */
-  caeLoadPt?: { x: number; y: number } | null;
+  /** Footprint loads placed on this body. Each carries magnitude + unit,
+   *  position (outline mm; null until placed → panel centre), footprint shape
+   *  + size, and direction. */
+  caeLoads?: CaeLoad[];
+  /** Optional uniform load, in kg (0 / undefined = off). */
+  caeUniformKg?: number;
+  /** Shelf-pin point supports in outline (2D mm) coords. */
+  caePins?: { x: number; y: number }[];
   /** Per-edge support overrides (outline frame). null → auto-prefill. */
   caeSupports?: EdgeSupports | null;
-  /** Force magnitude + unit as last entered in the CAE block. */
-  caeForceVal?: number;
-  caeForceUnit?: 'N' | 'kg' | 'lbf';
   /** Last solve result summary line, shown in the CAE block. */
   caeSolveMsg?: string;
+  /** Captured analysis for the PDF — only set after a successful solve this
+   *  session. Presence gates the Structure + Analysis pages in the job PDF. */
+  caeAnalysis?: CaeAnalysis | null;
+}
+
+/** One footprint load in the CAE panel. Magnitude is entered as val+unit;
+ *  `down` toggles between a downward force (↓) and an upward reaction (↑). */
+interface CaeLoad {
+  val: number;
+  unit: 'N' | 'kg' | 'lbf';
+  /** Placement in outline mm; null → panel centre. */
+  pt: { x: number; y: number } | null;
+  shape: 'square' | 'round';
+  /** Footprint size in mm (side length or diameter). */
+  sizeMm: number;
+  down: boolean;
+}
+
+/** Everything the PDF needs to render an Analysis page for a solved panel. */
+interface CaeAnalysis {
+  heatmapPng: string;
+  imgW: number;
+  imgH: number;
+  materialName: string;
+  loads: { magN: number; unit: string; magDisplay: string; shape: string; sizeMm: number; down: boolean; x: number; y: number }[];
+  uniformKg: number;
+  supports: EdgeSupports;
+  pinCount: number;
+  maxSagMm: number;
+  maxAt: [number, number];
+  spanMm: number;
+  verdict: string;
 }
 
 const state: {
@@ -234,6 +268,9 @@ function fmtWeight(kg: number): string {
   if (state.units === 'in') return `${(kg * 2.2046226).toFixed(1)} lb`;
   return `${kg.toFixed(2)} kg`;
 }
+
+/** Yield a frame to the browser so heavy work doesn't block paints. */
+const yieldFrame = () => new Promise<void>((r) => requestAnimationFrame(() => r()));
 
 const resultsEmpty = $('resultsEmpty');
 const resultsDetail = $('resultsDetail');
@@ -640,6 +677,9 @@ window.addEventListener('drop', (e) => {
 // Body list rendering
 // --------------------------------------------------------------------------
 function renderBodyList() {
+  // Edge-pick is re-armed per open CAE panel during build; drop any stale one
+  // so a body whose panel is now closed no longer intercepts edge clicks.
+  viewer.cancelEdgePick();
   // "15 sheet / 19 total" when some imports were skipped as non-sheet.
   bodyCount.textContent = state.nonSheetCount > 0
     ? `${state.bodies.length} sheet / ${state.bodies.length + state.nonSheetCount} total`
@@ -840,7 +880,7 @@ function buildCaeBlock(b: BodyState): HTMLDivElement {
   toggle.textContent = b.caeOpen ? 'Hide bending analysis' : 'Analyze bending';
   toggle.addEventListener('click', () => {
     b.caeOpen = !b.caeOpen;
-    if (!b.caeOpen) viewer.cancelForcePlacement();
+    if (!b.caeOpen) { viewer.cancelForcePlacement(); viewer.cancelEdgePick(b.id); }
     renderBodyList();
   });
   wrap.appendChild(toggle);
@@ -988,34 +1028,115 @@ function buildHeatTexture(res: import('./cae').SolveResult): THREE.CanvasTexture
   return tex;
 }
 
+/** Project a world click point onto the outline frame → clamped (ox, oy) mm. */
+function worldToOutline(b: BodyState, point: [number, number, number]): { x: number; y: number } {
+  const f = outlineFrame(b);
+  const rel: Vec3 = [point[0] - f.origin[0], point[1] - f.origin[1], point[2] - f.origin[2]];
+  const ox = rel[0] * f.uAxis[0] + rel[1] * f.uAxis[1] + rel[2] * f.uAxis[2];
+  const oy = rel[0] * f.vAxis[0] + rel[1] * f.vAxis[1] + rel[2] * f.vAxis[2];
+  return {
+    x: Math.max(0, Math.min(b.analysis.outline.bbox.w, ox)),
+    y: Math.max(0, Math.min(b.analysis.outline.bbox.h, oy)),
+  };
+}
+
+/** Map an outline (ox, oy) point back to world coords on the +face. */
+function outlineToWorld(b: BodyState, ox: number, oy: number): Vec3 {
+  const f = outlineFrame(b);
+  return v3add(v3add(f.origin, v3scale(f.uAxis, ox)), v3scale(f.vAxis, oy));
+}
+
+/** Default footprint size (mm) for a fresh load ≈ 40mm. */
+const DEFAULT_FOOTPRINT_MM = 40;
+
+/** A fresh footprint load: 25 kg downward, round, default footprint, unplaced. */
+function newCaeLoad(): CaeLoad {
+  return { val: 25, unit: 'kg', pt: null, shape: 'round', sizeMm: DEFAULT_FOOTPRINT_MM, down: true };
+}
+
+/** Redraw every load marker + pin marker + edge-support line for a body. */
+function repaintCaeMarkers(b: BodyState) {
+  const f = outlineFrame(b);
+  const arrowLen = Math.max(30, Math.min(b.analysis.length, b.analysis.width) * 0.35);
+  viewer.clearLoadMarkers(b.id);
+  (b.caeLoads ?? []).forEach((ld, i) => {
+    const pt = ld.pt ?? { x: b.analysis.outline.bbox.w / 2, y: b.analysis.outline.bbox.h / 2 };
+    const world = outlineToWorld(b, pt.x, pt.y);
+    viewer.showLoadMarker(b.id, i, world, f.normal, arrowLen,
+      { shape: ld.shape, size: ld.sizeMm, uAxis: f.uAxis, vAxis: f.vAxis }, ld.down);
+  });
+  if (b.caePins && b.caePins.length) {
+    const scale = Math.max(6, Math.min(b.analysis.length, b.analysis.width) * 0.03);
+    viewer.showPins(b.id, b.caePins.map((p) => ({ point: outlineToWorld(b, p.x, p.y), normal: f.normal })), scale);
+  } else {
+    viewer.clearPins(b.id);
+  }
+  const s = b.caeSupports ?? autoSupports(b);
+  viewer.showEdgeSupports(b.id, {
+    origin: f.origin, uAxis: f.uAxis, vAxis: f.vAxis, normal: f.normal,
+    w: b.analysis.outline.bbox.w, h: b.analysis.outline.bbox.h,
+  }, s);
+}
+
 function buildCaePanel(b: BodyState): HTMLDivElement {
   const panel = document.createElement('div');
   panel.className = 'cae-panel';
 
   const mat = bodyMaterial(b);
   if (!b.caeSupports) b.caeSupports = autoSupports(b);
-  if (b.caeForceVal == null) { b.caeForceVal = 25; b.caeForceUnit = 'kg'; }
+  if (!b.caeLoads) b.caeLoads = [newCaeLoad()];
+  if (!b.caePins) b.caePins = [];
   const supports = b.caeSupports;
 
   const edgeCycle: Record<EdgeSupport, EdgeSupport> = { free: 'simple', simple: 'fixed', fixed: 'free' };
   const edgeLabel: Record<EdgeSupport, string> = { free: 'free', simple: 'supported', fixed: 'fixed' };
+  // Footprint size input is in the user's units (raw number; mm stored). Round
+  // to 2 dp for inches, 0 dp for mm.
+  const sizeInUnits = (mm: number) => {
+    const v = fromMm(mm, state.units);
+    return state.units === 'in' ? Number(v.toFixed(2)) : Math.round(v);
+  };
+
+  const loadRows = b.caeLoads.map((ld, i) => {
+    const placed = ld.pt ? `@(${fmtDim(ld.pt.x, state.units)}, ${fmtDim(ld.pt.y, state.units)})` : 'centre';
+    return `
+    <div class="cae-load-row" data-load="${i}">
+      <input type="number" min="0" step="1" value="${ld.val}" data-lf="val" title="magnitude" />
+      <select data-lf="unit">
+        <option value="N" ${ld.unit === 'N' ? 'selected' : ''}>N</option>
+        <option value="kg" ${ld.unit === 'kg' ? 'selected' : ''}>kg</option>
+        <option value="lbf" ${ld.unit === 'lbf' ? 'selected' : ''}>lbf</option>
+      </select>
+      <button type="button" class="cae-dir" data-lf="dir" title="direction (down force / up reaction)">${ld.down ? '↓' : '↑'}</button>
+      <select data-lf="shape" title="footprint shape">
+        <option value="round" ${ld.shape === 'round' ? 'selected' : ''}>○</option>
+        <option value="square" ${ld.shape === 'square' ? 'selected' : ''}>□</option>
+      </select>
+      <input type="number" min="0" step="${state.units === 'in' ? '0.25' : '1'}" value="${sizeInUnits(ld.sizeMm)}" data-lf="size" title="footprint size (${state.units})" />
+      <button type="button" class="ghost cae-place-load" data-lf="place" title="place on panel">Place</button>
+      <span class="cae-load-at">${placed}</span>
+      <button type="button" class="cae-x" data-lf="remove" title="remove">×</button>
+    </div>`;
+  }).join('');
+
+  const pinRows = (b.caePins ?? []).map((p, i) => `
+    <div class="cae-pin-row" data-pin="${i}">
+      <span class="cae-pin-at">Pin @(${fmtDim(p.x, state.units)}, ${fmtDim(p.y, state.units)})</span>
+      <button type="button" class="cae-x" data-pf="remove" title="remove">×</button>
+    </div>`).join('');
 
   panel.innerHTML = `
     <div class="cae-row cae-mat">Material: <strong>${escapeHtml(mat.name)}</strong></div>
-    <div class="cae-row cae-force">
-      <label>Load
-        <span class="cae-force-input">
-          <input type="number" min="0" step="1" value="${b.caeForceVal}" data-cae="forceVal" />
-          <select data-cae="forceUnit">
-            <option value="N" ${b.caeForceUnit === 'N' ? 'selected' : ''}>N</option>
-            <option value="kg" ${b.caeForceUnit === 'kg' ? 'selected' : ''}>kg</option>
-            <option value="lbf" ${b.caeForceUnit === 'lbf' ? 'selected' : ''}>lbf</option>
-          </select>
-        </span>
+    <div class="cae-row cae-loads">
+      <span class="cae-subtitle">Loads</span>
+      <div class="cae-load-list">${loadRows}</div>
+      <button type="button" class="ghost cae-add" data-cae="addLoad">+ Add load</button>
+      <label class="cae-uniform">Uniform
+        <input type="number" min="0" step="1" value="${b.caeUniformKg ?? 0}" data-cae="uniformKg" /> kg
       </label>
     </div>
     <div class="cae-row cae-edges">
-      <span class="cae-edges-title">Edge supports</span>
+      <span class="cae-edges-title">Edge supports <span class="cae-hint">(or click an edge in 3D)</span></span>
       <div class="cae-edge-grid">
         <button type="button" class="cae-edge" data-edge="top">Top: <strong>${edgeLabel[supports.top]}</strong></button>
         <button type="button" class="cae-edge" data-edge="bottom">Bottom: <strong>${edgeLabel[supports.bottom]}</strong></button>
@@ -1023,20 +1144,68 @@ function buildCaePanel(b: BodyState): HTMLDivElement {
         <button type="button" class="cae-edge" data-edge="right">Right: <strong>${edgeLabel[supports.right]}</strong></button>
       </div>
     </div>
+    <div class="cae-row cae-pins">
+      <span class="cae-subtitle">Pins</span>
+      <div class="cae-pin-list">${pinRows}</div>
+      <button type="button" class="ghost cae-add" data-cae="addPin">+ Add pin</button>
+    </div>
     <div class="cae-row cae-actions">
-      <button type="button" class="ghost" data-cae="place">Place force</button>
       <button type="button" class="ghost" data-cae="solve">Solve</button>
       <button type="button" class="ghost" data-cae="clear">Clear</button>
+      <button type="button" class="ghost" data-cae="exportPdf" ${b.caeAnalysis ? '' : 'disabled'}>Export analysis PDF</button>
     </div>
-    <div class="cae-row cae-result">${b.caeSolveMsg ? escapeHtml(b.caeSolveMsg) : '<span class="cae-hint">Point load defaults to panel centre.</span>'}</div>
+    <div class="cae-row cae-result">${b.caeSolveMsg ? escapeHtml(b.caeSolveMsg) : '<span class="cae-hint">Add a load, support ≥2 edges (or add pins), then Solve.</span>'}</div>
   `;
 
-  // Force inputs
-  panel.querySelector<HTMLInputElement>('[data-cae="forceVal"]')!.addEventListener('change', (e) => {
-    b.caeForceVal = Math.max(0, parseFloat((e.target as HTMLInputElement).value) || 0);
+  // --- Per-load-row controls ---
+  panel.querySelectorAll<HTMLElement>('.cae-load-row').forEach((row) => {
+    const i = +row.dataset.load!;
+    const ld = b.caeLoads![i];
+    row.querySelector<HTMLInputElement>('[data-lf="val"]')!.addEventListener('change', (e) => {
+      ld.val = Math.max(0, parseFloat((e.target as HTMLInputElement).value) || 0);
+    });
+    row.querySelector<HTMLSelectElement>('[data-lf="unit"]')!.addEventListener('change', (e) => {
+      ld.unit = (e.target as HTMLSelectElement).value as CaeLoad['unit'];
+    });
+    row.querySelector<HTMLButtonElement>('[data-lf="dir"]')!.addEventListener('click', () => {
+      ld.down = !ld.down;
+      repaintCaeMarkers(b);
+      renderBodyList();
+    });
+    row.querySelector<HTMLSelectElement>('[data-lf="shape"]')!.addEventListener('change', (e) => {
+      ld.shape = (e.target as HTMLSelectElement).value as CaeLoad['shape'];
+      repaintCaeMarkers(b);
+    });
+    row.querySelector<HTMLInputElement>('[data-lf="size"]')!.addEventListener('change', (e) => {
+      const disp = Math.max(0, parseFloat((e.target as HTMLInputElement).value) || 0);
+      ld.sizeMm = toMm(disp, state.units);
+      repaintCaeMarkers(b);
+    });
+    row.querySelector<HTMLButtonElement>('[data-lf="place"]')!.addEventListener('click', (e) => {
+      const btn = e.target as HTMLButtonElement;
+      btn.classList.add('armed');
+      btn.textContent = 'Click…';
+      viewer.beginForcePlacement(b.id, (point) => {
+        ld.pt = worldToOutline(b, point);
+        repaintCaeMarkers(b);
+        renderBodyList();
+      });
+    });
+    row.querySelector<HTMLButtonElement>('[data-lf="remove"]')!.addEventListener('click', () => {
+      b.caeLoads!.splice(i, 1);
+      repaintCaeMarkers(b);
+      renderBodyList();
+    });
   });
-  panel.querySelector<HTMLSelectElement>('[data-cae="forceUnit"]')!.addEventListener('change', (e) => {
-    b.caeForceUnit = (e.target as HTMLSelectElement).value as 'N' | 'kg' | 'lbf';
+
+  panel.querySelector<HTMLButtonElement>('[data-cae="addLoad"]')!.addEventListener('click', () => {
+    b.caeLoads!.push(newCaeLoad());
+    repaintCaeMarkers(b);
+    renderBodyList();
+  });
+
+  panel.querySelector<HTMLInputElement>('[data-cae="uniformKg"]')!.addEventListener('change', (e) => {
+    b.caeUniformKg = Math.max(0, parseFloat((e.target as HTMLInputElement).value) || 0);
   });
 
   // Edge toggle buttons — cycle free→simple→fixed.
@@ -1044,28 +1213,27 @@ function buildCaePanel(b: BodyState): HTMLDivElement {
     btn.addEventListener('click', () => {
       const edge = btn.dataset.edge as keyof EdgeSupports;
       b.caeSupports![edge] = edgeCycle[b.caeSupports![edge]];
+      repaintCaeMarkers(b);
       renderBodyList();
     });
   });
 
-  // Place force — arm the viewer to capture the next click on this body.
-  panel.querySelector<HTMLButtonElement>('[data-cae="place"]')!.addEventListener('click', (e) => {
+  // --- Pins ---
+  panel.querySelectorAll<HTMLElement>('.cae-pin-row').forEach((row) => {
+    const i = +row.dataset.pin!;
+    row.querySelector<HTMLButtonElement>('[data-pf="remove"]')!.addEventListener('click', () => {
+      b.caePins!.splice(i, 1);
+      repaintCaeMarkers(b);
+      renderBodyList();
+    });
+  });
+  panel.querySelector<HTMLButtonElement>('[data-cae="addPin"]')!.addEventListener('click', (e) => {
     const btn = e.target as HTMLButtonElement;
     btn.classList.add('armed');
     btn.textContent = 'Click the panel…';
-    viewer.beginForcePlacement(b.id, (point, normal) => {
-      // Project the world click point onto the outline frame → (ox, oy).
-      const f = outlineFrame(b);
-      const rel: Vec3 = [point[0] - f.origin[0], point[1] - f.origin[1], point[2] - f.origin[2]];
-      const ox = rel[0] * f.uAxis[0] + rel[1] * f.uAxis[1] + rel[2] * f.uAxis[2];
-      const oy = rel[0] * f.vAxis[0] + rel[1] * f.vAxis[1] + rel[2] * f.vAxis[2];
-      b.caeLoadPt = {
-        x: Math.max(0, Math.min(b.analysis.outline.bbox.w, ox)),
-        y: Math.max(0, Math.min(b.analysis.outline.bbox.h, oy)),
-      };
-      const arrowLen = Math.max(30, Math.min(b.analysis.length, b.analysis.width) * 0.35);
-      viewer.showForceArrow(b.id, point, normal, arrowLen);
-      b.caeSolveMsg = `Force placed at (${fmtDim(b.caeLoadPt.x, state.units)}, ${fmtDim(b.caeLoadPt.y, state.units)}). Click Solve.`;
+    viewer.beginForcePlacement(b.id, (point) => {
+      b.caePins!.push(worldToOutline(b, point));
+      repaintCaeMarkers(b);
       renderBodyList();
     });
   });
@@ -1077,7 +1245,7 @@ function buildCaePanel(b: BodyState): HTMLDivElement {
     btn.textContent = 'Solving…';
     await new Promise((r) => setTimeout(r, 0));
     try {
-      runCaeSolve(b);
+      await runCaeSolve(b);
     } catch (err) {
       console.error('CAE solve failed', err);
       b.caeSolveMsg = 'Solve failed — see console.';
@@ -1085,36 +1253,95 @@ function buildCaePanel(b: BodyState): HTMLDivElement {
     renderBodyList();
   });
 
-  // Clear — remove overlay + arrow.
+  // Clear — remove overlay + all markers.
   panel.querySelector<HTMLButtonElement>('[data-cae="clear"]')!.addEventListener('click', () => {
     viewer.clearCae(b.id);
-    b.caeLoadPt = null;
+    for (const ld of b.caeLoads ?? []) ld.pt = null;
+    b.caePins = [];
     b.caeSolveMsg = undefined;
+    b.caeAnalysis = null;
+    repaintCaeMarkers(b);
     renderBodyList();
   });
+
+  // Export analysis PDF — one-page standalone report for this body.
+  panel.querySelector<HTMLButtonElement>('[data-cae="exportPdf"]')!.addEventListener('click', () => {
+    exportAnalysisPdf(b);
+  });
+
+  // Arm the in-3D edge picker while this panel is open, and paint markers.
+  const f = outlineFrame(b);
+  viewer.beginEdgePick(b.id, {
+    origin: f.origin, uAxis: f.uAxis, vAxis: f.vAxis,
+    w: b.analysis.outline.bbox.w, h: b.analysis.outline.bbox.h,
+  }, (edge) => {
+    b.caeSupports![edge] = edgeCycle[b.caeSupports![edge]];
+    repaintCaeMarkers(b);
+    renderBodyList();
+  });
+  // Paint after the DOM settles so outlineFrame is valid.
+  setTimeout(() => repaintCaeMarkers(b), 0);
 
   return panel;
 }
 
-/** Run the plate solve for a body, paint the heatmap + report the result. */
-function runCaeSolve(b: BodyState) {
-  const mat = bodyMaterial(b);
-  const forceN = forceToN(b.caeForceVal ?? 25, b.caeForceUnit ?? 'kg');
-  const bbox = b.analysis.outline.bbox;
-  const loadPt = b.caeLoadPt ?? { x: bbox.w / 2, y: bbox.h / 2 };
-  const supports = b.caeSupports ?? autoSupports(b);
-  const grainAlongLength = b.grain !== 'width'; // 'free'/'length' → grain along length
-
-  // Count constrained edges — a plate needs enough supports to prevent
-  // rigid-body motion. One simply-supported edge alone leaves the panel a
-  // mechanism (it can still tilt about the in-plane axis), so the solve
-  // diverges. Require either ≥1 fixed edge or ≥2 supported/fixed edges.
+/** Generalised constraint check — see the requirement. Returns null if OK, else
+ *  a message explaining what's missing. */
+function caeUnderConstrained(b: BodyState, supports: EdgeSupports): string | null {
   const edgeKinds = [supports.top, supports.bottom, supports.left, supports.right];
   const nFixed = edgeKinds.filter((k) => k === 'fixed').length;
   const nSupported = edgeKinds.filter((k) => k !== 'free').length;
-  if (nFixed === 0 && nSupported < 2) {
+  const pins = b.caePins ?? [];
+  const nPins = pins.length;
+  // ≥3 non-collinear pins?
+  let nonCollinearPins = false;
+  if (nPins >= 3) {
+    for (let i = 0; i < nPins && !nonCollinearPins; i++) {
+      for (let j = i + 1; j < nPins && !nonCollinearPins; j++) {
+        for (let k = j + 1; k < nPins; k++) {
+          const ax = pins[j].x - pins[i].x, ay = pins[j].y - pins[i].y;
+          const bx = pins[k].x - pins[i].x, by = pins[k].y - pins[i].y;
+          if (Math.abs(ax * by - ay * bx) > 1e-3) { nonCollinearPins = true; break; }
+        }
+      }
+    }
+  }
+  // 1 supported edge + ≥1 pin off that edge — treat any pin not exactly on the
+  // supported edge line as "off it".
+  const pinOffAnEdge = nSupported >= 1 && nPins >= 1;
+  const constrained =
+    nFixed >= 1 || nSupported >= 2 || nonCollinearPins || pinOffAnEdge;
+  if (constrained) return null;
+  return 'Under-constrained: fix an edge, support ≥2 edges, add ≥3 non-collinear pins, or combine a supported edge with a pin so the panel can\'t tip.';
+}
+
+/** Run the plate solve for a body, paint the heatmap, capture the analysis. */
+async function runCaeSolve(b: BodyState) {
+  const mat = bodyMaterial(b);
+  const bbox = b.analysis.outline.bbox;
+  const supports = b.caeSupports ?? autoSupports(b);
+  const grainAlongLength = b.grain !== 'width'; // 'free'/'length' → grain along length
+
+  const msg = caeUnderConstrained(b, supports);
+  if (msg) {
     viewer.clearDeflectionOverlay(b.id);
-    b.caeSolveMsg = 'Under-constrained: support at least two edges (or fix one) so the panel can\'t tip. Click an edge to add a support.';
+    b.caeSolveMsg = msg;
+    b.caeAnalysis = null;
+    return;
+  }
+
+  // Build the load list — signed magnitude for direction (down +, up −).
+  const loads = (b.caeLoads ?? []).filter((l) => l.val > 0).map((l) => {
+    const magN = forceToN(l.val, l.unit);
+    const pt = l.pt ?? { x: bbox.w / 2, y: bbox.h / 2 };
+    return { x: pt.x, y: pt.y, N: l.down ? magN : -magN, shape: l.shape, size: l.sizeMm };
+  });
+  const uniformKg = b.caeUniformKg ?? 0;
+
+  if (loads.length === 0 && uniformKg <= 0) {
+    viewer.clearDeflectionOverlay(b.id);
+    b.caeSolveMsg = 'No load — add a point load or a uniform kg first.';
+    b.caeAnalysis = null;
     return;
   }
 
@@ -1124,15 +1351,15 @@ function runCaeSolve(b: BodyState) {
     material: mat,
     grainAlongLength,
     supports,
-    forceN,
-    loadX: loadPt.x,
-    loadY: loadPt.y,
+    loads,
+    uniform: uniformKg > 0 ? { totalKg: uniformKg } : undefined,
+    pointSupports: b.caePins ?? [],
   });
 
   if (!res.converged || !Number.isFinite(res.maxAbsW) || res.maxAbsW > b.analysis.length) {
-    // Divergent / non-physical (usually still under-constrained). Don't paint.
     viewer.clearDeflectionOverlay(b.id);
-    b.caeSolveMsg = 'Solve did not converge — the supports leave the panel free to move. Add more edge supports.';
+    b.caeSolveMsg = 'Solve did not converge — the supports leave the panel free to move. Add more supports.';
+    b.caeAnalysis = null;
     return;
   }
 
@@ -1140,14 +1367,10 @@ function runCaeSolve(b: BodyState) {
   const tex = buildHeatTexture(res);
   const f = outlineFrame(b);
   viewer.showDeflectionOverlay(b.id, tex, {
-    origin: f.origin,
-    uAxis: f.uAxis,
-    vAxis: f.vAxis,
-    normal: f.normal,
-    w: bbox.w,
-    h: bbox.h,
-    thickness: b.analysis.thickness,
+    origin: f.origin, uAxis: f.uAxis, vAxis: f.vAxis, normal: f.normal,
+    w: bbox.w, h: bbox.h, thickness: b.analysis.thickness,
   });
+  repaintCaeMarkers(b);
 
   const span = Math.max(b.analysis.length, b.analysis.width);
   const limit = span / 200;
@@ -1156,6 +1379,50 @@ function runCaeSolve(b: BodyState) {
     `Max sag ${fmtSag(res.maxAbsW, state.units)} at ` +
     `(${fmtDim(res.maxAt[0], state.units)}, ${fmtDim(res.maxAt[1], state.units)}) — ` +
     `${verdict} vs span/200 (${fmtSag(limit, state.units)})`;
+
+  // Capture the analysis for the PDF — snapshot the body with its CAE overlay,
+  // white PDF background. Only this body visible so the heatmap fills the frame.
+  await captureCaeAnalysis(b, res, span, verdict);
+}
+
+/** Snapshot the solved body + overlay for the PDF and store the analysis. */
+async function captureCaeAnalysis(b: BodyState, res: import('./cae').SolveResult, span: number, verdict: string) {
+  await yieldFrame();
+  const SHOT = { w: 1200, h: 900 };
+  let heatmapPng = '', imgW = SHOT.w, imgH = SHOT.h;
+  viewer.enterPdfBg();
+  try {
+    viewer.beginSnapshotBatch(SHOT);
+    const shot = viewer.snapshotFiltered(new Set([b.id]), null, 0, undefined, SHOT);
+    heatmapPng = shot.dataUrl; imgW = shot.width; imgH = shot.height;
+  } catch (err) {
+    console.warn('CAE snapshot failed', err);
+  } finally {
+    viewer.endSnapshotBatch();
+    viewer.exitPdfBg();
+  }
+
+  const loads = (b.caeLoads ?? []).filter((l) => l.val > 0).map((l) => {
+    const pt = l.pt ?? { x: b.analysis.outline.bbox.w / 2, y: b.analysis.outline.bbox.h / 2 };
+    return {
+      magN: forceToN(l.val, l.unit), unit: l.unit,
+      magDisplay: `${l.val} ${l.unit}`,
+      shape: l.shape, sizeMm: l.sizeMm, down: l.down, x: pt.x, y: pt.y,
+    };
+  });
+
+  b.caeAnalysis = {
+    heatmapPng, imgW, imgH,
+    materialName: bodyMaterial(b).name,
+    loads,
+    uniformKg: b.caeUniformKg ?? 0,
+    supports: { ...(b.caeSupports ?? autoSupports(b)) },
+    pinCount: (b.caePins ?? []).length,
+    maxSagMm: res.maxAbsW,
+    maxAt: [res.maxAt[0], res.maxAt[1]],
+    spanMm: span,
+    verdict,
+  };
 }
 
 function syncViewerSelectionFromState() {
@@ -2035,6 +2302,78 @@ function buildStructureRows(idByBodyPartId: Map<string, string[]>): import('./pd
   return rows;
 }
 
+/** True when the user ran CAE this session (≥1 panel solved). Gates the whole
+ *  Structure + Analysis section in the job PDF. */
+function anyPanelSolved(): boolean {
+  return state.bodies.some((b) => !!b.caeAnalysis);
+}
+
+/** Convert a body's captured analysis to the PDF's CaePanelAnalysis. `codes`
+ *  are the panel labels this body placed (may be empty for standalone). */
+function toPanelAnalysis(b: BodyState, codes: string[]): CaePanelAnalysis | null {
+  const a = b.caeAnalysis;
+  if (!a) return null;
+  return {
+    code: codes.join(', '),
+    name: b.name,
+    image: { dataUrl: a.heatmapPng, width: a.imgW, height: a.imgH },
+    materialName: a.materialName,
+    loads: a.loads.map((l) => ({ magDisplay: l.magDisplay, shape: l.shape as 'square' | 'round', sizeMm: l.sizeMm, down: l.down, x: l.x, y: l.y })),
+    uniformKg: a.uniformKg,
+    supports: a.supports,
+    pinCount: a.pinCount,
+    maxSagMm: a.maxSagMm,
+    maxAt: a.maxAt,
+    spanMm: a.spanMm,
+    verdict: a.verdict,
+  };
+}
+
+/** Build the job-PDF Analysis pages: one per solved body, ordered like the
+ *  Structure table (weakest first). */
+function buildAnalyses(idByBodyPartId: Map<string, string[]>): CaePanelAnalysis[] {
+  const rank: Record<string, number> = { weak: 0, borderline: 1, ok: 2, OK: 0 };
+  const out: { an: CaePanelAnalysis; sag: number; v: number }[] = [];
+  for (const b of state.bodies) {
+    if (!b.caeAnalysis) continue;
+    const codes = idByBodyPartId.get(String(b.id)) ?? [];
+    const an = toPanelAnalysis(b, codes);
+    if (an) out.push({ an, sag: an.maxSagMm, v: rank[an.verdict] ?? 3 });
+  }
+  out.sort((a, b) => (a.v - b.v) || (b.sag - a.sag));
+  return out.map((o) => o.an);
+}
+
+/** Standalone Analysis PDF for one body. */
+function exportAnalysisPdf(b: BodyState) {
+  if (!b.caeAnalysis) return;
+  // Codes if this body was nested; else none.
+  const codes: string[] = [];
+  if (state.lastNest) {
+    for (const g of state.lastNest.groups) {
+      for (const s of g.sheets) {
+        for (const p of s.parts) {
+          if (p.partId === String(b.id)) codes.push(`${s.globalIndex}${p.panelLabel}`);
+        }
+      }
+    }
+  }
+  const an = toPanelAnalysis(b, codes);
+  if (!an) return;
+  const doc = buildAnalysisPdf(an, {
+    sheetW: state.lastSheet?.w ?? 2440,
+    sheetL: state.lastSheet?.l ?? 1220,
+    margin: state.lastSheet?.margin ?? 0,
+    kerf: state.lastSheet?.kerf ?? 0,
+    units: state.units,
+    jobName: state.jobName || 'Plywood cut estimate',
+    paper: (pdfPaperSelect.value as any) || 'widescreen-16-9',
+  });
+  const job = (state.jobName || 'plywood').replace(/[^a-z0-9_-]+/gi, '_').toLowerCase();
+  const tag = (codes[0] || b.name || `body_${b.id}`).replace(/[^a-z0-9_-]+/gi, '_').toLowerCase();
+  downloadPdf(`${job}_analysis_${tag}.pdf`, doc);
+}
+
 function buildSplitJoins(): SplitJoinGroup[] {
   if (!state.lastNest || state.splitSegmentGeo.size === 0) return [];
   // First placement of each segment id → its sheet + label.
@@ -2389,7 +2728,6 @@ async function exportPdf(btn: HTMLButtonElement, paper: string) {
   const setProgress = (label: string, pct: number) => {
     btn.innerHTML = `<span class="progress-bar"><span class="progress-fill" style="width:${pct.toFixed(0)}%"></span></span><span class="progress-label">${label}</span>`;
   };
-  const yieldFrame = () => new Promise<void>((r) => requestAnimationFrame(() => r()));
   setProgress('Preparing…', 5);
   await yieldFrame();
 
@@ -2474,9 +2812,13 @@ async function exportPdf(btn: HTMLButtonElement, paper: string) {
     }
   }
 
-  // Structure rows — one per body, with the screening sag verdict under the
-  // default 20 kg uniform load. Codes list every placed instance of the body.
-  const structure = buildStructureRows(idByBodyPartId);
+  // Structure + Analysis are ONLY included when the user actually ran CAE this
+  // session (≥1 panel solved). If nobody solved, the job PDF has no Structure
+  // table, no Analysis pages, and no TOC entries for them — as if the feature
+  // didn't exist. The live sidebar screening line + weak badges are unaffected.
+  const caeRan = anyPanelSolved();
+  const structure = caeRan ? buildStructureRows(idByBodyPartId) : undefined;
+  const analyses = caeRan ? buildAnalyses(idByBodyPartId) : undefined;
 
   // Use a clean WHITE scene background + faint shadow floor for all PDF
   // snapshots — the dark studio backdrop the live viewer uses prints
@@ -2586,6 +2928,7 @@ async function exportPdf(btn: HTMLButtonElement, paper: string) {
     cnc: isCncStrategy(state.lastStrategy),
     splitJoins: buildSplitJoins(),
     structure,
+    analyses,
   });
   setProgress('Saving…', 98);
   await yieldFrame();

@@ -63,8 +63,48 @@ export interface PdfOptions {
   splitJoins?: SplitJoinGroup[];
   /** Quick-CAE structural screening rows for the Structure section. One row
    *  per panel size; sag is the formula-screening estimate under the default
-   *  uniform load. */
+   *  uniform load. Only present when the user actually ran CAE this session —
+   *  otherwise the whole Structure/Analysis feature is absent from the PDF. */
   structure?: StructureRow[];
+  /** One entry per SOLVED panel — a full CAE analysis page (heatmap image +
+   *  inputs/results block). Rendered right after the Structure table. */
+  analyses?: CaePanelAnalysis[];
+}
+
+/** A load line for the Analysis page inputs block. */
+export interface CaeAnalysisLoad {
+  /** Human magnitude, e.g. "25 kg". */
+  magDisplay: string;
+  shape: 'square' | 'round';
+  /** Footprint size in mm. */
+  sizeMm: number;
+  /** True → downward force (↓); false → upward reaction (↑). */
+  down: boolean;
+  /** Placement in outline mm. */
+  x: number;
+  y: number;
+}
+
+/** Everything needed to render one panel's Analysis page. */
+export interface CaePanelAnalysis {
+  /** Panel code(s), e.g. "1a, 3b" (empty for standalone bodies not nested). */
+  code: string;
+  /** Panel display name. */
+  name: string;
+  /** Heatmap snapshot (deflection fringe over the body, white bg). */
+  image: SnapshotImage;
+  materialName: string;
+  loads: CaeAnalysisLoad[];
+  /** Uniform load in kg (0 = none). */
+  uniformKg: number;
+  supports: { top: string; bottom: string; left: string; right: string };
+  pinCount: number;
+  /** Max sag (mm) and its location in outline mm. */
+  maxSagMm: number;
+  maxAt: [number, number];
+  /** Free span (mm) used for the verdict. */
+  spanMm: number;
+  verdict: string;
 }
 
 export interface StructureRow {
@@ -289,6 +329,22 @@ export function buildPdf(result: NestResult, opt: PdfOptions): jsPDF {
     addPage('Structure');
     nav.toc.push({ title: 'Structure', desc: 'Predicted sag per panel under a loaded-shelf assumption.', target: 'Structure' });
     drawStructureTable(doc, opt.structure, opt, dims, () => addPage('Structure'));
+  }
+
+  // 5c. ANALYSIS — one page per SOLVED panel (heatmap + inputs/results). Only
+  //     present when the user ran CAE this session (opt.analyses non-empty).
+  if (opt.analyses && opt.analyses.length > 0) {
+    opt.analyses.forEach((an, i) => {
+      const sectionName = `Analysis ${i + 1}`;
+      addPage(sectionName);
+      const codeLabel = an.code ? ` ${an.code}` : '';
+      nav.toc.push({
+        title: `Analysis${codeLabel} · ${an.name}`,
+        desc: 'Deflection heatmap with load and support inputs.',
+        target: sectionName,
+      });
+      drawAnalysisPage(doc, an, opt, dims);
+    });
   }
 
   // 6. CUT SHEETS grouped by thickness — divider page per group when the job
@@ -1880,6 +1936,134 @@ function drawStructureTable(
   doc.setTextColor(0);
 }
 
+// ---------------------------------------------------------------------------
+// CAE Analysis page — heatmap image + a compact inputs/results block in the
+// same hairline table style as Structure. One page per solved panel.
+// ---------------------------------------------------------------------------
+function drawAnalysisPage(
+  doc: jsPDF,
+  an: CaePanelAnalysis,
+  opt: PdfOptions,
+  dims: { w: number; h: number },
+) {
+  const PAGE_W = dims.w;
+  const PAGE_H = dims.h;
+
+  // Header
+  doc.setFont('helvetica', 'bold');
+  doc.setFontSize(13);
+  doc.setTextColor(20);
+  const title = an.code ? `Analysis — ${an.code} · ${an.name}` : `Analysis — ${an.name}`;
+  doc.text(clip(doc, title, PAGE_W - 2 * PAGE_PAD - 200), PAGE_PAD, PAGE_PAD + 10);
+  doc.setFont('helvetica', 'normal');
+  doc.setFontSize(9);
+  doc.setTextColor(120);
+  doc.text('Predicted deflection under the placed loads and supports.', PAGE_W - PAGE_PAD, PAGE_PAD + 10, { align: 'right' });
+  doc.setTextColor(0);
+
+  const TOP = PAGE_PAD + 30;
+  const BOTTOM = PAGE_H - PAGE_PAD;
+  // Left column: heatmap image. Right column: inputs/results table.
+  const gutter = 20;
+  const imgColW = Math.min((PAGE_W - 2 * PAGE_PAD) * 0.56, 640);
+  const imgLeft = PAGE_PAD;
+  const tableLeft = imgLeft + imgColW + gutter;
+  const tableRight = PAGE_W - PAGE_PAD;
+
+  // Heatmap image, aspect-fit into its column.
+  if (an.image && an.image.dataUrl) {
+    const availH = BOTTOM - TOP;
+    const aspect = an.image.width / an.image.height || 4 / 3;
+    let iw = imgColW;
+    let ih = iw / aspect;
+    if (ih > availH) { ih = availH; iw = ih * aspect; }
+    doc.setDrawColor(225);
+    doc.setLineWidth(0.5);
+    doc.rect(imgLeft, TOP, iw, ih);
+    try {
+      doc.addImage(an.image.dataUrl, 'JPEG', imgLeft, TOP, iw, ih);
+    } catch {
+      // ignore image failures — the table still prints
+    }
+  }
+
+  // Inputs / results block — hairline rows: LABEL … VALUE.
+  let y = TOP + 4;
+  const rowH = 18;
+  const line = () => {
+    doc.setDrawColor(235); doc.setLineWidth(0.4);
+    doc.line(tableLeft, y + 4, tableRight, y + 4);
+  };
+  const section = (t: string) => {
+    doc.setFont('helvetica', 'bold'); doc.setFontSize(8.5); doc.setTextColor(110);
+    doc.text(t.toUpperCase(), tableLeft, y);
+    doc.setDrawColor(215); doc.setLineWidth(0.5);
+    doc.line(tableLeft, y + 4, tableRight, y + 4);
+    doc.setTextColor(0);
+    y += rowH;
+  };
+  const kv = (k: string, v: string, color?: [number, number, number]) => {
+    doc.setFont('helvetica', 'normal'); doc.setFontSize(9.5); doc.setTextColor(90);
+    doc.text(k, tableLeft, y);
+    doc.setFont('helvetica', 'bold');
+    if (color) doc.setTextColor(...color); else doc.setTextColor(30);
+    doc.text(clip(doc, v, tableRight - tableLeft - 130), tableRight, y, { align: 'right' });
+    doc.setTextColor(0);
+    line();
+    y += rowH;
+  };
+
+  section('Inputs');
+  kv('Material', an.materialName);
+  const supLabel: Record<string, string> = { free: 'free', simple: 'supported', fixed: 'fixed' };
+  kv('Edges (T/B/L/R)',
+    `${supLabel[an.supports.top]} / ${supLabel[an.supports.bottom]} / ${supLabel[an.supports.left]} / ${supLabel[an.supports.right]}`);
+  kv('Pins', an.pinCount > 0 ? `${an.pinCount}` : 'none');
+  if (an.uniformKg > 0) kv('Uniform load', `${an.uniformKg.toFixed(0)} kg over face`);
+
+  // Loads sub-list.
+  if (an.loads.length > 0) {
+    doc.setFont('helvetica', 'bold'); doc.setFontSize(8.5); doc.setTextColor(110);
+    doc.text('LOADS', tableLeft, y);
+    doc.setDrawColor(235); doc.setLineWidth(0.4); doc.line(tableLeft, y + 4, tableRight, y + 4);
+    doc.setTextColor(0); y += rowH;
+    an.loads.forEach((ld, i) => {
+      // jsPDF's core Helvetica has no Unicode arrows/shapes — use ASCII labels.
+      const dir = ld.down ? 'down' : 'up';
+      const shape = ld.shape === 'round' ? 'round' : 'square';
+      const label = `${i + 1}. ${ld.magDisplay} ${dir}`;
+      const detail = `${shape} ${fmtDim(ld.sizeMm, opt.units)} @ (${fmtDim(ld.x, opt.units)}, ${fmtDim(ld.y, opt.units)})`;
+      doc.setFont('helvetica', 'normal'); doc.setFontSize(9); doc.setTextColor(60);
+      doc.text(clip(doc, label, (tableRight - tableLeft) * 0.42), tableLeft, y);
+      doc.text(clip(doc, detail, (tableRight - tableLeft) * 0.55), tableRight, y, { align: 'right' });
+      doc.setDrawColor(240); doc.setLineWidth(0.35); doc.line(tableLeft, y + 4, tableRight, y + 4);
+      y += rowH - 2;
+    });
+    y += 4;
+  }
+
+  y += 6;
+  section('Results');
+  const verdictColor: Record<string, [number, number, number]> = {
+    ok: [15, 123, 108], OK: [15, 123, 108],
+    borderline: [217, 115, 13], weak: [192, 57, 43],
+  };
+  kv('Max sag', fmtSag(an.maxSagMm, opt.units));
+  kv('At', `(${fmtDim(an.maxAt[0], opt.units)}, ${fmtDim(an.maxAt[1], opt.units)})`);
+  kv('Span', fmtDim(an.spanMm, opt.units));
+  kv('Verdict', an.verdict.toUpperCase(), verdictColor[an.verdict] ?? [30, 30, 30]);
+  doc.setTextColor(0);
+}
+
+/** Standalone one-page Analysis PDF for a single body. */
+export function buildAnalysisPdf(an: CaePanelAnalysis, opt: PdfOptions): jsPDF {
+  const paper = opt.paper ?? 'widescreen-16-9';
+  const dims = PAPER_DIMS[paper === 'mobile' ? 'widescreen-16-9' : paper];
+  const doc = new jsPDF({ orientation: dims.orient, unit: 'pt', format: dims.format });
+  drawAnalysisPage(doc, an, opt, dims);
+  return doc;
+}
+
 /** Truncate `text` to fit `maxW` pt, appending an ellipsis if clipped. */
 function clip(doc: jsPDF, text: string, maxW: number): string {
   if (doc.getTextWidth(text) <= maxW) return text;
@@ -2488,7 +2672,7 @@ function drawHeaderFooter(
   doc.setDrawColor(225);
   doc.line(PAGE_PAD, fy - 8, PAGE_W - PAGE_PAD, fy - 8);
   doc.setTextColor(140);
-  doc.text('plywood-estimator', PAGE_PAD, fy);
+  doc.text('furniture-companion', PAGE_PAD, fy);
   doc.text(`Page ${pageNum} of ${pageTotal}`, PAGE_W / 2, fy, { align: 'center' });
   doc.text(dateStr, PAGE_W - PAGE_PAD, fy, { align: 'right' });
   doc.setTextColor(0);

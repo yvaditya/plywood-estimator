@@ -1,4 +1,4 @@
-# Plywood Estimator
+# Furniture Companion
 
 A browser app for cabinet builders and woodworkers.
 Drop one or more STEP files → pick the panel bodies → get optimized cut
