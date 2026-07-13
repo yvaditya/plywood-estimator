@@ -79,6 +79,15 @@
                 <option value="mm">mm</option>
               </select>
             </label>
+            <label style="grid-column: 1 / -1">Material
+              <select id="material"></select>
+            </label>
+          </div>
+        </section>
+
+        <section class="panel panel--group" data-group="cutting">
+          <h2><span class="panel-dot" aria-hidden="true"></span>Cutting</h2>
+          <div class="grid2">
             <label>Edge margin <input id="margin" type="number" value="0.5" step="0.0625" /></label>
             <label>Kerf / spacing
               <select id="kerfSelect">
@@ -90,15 +99,6 @@
             <label id="kerfCustomRow" style="grid-column: 1 / -1" hidden>Custom kerf
               <input id="kerf" type="number" value="0.125" step="0.0156" />
             </label>
-            <label style="grid-column: 1 / -1">Material
-              <select id="material"></select>
-            </label>
-          </div>
-        </section>
-
-        <section class="panel panel--group" data-group="cutting">
-          <h2><span class="panel-dot" aria-hidden="true"></span>Cutting</h2>
-          <div class="grid2">
             <label style="grid-column: 1 / -1">Cut strategy
               <select id="cutStrategy">
                 <option value="free">Max yield (any cuts)</option>
