@@ -110,34 +110,52 @@ function applyStepToRegions(step: CutStep, sheetW: number, sheetL: number, regio
   return out;
 }
 
-/** Does `step`'s parent piece exist after executing `prefix` (trims + earlier
- *  layout cuts) over the full sheet? */
-function parentReady(step: CutStep, prefix: CutStep[], sheetW: number, sheetL: number): boolean {
+/** Region state after the trims, in the LAYOUT frame.
+ *
+ *  Frame note: layout-cut parents live in the USABLE frame (both margins
+ *  removed), but the trims never cut the FAR short edge — its margin falls
+ *  off with the layout cuts. After replaying the trims we therefore shave
+ *  that margin off any region still touching the raw far edge, otherwise no
+ *  layout parent ever matches (width off by exactly one margin). */
+function seedRegions(trims: CutStep[], sheetW: number, sheetL: number, margin: number): Region[] {
   let regions: Region[] = [{ x: 0, y: 0, w: sheetW, h: sheetL }];
-  for (const s of prefix) regions = applyStepToRegions(s, sheetW, sheetL, regions);
+  for (const s of trims) regions = applyStepToRegions(s, sheetW, sheetL, regions);
+  if (margin > 0) {
+    const lengthIsY = sheetL >= sheetW;
+    for (const r of regions) {
+      if (!lengthIsY && Math.abs(r.x + r.w - sheetW) < 0.5) r.w -= margin;
+      if (lengthIsY && Math.abs(r.y + r.h - sheetL) < 0.5) r.h -= margin;
+    }
+  }
+  return regions;
+}
+
+function matchParent(regions: Region[], step: CutStep): boolean {
   return regions.some((r) =>
     Math.abs(r.x - step.parentX) < 1 && Math.abs(r.y - step.parentY) < 1 &&
     Math.abs(r.w - step.parentW) < 1 && Math.abs(r.h - step.parentH) < 1,
   );
 }
 
+/** Is a full candidate layout ORDER physically executable? Replays every cut
+ *  in sequence and requires each one's parent piece to exist at its turn —
+ *  this covers both the moved cut AND every cut it displaces. */
+function sequenceLegal(layout: CutStep[], trims: CutStep[], sheetW: number, sheetL: number, margin: number): boolean {
+  let regions = seedRegions(trims, sheetW, sheetL, margin);
+  for (const s of layout) {
+    if (!matchParent(regions, s)) return false;
+    regions = applyStepToRegions(s, sheetW, sheetL, regions);
+  }
+  return true;
+}
+
 /**
  * Is moving the layout cut at `fromIdx` (index within the LAYOUT tail) to
- * `toIdx` legal? Per the spec: "a cut may only move to a position where its
- * PARENT PIECE already exists" — we replay the executed prefix (trims + the
- * layout cuts that end up BEFORE it in the new order) over regions and
- * require the moved cut's parent rect to match a live region within 1 mm
- * (the countFreedParts technique). This forbids a cut from leap-frogging the
- * cut that produces its parent, while letting a cut slide anywhere its parent
- * piece is already on the bench.
- *
- * Additionally, a cut may not be dragged BEFORE any earlier cut whose parent
- * IT produces — otherwise that earlier cut would be stranded. That case is
- * exactly "the displaced cut's parent no longer exists at its position", so a
- * move is rejected if the immediate neighbour it displaces (the cut now at
- * `fromIdx`'s old slot direction) loses its parent. We check the single cut
- * that ends up where the moved cut left, which is the only one whose prefix
- * shrank; cuts further away keep an unchanged-or-superset prefix.
+ * `toIdx` legal? Build the candidate order and validate the WHOLE sequence:
+ * every cut's parent piece must exist at its turn. That covers the moved cut
+ * (it can't leap-frog the cut that produces its parent) AND every displaced
+ * cut (a cut can't be pulled in front of an earlier cut whose parent it
+ * produces).
  */
 function reorderLegal(
   layout: CutStep[],
@@ -146,19 +164,14 @@ function reorderLegal(
   toIdx: number,
   sheetW: number,
   sheetL: number,
+  margin: number,
 ): boolean {
   if (fromIdx === toIdx) return true;
   if (toIdx < 0 || toIdx >= layout.length) return false;
   const next = layout.slice();
   const [moved] = next.splice(fromIdx, 1);
   next.splice(toIdx, 0, moved);
-  // The moved cut's parent must already exist at its destination — replay the
-  // trims + the layout cuts now before it and require a matching live region.
-  // (This is the exact rule the spec calls out: "a cut may only move to a
-  // position where its parent piece already exists".) A cut therefore can't be
-  // pulled in front of the cut that PRODUCES its parent — that cut would land
-  // after it, so the parent region wouldn't exist yet and the check fails.
-  return parentReady(moved, [...trims, ...next.slice(0, toIdx)], sheetW, sheetL);
+  return sequenceLegal(next, trims, sheetW, sheetL, margin);
 }
 
 // ---------------------------------------------------------------------------
@@ -303,7 +316,7 @@ function humanSummary(s: CutStep, ctx: CutEditorContext): string {
 function doReorder(fromLayoutIdx: number, toLayoutIdx: number): boolean {
   if (!session) return false;
   const { layout, trims, ctx } = session;
-  if (!reorderLegal(layout, trims, fromLayoutIdx, toLayoutIdx, ctx.sheet.sheetW, ctx.sheet.sheetL)) {
+  if (!reorderLegal(layout, trims, fromLayoutIdx, toLayoutIdx, ctx.sheet.sheetW, ctx.sheet.sheetL, ctx.margin)) {
     return false;
   }
   const moved = layout[fromLayoutIdx];
@@ -640,8 +653,8 @@ function renderList(): void {
     if (isLayout) {
       const upBtn = row.querySelector('[data-act="up"]') as HTMLButtonElement;
       const downBtn = row.querySelector('[data-act="down"]') as HTMLButtonElement;
-      const canUp = layoutIdx > 0 && reorderLegal(session!.layout, session!.trims, layoutIdx, layoutIdx - 1, ctx.sheet.sheetW, ctx.sheet.sheetL);
-      const canDown = layoutIdx < session!.layout.length - 1 && reorderLegal(session!.layout, session!.trims, layoutIdx, layoutIdx + 1, ctx.sheet.sheetW, ctx.sheet.sheetL);
+      const canUp = layoutIdx > 0 && reorderLegal(session!.layout, session!.trims, layoutIdx, layoutIdx - 1, ctx.sheet.sheetW, ctx.sheet.sheetL, ctx.margin);
+      const canDown = layoutIdx < session!.layout.length - 1 && reorderLegal(session!.layout, session!.trims, layoutIdx, layoutIdx + 1, ctx.sheet.sheetW, ctx.sheet.sheetL, ctx.margin);
       upBtn.disabled = !canUp;
       downBtn.disabled = !canDown;
     }
@@ -688,7 +701,7 @@ function renderList(): void {
         e.preventDefault();
         const from = dragSourceLayoutIdx();
         if (from < 0) return;
-        const legal = reorderLegal(session!.layout, session!.trims, from, layoutIdx, ctx.sheet.sheetW, ctx.sheet.sheetL);
+        const legal = reorderLegal(session!.layout, session!.trims, from, layoutIdx, ctx.sheet.sheetW, ctx.sheet.sheetL, ctx.margin);
         row.classList.toggle('drop-ok', legal);
         row.classList.toggle('drop-bad', !legal);
       });
