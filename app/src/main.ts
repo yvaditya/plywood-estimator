@@ -114,6 +114,10 @@ interface AssemblyAnalysis {
   heatmapPng: string;
   imgW: number;
   imgH: number;
+  /** Second heatmap: von-Mises stress field (same view). '' if capture failed. */
+  stressPng: string;
+  stressImgW: number;
+  stressImgH: number;
   cabinetTag: string;
   panelCount: number;
   joints: { labelA: string; labelB: string; length: number; stiffness: string }[];
@@ -124,6 +128,15 @@ interface AssemblyAnalysis {
   maxAt: [number, number];
   spanMm: number;
   verdict: string;
+  /** Max von-Mises surface stress (MPa) + governing panel + location. */
+  maxVmMPa: number;
+  maxVmPanelLabel: string;
+  maxVmAt: [number, number];
+  /** Utilization % vs the material bending strengths + its verdict. */
+  utilPct: number;
+  stressVerdict: string;
+  /** Combined verdict (worst of deflection + stress). */
+  combinedVerdict: string;
   resolutionLog: string;
   iterations: number;
 }
@@ -144,6 +157,12 @@ interface AsmState {
   analysis: AssemblyAnalysis | null;
   /** True once "Detect joints" has run for the current cabinet. */
   detected: boolean;
+  /** Which field the heatmap paints (segmented toggle, post-solve). */
+  field: 'deflection' | 'stress';
+  /** Cached last solve result + the panel bodies it covered, so the field
+   *  toggle can re-texture the overlays WITHOUT re-solving. Cleared whenever
+   *  joints/loads change (same lifecycle as `analysis`). */
+  lastSolve: { res: ReturnType<typeof solveAssembly>; panelIds: number[] } | null;
 }
 
 const state: {
@@ -203,7 +222,7 @@ const state: {
   splitSegmentGeo: new Map(),
   splitInfo: [],
   jobMaterial: DEFAULT_MATERIAL_ID,
-  asm: { cabinet: null, tolMm: 2, joints: [], loads: [], solveMsg: '', analysis: null, detected: false },
+  asm: { cabinet: null, tolMm: 2, joints: [], loads: [], solveMsg: '', analysis: null, detected: false, field: 'deflection', lastSolve: null },
 };
 
 // --------------------------------------------------------------------------
@@ -752,7 +771,7 @@ function clearAll() {
   state.partLabels = new Map();
   nextBodyId = 0;
   cumulativeRightX = 0;
-  state.asm = { cabinet: null, tolMm: state.asm.tolMm, joints: [], loads: [], solveMsg: '', analysis: null, detected: false };
+  state.asm = { cabinet: null, tolMm: state.asm.tolMm, joints: [], loads: [], solveMsg: '', analysis: null, detected: false, field: state.asm.field, lastSolve: null };
   viewer.clearAssemblyOverlay();
   viewer.clear();
   renderBodyList();
@@ -1048,11 +1067,14 @@ function heatColor(t: number): [number, number, number] {
   return stops[stops.length - 1][1];
 }
 
-/** Build a CanvasTexture of one panel's deflection field for the overlay. The
- *  `denom` is the WHOLE-ASSEMBLY max displacement so every panel shares one
- *  colour scale (a global fringe plot). */
-function buildAsmHeatTexture(pr: AsmPanelResult, denom: number): THREE.CanvasTexture {
-  const { nx, ny, disp, active } = pr;
+/** Build a CanvasTexture of one panel's result field for the overlay. `field`
+ *  selects deflection or von-Mises stress; `denom` is the WHOLE-ASSEMBLY max of
+ *  that field so every panel shares one colour scale (a global fringe plot). */
+function buildAsmHeatTexture(
+  pr: AsmPanelResult, denom: number, field: 'deflection' | 'stress',
+): THREE.CanvasTexture {
+  const { nx, ny, active } = pr;
+  const data = field === 'stress' ? pr.vm : pr.disp;
   const canvas = document.createElement('canvas');
   canvas.width = nx;
   canvas.height = ny;
@@ -1064,11 +1086,11 @@ function buildAsmHeatTexture(pr: AsmPanelResult, denom: number): THREE.CanvasTex
       const n = iy * nx + ix;
       // Flip Y so texture V matches outline +Y (canvas is top-down).
       const dst = ((ny - 1 - iy) * nx + ix) * 4;
-      if (!active[n] || Number.isNaN(disp[n])) {
+      if (!active[n] || Number.isNaN(data[n])) {
         img.data[dst + 3] = 0; // transparent outside the part
         continue;
       }
-      const [r, g, bl] = heatColor(Math.abs(disp[n]) / d);
+      const [r, g, bl] = heatColor(Math.abs(data[n]) / d);
       img.data[dst] = r;
       img.data[dst + 1] = g;
       img.data[dst + 2] = bl;
@@ -1121,6 +1143,20 @@ const asmSolveBtn = $<HTMLButtonElement>('asmSolveBtn');
 const asmClearBtn = $<HTMLButtonElement>('asmClearBtn');
 const asmExportBtn = $<HTMLButtonElement>('asmExportBtn');
 const asmResult = $('asmResult');
+const asmFieldToggle = $('asmFieldToggle');
+const asmFieldDefl = $<HTMLButtonElement>('asmFieldDefl');
+const asmFieldStress = $<HTMLButtonElement>('asmFieldStress');
+
+/** Switch the heatmap field (Deflection/Stress). Re-textures from the cached
+ *  solve — no re-solve. Updates the result line's leading emphasis too. */
+function setAsmField(field: 'deflection' | 'stress') {
+  if (state.asm.field === field) return;
+  state.asm.field = field;
+  paintAsmField(field);
+  renderAnalysisSection();
+}
+asmFieldDefl.addEventListener('click', () => setAsmField('deflection'));
+asmFieldStress.addEventListener('click', () => setAsmField('stress'));
 
 /** Distinct cabinet tags that currently have ≥1 selected sheet body. */
 function analysisCabinets(): string[] {
@@ -1205,6 +1241,7 @@ function detectAssemblyJoints() {
     : 'No touching panel edges found. Raise the join tolerance if panels should be joined.';
   // Clear a stale solved overlay/result — joints changed.
   state.asm.analysis = null;
+  state.asm.lastSolve = null;
   viewer.clearAssemblyOverlay();
   paintAssemblyPreview();
   renderAnalysisSection();
@@ -1349,61 +1386,109 @@ async function solveAssemblyForCabinet() {
     viewer.clearDeflectionOverlay(-1); // no-op safety
     for (const b of panels) viewer.clearDeflectionOverlay(b.id);
     state.asm.analysis = null;
+    state.asm.lastSolve = null;
     state.asm.solveMsg = res.message ?? 'Solve failed.';
     renderAnalysisSection();
     return;
   }
 
-  // Paint the whole-assembly heatmap: one shared colour scale (res.maxDisp).
-  for (const b of panels) viewer.clearDeflectionOverlay(b.id);
-  const prById = new Map(res.panels.map((p) => [p.id, p] as const));
-  for (const b of panels) {
-    const pr = prById.get(b.id);
-    if (!pr) continue;
-    const tex = buildAsmHeatTexture(pr, res.maxDisp);
-    const f = outlineFrame(b);
-    viewer.showDeflectionOverlay(b.id, tex, {
-      origin: f.origin, uAxis: f.uAxis, vAxis: f.vAxis, normal: f.normal,
-      w: b.analysis.outline.bbox.w, h: b.analysis.outline.bbox.h, thickness: b.analysis.thickness,
-    });
-  }
+  // Cache the result so the Deflection/Stress field toggle can re-texture the
+  // overlays without re-solving, then paint the current field.
+  state.asm.lastSolve = { res, panelIds: panels.map((b) => b.id) };
+  paintAsmField(state.asm.field);
   paintAssemblyPreview();
 
   const maxBody = byId.get(res.maxPanelId);
   const maxLabel = maxBody ? panelLabel(maxBody) : '?';
-  const limit = res.spanMm / 200;
-  state.asm.solveMsg =
-    `Max deflection ${fmtSag(res.maxDisp, state.units)} on ${maxLabel} at ` +
-    `(${fmtDim(res.maxAt[0], state.units)}, ${fmtDim(res.maxAt[1], state.units)}) — ` +
-    `${res.verdict.toUpperCase()} vs span/200 (${fmtSag(limit, state.units)})`;
+  const vmBody = byId.get(res.maxVmPanelId);
+  const vmLabel = vmBody ? panelLabel(vmBody) : '?';
+  state.asm.solveMsg = assemblyResultLine(res, maxLabel, vmLabel);
 
-  await captureAssemblyAnalysis(res, panels, maxLabel);
+  await captureAssemblyAnalysis(res, panels, maxLabel, vmLabel);
   renderAnalysisSection();
 }
 
-/** Snapshot the solved cabinet + overlay for the PDF and store the analysis. */
+/** Combined deflection + stress result line, verdict = worst of the two. */
+function assemblyResultLine(
+  res: ReturnType<typeof solveAssembly>, maxLabel: string, vmLabel: string,
+): string {
+  const rank: Record<string, number> = { ok: 0, borderline: 1, weak: 2 };
+  const worst = rank[res.verdict] >= rank[res.stressVerdict] ? res.verdict : res.stressVerdict;
+  const limit = res.spanMm / 200;
+  return (
+    `Max deflection ${fmtSag(res.maxDisp, state.units)} on ${maxLabel} ` +
+    `(vs span/200 ${fmtSag(limit, state.units)}). ` +
+    `Max stress ${res.maxVm.toFixed(res.maxVm < 10 ? 1 : 0)} MPa on ${vmLabel} ` +
+    `(util ${Math.round(res.utilPct)}%). ` +
+    `${worst.toUpperCase()}`
+  );
+}
+
+/** Verdict class (cae-ok/borderline/weak) = worst of deflection + stress. */
+function assemblyWorstVerdict(res: ReturnType<typeof solveAssembly>): 'ok' | 'borderline' | 'weak' {
+  const rank: Record<string, number> = { ok: 0, borderline: 1, weak: 2 };
+  return rank[res.verdict] >= rank[res.stressVerdict] ? res.verdict : res.stressVerdict;
+}
+
+/** Paint the cached solve's chosen field onto every cabinet panel overlay. One
+ *  shared colour scale (the field's whole-assembly max). No re-solve. */
+function paintAsmField(field: 'deflection' | 'stress') {
+  const cached = state.asm.lastSolve;
+  if (!cached || !cached.res.ok) return;
+  const { res } = cached;
+  const denom = field === 'stress' ? res.maxVm : res.maxDisp;
+  const prById = new Map(res.panels.map((p) => [p.id, p] as const));
+  for (const id of cached.panelIds) {
+    const b = state.bodies.find((x) => x.id === id);
+    const pr = prById.get(id);
+    viewer.clearDeflectionOverlay(id);
+    if (!b || !pr) continue;
+    const tex = buildAsmHeatTexture(pr, denom, field);
+    const f = outlineFrame(b);
+    viewer.showDeflectionOverlay(id, tex, {
+      origin: f.origin, uAxis: f.uAxis, vAxis: f.vAxis, normal: f.normal,
+      w: b.analysis.outline.bbox.w, h: b.analysis.outline.bbox.h, thickness: b.analysis.thickness,
+    });
+  }
+}
+
+/** Snapshot the solved cabinet with BOTH field overlays (deflection + stress)
+ *  for the PDF and store the analysis. Restores the on-screen field after. */
 async function captureAssemblyAnalysis(
-  res: ReturnType<typeof solveAssembly>, panels: BodyState[], maxLabel: string,
+  res: ReturnType<typeof solveAssembly>, panels: BodyState[], maxLabel: string, vmLabel: string,
 ) {
   await yieldFrame();
   const SHOT = { w: 1400, h: 1000 };
-  let heatmapPng = '', imgW = SHOT.w, imgH = SHOT.h;
   const visibleIds = new Set(panels.map((b) => b.id));
-  viewer.enterPdfBg();
-  try {
-    viewer.beginSnapshotBatch(SHOT);
-    const shot = viewer.snapshotFiltered(visibleIds, null, 0, undefined, SHOT);
-    heatmapPng = shot.dataUrl; imgW = shot.width; imgH = shot.height;
-  } catch (err) {
-    console.warn('assembly snapshot failed', err);
-  } finally {
-    viewer.endSnapshotBatch();
-    viewer.exitPdfBg();
-  }
+
+  const shotField = (field: 'deflection' | 'stress'): { png: string; w: number; h: number } => {
+    paintAsmField(field);
+    let png = '', w = SHOT.w, h = SHOT.h;
+    viewer.enterPdfBg();
+    try {
+      viewer.beginSnapshotBatch(SHOT);
+      const shot = viewer.snapshotFiltered(visibleIds, null, 0, undefined, SHOT);
+      png = shot.dataUrl; w = shot.width; h = shot.height;
+    } catch (err) {
+      console.warn(`assembly ${field} snapshot failed`, err);
+    } finally {
+      viewer.endSnapshotBatch();
+      viewer.exitPdfBg();
+    }
+    return { png, w, h };
+  };
+
+  const defl = shotField('deflection');
+  await yieldFrame();
+  const stress = shotField('stress');
+  // Restore the field the user was viewing.
+  paintAsmField(state.asm.field);
+
   const byId = new Map(panels.map((b) => [b.id, b] as const));
 
   state.asm.analysis = {
-    heatmapPng, imgW, imgH,
+    heatmapPng: defl.png, imgW: defl.w, imgH: defl.h,
+    stressPng: stress.png, stressImgW: stress.w, stressImgH: stress.h,
     cabinetTag: state.asm.cabinet ?? '',
     panelCount: panels.length,
     joints: state.asm.joints.map((j) => ({
@@ -1419,6 +1504,12 @@ async function captureAssemblyAnalysis(
     maxAt: [res.maxAt[0], res.maxAt[1]],
     spanMm: res.spanMm,
     verdict: res.verdict,
+    maxVmMPa: res.maxVm,
+    maxVmPanelLabel: vmLabel,
+    maxVmAt: [res.maxVmAt[0], res.maxVmAt[1]],
+    utilPct: res.utilPct,
+    stressVerdict: res.stressVerdict,
+    combinedVerdict: assemblyWorstVerdict(res),
     resolutionLog: res.resolutionLog,
     iterations: res.iterations,
   };
@@ -1433,6 +1524,7 @@ function clearAssembly() {
   state.asm.loads = [];
   state.asm.solveMsg = '';
   state.asm.analysis = null;
+  state.asm.lastSolve = null;
   state.asm.detected = false;
   renderAnalysisSection();
 }
@@ -1518,9 +1610,17 @@ function renderAnalysisSection() {
   asmSolveBtn.disabled = !hasBodies;
   asmExportBtn.disabled = !state.asm.analysis;
 
-  // Result line.
+  // Field toggle (Deflection / Stress) — only live after a solve.
+  const solved = !!state.asm.lastSolve && state.asm.lastSolve.res.ok;
+  asmFieldToggle.hidden = !solved;
+  asmFieldDefl.classList.toggle('active', state.asm.field === 'deflection');
+  asmFieldStress.classList.toggle('active', state.asm.field === 'stress');
+  asmFieldDefl.setAttribute('aria-selected', String(state.asm.field === 'deflection'));
+  asmFieldStress.setAttribute('aria-selected', String(state.asm.field === 'stress'));
+
+  // Result line — verdict class is the WORST of deflection + stress.
   const verdictClass = state.asm.analysis
-    ? `cae-${state.asm.analysis.verdict}` : '';
+    ? `cae-${state.asm.analysis.combinedVerdict}` : '';
   asmResult.className = `asm-result ${verdictClass}`;
   asmResult.innerHTML = state.asm.solveMsg
     ? escapeHtml(state.asm.solveMsg)
@@ -1539,6 +1639,7 @@ function wireAnalysisSection() {
       state.asm.joints[i].stiffness = (e.target as HTMLSelectElement).value as JointStiffness;
       // Result is stale once a joint changes.
       state.asm.analysis = null;
+      state.asm.lastSolve = null;
       paintAssemblyPreview();
       renderAnalysisSection();
     });
@@ -1606,6 +1707,7 @@ function toAsmPdf(an: AssemblyAnalysis): import('./pdf').AssemblyAnalysisPage {
   return {
     cabinet: an.cabinetTag,
     image: { dataUrl: an.heatmapPng, width: an.imgW, height: an.imgH },
+    stressImage: an.stressPng ? { dataUrl: an.stressPng, width: an.stressImgW, height: an.stressImgH } : undefined,
     panelCount: an.panelCount,
     joints: an.joints.map((j) => ({ pair: `${j.labelA} ⟂ ${j.labelB}`, length: j.length, stiffness: j.stiffness })),
     loads: an.loads.map((l) => ({ magDisplay: l.magDisplay, shape: l.shape as 'square' | 'round', sizeMm: l.sizeMm, down: l.down, panelLabel: l.panelLabel })),
@@ -1615,6 +1717,12 @@ function toAsmPdf(an: AssemblyAnalysis): import('./pdf').AssemblyAnalysisPage {
     maxAt: an.maxAt,
     spanMm: an.spanMm,
     verdict: an.verdict,
+    maxVmMPa: an.maxVmMPa,
+    maxVmPanelLabel: an.maxVmPanelLabel,
+    maxVmAt: an.maxVmAt,
+    utilPct: an.utilPct,
+    stressVerdict: an.stressVerdict,
+    combinedVerdict: an.combinedVerdict,
     resolutionLog: an.resolutionLog,
     iterations: an.iterations,
   };
@@ -1626,6 +1734,7 @@ asmCabinetSelect.addEventListener('change', () => {
   state.asm.joints = [];
   state.asm.detected = false;
   state.asm.analysis = null;
+  state.asm.lastSolve = null;
   viewer.clearAssemblyOverlay();
   renderAnalysisSection();
 });

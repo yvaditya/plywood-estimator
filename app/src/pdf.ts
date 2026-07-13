@@ -101,6 +101,9 @@ export interface AssemblyAnalysisPage {
   cabinet: string;
   /** Whole-cabinet deflection heatmap snapshot (white bg). */
   image: SnapshotImage;
+  /** Whole-cabinet von-Mises stress heatmap snapshot (white bg). Optional —
+   *  when present (and there's room) it prints under the deflection map. */
+  stressImage?: SnapshotImage;
   panelCount: number;
   joints: AssemblyAnalysisJoint[];
   loads: AssemblyAnalysisLoad[];
@@ -113,6 +116,15 @@ export interface AssemblyAnalysisPage {
   /** Governing panel free span (mm), for the verdict. */
   spanMm: number;
   verdict: string;
+  /** Max von-Mises surface stress (MPa) + governing panel + location. */
+  maxVmMPa?: number;
+  maxVmPanelLabel?: string;
+  maxVmAt?: [number, number];
+  /** Utilization % vs the material bending strengths + its verdict. */
+  utilPct?: number;
+  stressVerdict?: string;
+  /** Combined verdict (worst of deflection + stress). */
+  combinedVerdict?: string;
   /** Solver resolution log line. */
   resolutionLog: string;
   iterations: number;
@@ -1984,20 +1996,38 @@ function drawAssemblyAnalysisPage(
   const tableLeft = imgLeft + imgColW + gutter;
   const tableRight = PAGE_W - PAGE_PAD;
 
-  // Heatmap image, aspect-fit into its column.
-  if (an.image && an.image.dataUrl) {
-    const availH = BOTTOM - TOP;
-    const aspect = an.image.width / an.image.height || 4 / 3;
+  // Heatmap image(s), aspect-fit into the image column. With a stress map we
+  // stack two labeled panels (deflection on top, stress below); otherwise the
+  // single deflection map fills the column.
+  const drawLabeledImage = (
+    img: SnapshotImage, label: string, top: number, availH: number,
+  ): number => {
+    const aspect = img.width / img.height || 4 / 3;
+    const labelH = 12;
     let iw = imgColW;
     let ih = iw / aspect;
-    if (ih > availH) { ih = availH; iw = ih * aspect; }
-    doc.setDrawColor(225);
-    doc.setLineWidth(0.5);
-    doc.rect(imgLeft, TOP, iw, ih);
-    try {
-      doc.addImage(an.image.dataUrl, 'JPEG', imgLeft, TOP, iw, ih);
-    } catch {
-      // ignore image failures — the table still prints
+    if (ih > availH - labelH) { ih = availH - labelH; iw = ih * aspect; }
+    doc.setFont('helvetica', 'bold'); doc.setFontSize(8);
+    doc.setTextColor(110);
+    doc.text(label.toUpperCase(), imgLeft, top + 8);
+    doc.setTextColor(0);
+    const iy = top + labelH;
+    doc.setDrawColor(225); doc.setLineWidth(0.5);
+    doc.rect(imgLeft, iy, iw, ih);
+    try { doc.addImage(img.dataUrl, 'JPEG', imgLeft, iy, iw, ih); } catch { /* table still prints */ }
+    return iy + ih; // bottom y
+  };
+
+  if (an.image && an.image.dataUrl) {
+    const hasStress = !!(an.stressImage && an.stressImage.dataUrl);
+    const availH = BOTTOM - TOP;
+    if (hasStress) {
+      const gap = 14;
+      const half = (availH - gap) / 2;
+      const b1 = drawLabeledImage(an.image, 'Deflection', TOP, half);
+      drawLabeledImage(an.stressImage!, 'Von Mises stress', b1 + gap, availH - (b1 - TOP) - gap);
+    } else {
+      drawLabeledImage(an.image, 'Deflection', TOP, availH);
     }
   }
 
@@ -2033,13 +2063,22 @@ function drawAssemblyAnalysisPage(
   kv('Floor supports', `${an.groundedNodes} nodes`);
   kv('Resolution', an.resolutionLog.replace(/ · target.*$/, ''));
 
-  // Joints sub-list (ASCII — jsPDF core font has no ⟂ glyph).
+  // Joints sub-list (ASCII — jsPDF core font has no ⟂ glyph). Cap the number of
+  // rows so the LOADS + RESULT sections below always fit above BOTTOM — the
+  // Result verdict (and stress block) must never fall off the page.
   if (an.joints.length > 0) {
     doc.setFont('helvetica', 'bold'); doc.setFontSize(8.5); doc.setTextColor(110);
     doc.text('JOINTS', tableLeft, y);
     doc.setDrawColor(235); doc.setLineWidth(0.4); doc.line(tableLeft, y + 4, tableRight, y + 4);
     doc.setTextColor(0); y += rowH;
-    const maxJoints = Math.min(an.joints.length, 12);
+    // Reserve: LOADS header + rows, plus RESULT (header + up to 9 kv rows).
+    const stressRows = an.maxVmMPa != null ? 4 : 0;
+    const loadsBlock = an.loads.length > 0 ? rowH + an.loads.length * (rowH - 3) + 4 : 0;
+    const resultBlock = rowH + (5 + stressRows) * rowH + 12;
+    const reserve = loadsBlock + resultBlock;
+    const roomForJoints = Math.max(0, (BOTTOM - y - reserve));
+    const fit = Math.max(2, Math.floor(roomForJoints / (rowH - 3)) - 1);
+    const maxJoints = Math.min(an.joints.length, 12, fit);
     for (let i = 0; i < maxJoints; i++) {
       const j = an.joints[i];
       const label = j.pair.replace('⟂', 'x');
@@ -2088,7 +2127,18 @@ function drawAssemblyAnalysisPage(
   kv('On panel', an.maxPanelLabel);
   kv('At', `(${fmtDim(an.maxAt[0], opt.units)}, ${fmtDim(an.maxAt[1], opt.units)})`);
   kv('Span', fmtDim(an.spanMm, opt.units));
-  kv('Verdict', an.verdict.toUpperCase(), verdictColor[an.verdict] ?? [30, 30, 30]);
+  // Stress block — only when the solver reported it (older captures may not).
+  if (an.maxVmMPa != null) {
+    const vm = an.maxVmMPa;
+    kv('Max von Mises', `${vm.toFixed(vm < 10 ? 1 : 0)} MPa`);
+    if (an.maxVmPanelLabel) kv('On panel', an.maxVmPanelLabel);
+    if (an.maxVmAt) kv('At', `(${fmtDim(an.maxVmAt[0], opt.units)}, ${fmtDim(an.maxVmAt[1], opt.units)})`);
+    if (an.utilPct != null) {
+      kv('Utilization', `${Math.round(an.utilPct)}%`, verdictColor[an.stressVerdict ?? ''] ?? [30, 30, 30]);
+    }
+  }
+  const finalVerdict = an.combinedVerdict ?? an.verdict;
+  kv('Verdict', finalVerdict.toUpperCase(), verdictColor[finalVerdict] ?? [30, 30, 30]);
   doc.setTextColor(0);
 }
 

@@ -821,6 +821,22 @@ button.primary:disabled {
 .asm-actions { display: flex; gap: 4px; flex-wrap: wrap; margin-top: 12px; }
 .asm-actions .ghost { border: 1px solid var(--line); border-radius: 5px; padding: 5px 10px; font-size: 12px; }
 .asm-actions .ghost[disabled] { opacity: 0.45; cursor: default; }
+/* Heatmap field toggle (Deflection / Stress) — a compact segmented control,
+   same language as the sidebar mode switch. Appears only after a solve. */
+.asm-field-toggle {
+  display: flex; gap: 2px; margin: 10px 0 2px; padding: 2px;
+  background: var(--bg-input-2); border: 1px solid var(--line); border-radius: 6px;
+}
+.asm-field-toggle[hidden] { display: none; }
+.asm-field-tab {
+  flex: 1; border: none; background: none; border-radius: 4px;
+  padding: 4px 8px; font-size: 10.5px; font-weight: 600; letter-spacing: 0.04em;
+  color: var(--muted); cursor: pointer;
+}
+.asm-field-tab:hover { color: var(--text-2); }
+.asm-field-tab.active {
+  background: var(--bg); color: var(--text); box-shadow: 0 1px 2px rgba(0, 0, 0, 0.06);
+}
 .asm-result {
   margin-top: 10px; font-family: var(--font-mono); font-variant-numeric: tabular-nums;
   font-size: 11px; color: var(--text-2); line-height: 1.45;

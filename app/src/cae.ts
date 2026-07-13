@@ -34,13 +34,20 @@ export interface MaterialCard {
   density: number;
   /** True → isotropic (eAlong == eAcross, no grain direction). */
   isotropic?: boolean;
+  /** Characteristic bending strength ALONG the face grain (MPa) — the stress a
+   *  panel can carry with the outer plies running with the span. Used for the
+   *  utilization % (max bending stress vs strength). */
+  fbAlong: number;
+  /** Characteristic bending strength ACROSS the face grain (MPa) — weaker
+   *  direction (outer plies perpendicular to the span). */
+  fbAcross: number;
 }
 
 export const MATERIALS: MaterialCard[] = [
-  { id: 'baltic-birch', name: 'Baltic birch ply', eAlong: 9500, eAcross: 4500, gShear: 9500 / 16, density: 680 },
-  { id: 'softwood-ply', name: 'Softwood ply',     eAlong: 8000, eAcross: 3500, gShear: 8000 / 16, density: 550 },
-  { id: 'hardwood-ply', name: 'Hardwood ply',     eAlong: 9000, eAcross: 4200, gShear: 9000 / 16, density: 640 },
-  { id: 'mdf',          name: 'MDF',              eAlong: 3200, eAcross: 3200, gShear: 3200 / (2 * (1 + 0.25)), density: 750, isotropic: true },
+  { id: 'baltic-birch', name: 'Baltic birch ply', eAlong: 9500, eAcross: 4500, gShear: 9500 / 16, density: 680, fbAlong: 40, fbAcross: 25 },
+  { id: 'softwood-ply', name: 'Softwood ply',     eAlong: 8000, eAcross: 3500, gShear: 8000 / 16, density: 550, fbAlong: 30, fbAcross: 18 },
+  { id: 'hardwood-ply', name: 'Hardwood ply',     eAlong: 9000, eAcross: 4200, gShear: 9000 / 16, density: 640, fbAlong: 38, fbAcross: 22 },
+  { id: 'mdf',          name: 'MDF',              eAlong: 3200, eAcross: 3200, gShear: 3200 / (2 * (1 + 0.25)), density: 750, isotropic: true, fbAlong: 18, fbAcross: 18 },
 ];
 
 export const DEFAULT_MATERIAL_ID = 'baltic-birch';
@@ -888,8 +895,13 @@ export interface AsmPanelResult {
   /** Per-node transverse deflection magnitude |u·? | — the total translational
    *  displacement magnitude (mm). NaN for inactive nodes. */
   disp: Float32Array;
+  /** Per-node von Mises surface stress (MPa), nodally averaged from the
+   *  incident elements' worst-face stress. NaN for inactive nodes. */
+  vm: Float32Array;
   active: Uint8Array;
   maxAbs: number;
+  /** Max nodal von Mises on this panel (MPa). */
+  maxVm: number;
 }
 
 export interface AsmResult {
@@ -905,6 +917,16 @@ export interface AsmResult {
   /** Free span of the governing panel (mm) — for the verdict. */
   spanMm: number;
   verdict: 'ok' | 'borderline' | 'weak';
+  /** Global max von Mises surface stress (MPa) across the whole assembly. */
+  maxVm: number;
+  /** Panel id + local location where the max von Mises occurred. */
+  maxVmPanelId: number;
+  maxVmAt: Vec2;
+  /** Utilization % = max(σ_along/fbAlong, σ_across/fbAcross) over all panels,
+   *  where σ_along/σ_across are the peak bending stresses along/across grain. */
+  utilPct: number;
+  /** Verdict from the utilization: <50% ok, <100% borderline, ≥100% weak. */
+  stressVerdict: 'ok' | 'borderline' | 'weak';
   totalDof: number;
   totalNodes: number;
   iterations: number;
@@ -1172,6 +1194,74 @@ function meshPanel(p: AsmPanel, target: number): {
   return { nx, ny, dx, dy, active, activeCells, activeCount };
 }
 
+// ---------------------------------------------------------------------------
+// STRESS RECOVERY — from the converged displacement field.
+//
+// Per element, evaluate the SAME membrane + bending B-matrices used in the
+// assembly at the element CENTRE (ξ=η=0, matching the reduced-integration
+// point) against the element's local displacement vector. That gives:
+//   membrane force resultants  N  = Dm·ε   (N/mm — Dm already carries ×t)
+//   bending moment resultants  M  = Db·κ   (N·mm/mm — Db carries ×t³/12)
+// Combine to the two panel-face stresses  σ = N/t ± 6M/t²  (MPa == N/mm²),
+// take plane-stress von Mises on each face, keep the worse of the two.
+// ---------------------------------------------------------------------------
+
+/** Membrane strain (εx, εy, γxy) at the element centre from local [u,v]×4. */
+function membraneStrainCentre(dx: number, dy: number, ul: number[]): [number, number, number] {
+  // dN/dx, dN/dy at ξ=η=0. Nodes: 0(-,-) 1(+,-) 2(+,+) 3(-,+).
+  const sx = [-1, 1, 1, -1];
+  const se = [-1, -1, 1, 1];
+  const dNdx = new Array(4), dNdy = new Array(4);
+  for (let i = 0; i < 4; i++) {
+    dNdx[i] = 0.25 * sx[i] * (2 / dx); // (1 + se·η)=1 at η=0
+    dNdy[i] = 0.25 * se[i] * (2 / dy); // (1 + sx·ξ)=1 at ξ=0
+  }
+  let ex = 0, ey = 0, gxy = 0;
+  for (let i = 0; i < 4; i++) {
+    const u = ul[i * 2], v = ul[i * 2 + 1];
+    ex += dNdx[i] * u;
+    ey += dNdy[i] * v;
+    gxy += dNdy[i] * u + dNdx[i] * v;
+  }
+  return [ex, ey, gxy];
+}
+
+/** Bending curvature (κx, κy, κxy) at the element centre from local
+ *  [w, θu(=θx), θv(=θy)]×4 — matching elementK's curvature convention. */
+function bendingCurvatureCentre(dx: number, dy: number, wl: number[]): [number, number, number] {
+  const sx = [-1, 1, 1, -1];
+  const se = [-1, -1, 1, 1];
+  const dNdx = new Array(4), dNdy = new Array(4);
+  for (let i = 0; i < 4; i++) {
+    dNdx[i] = 0.25 * sx[i] * (2 / dx);
+    dNdy[i] = 0.25 * se[i] * (2 / dy);
+  }
+  // κx = ∂θy/∂x ; κy = −∂θx/∂y ; κxy = ∂θy/∂y − ∂θx/∂x
+  let kx = 0, ky = 0, kxy = 0;
+  for (let i = 0; i < 4; i++) {
+    const thx = wl[i * 3 + 1]; // θu == θx
+    const thy = wl[i * 3 + 2]; // θv == θy
+    kx += dNdx[i] * thy;
+    ky += -dNdy[i] * thx;
+    kxy += dNdy[i] * thy - dNdx[i] * thx;
+  }
+  return [kx, ky, kxy];
+}
+
+/** 3×3 · 3-vector. */
+function m3v(D: number[][], v: [number, number, number]): [number, number, number] {
+  return [
+    D[0][0] * v[0] + D[0][1] * v[1] + D[0][2] * v[2],
+    D[1][0] * v[0] + D[1][1] * v[1] + D[1][2] * v[2],
+    D[2][0] * v[0] + D[2][1] * v[1] + D[2][2] * v[2],
+  ];
+}
+
+/** Plane-stress von Mises of (σx, σy, τxy) in MPa. */
+function vonMises(sx: number, sy: number, txy: number): number {
+  return Math.sqrt(sx * sx - sx * sy + sy * sy + 3 * txy * txy);
+}
+
 /**
  * Solve the whole assembly. Returns a refusal (ok:false) when the system is
  * under-constrained (nothing grounded / not enough grounding to prevent rigid
@@ -1184,7 +1274,9 @@ export function solveAssembly(opts: AsmSolveOptions): AsmResult {
 
   const empty = (msg: string): AsmResult => ({
     ok: false, message: msg, panels: [], maxDisp: 0, maxPanelId: -1, maxAt: [0, 0],
-    spanMm: 0, verdict: 'ok', totalDof: 0, totalNodes: 0, iterations: 0, converged: false,
+    spanMm: 0, verdict: 'ok', maxVm: 0, maxVmPanelId: -1, maxVmAt: [0, 0],
+    utilPct: 0, stressVerdict: 'ok',
+    totalDof: 0, totalNodes: 0, iterations: 0, converged: false,
     groundedNodes: 0, resolutionLog: '', groundPoints: [],
   });
 
@@ -1246,6 +1338,8 @@ export function solveAssembly(opts: AsmSolveOptions): AsmResult {
   // wrecks the condition number and stalls PCG on real, mixed-thickness jobs.
   const panelStiff = new Map<number, number>();
   let repStiff = 0;
+  // Per-panel D-matrices retained for stress recovery after the solve.
+  const panelD = new Map<number, { Db: number[][]; Dm: number[][] }>();
 
   for (const m of meshes) {
     const p = m.panel;
@@ -1255,6 +1349,7 @@ export function solveAssembly(opts: AsmSolveOptions): AsmResult {
     const Db = bendingD(e1, e2, p.material.gShear, NU, t);
     const Ds = shearD(p.material.gShear, p.material.gShear, t);
     const Dm = membraneD(e1, e2, p.material.gShear, NU, t);
+    panelD.set(p.id, { Db, Dm });
     const Kb = elementK(m.dx, m.dy, Db, Ds);   // 12×12 [w,θx,θy] per node
     const Km = membraneK(m.dx, m.dy, Dm);       // 8×8  [u,v]     per node
 
@@ -1508,14 +1603,28 @@ export function solveAssembly(opts: AsmSolveOptions): AsmResult {
   const x = new Float64Array(nDof);
   const { iterations, converged } = pcg(rowPtr, colIdx, val, diag, F, x, 1e-7, 20000);
 
-  // Scatter per-panel translational displacement magnitude.
+  // Scatter per-panel translational displacement magnitude + recover stresses.
   const panelResults: AsmPanelResult[] = [];
   let maxDisp = 0, maxPanelId = -1;
   let maxAt: Vec2 = [0, 0];
+  let maxVm = 0, maxVmPanelId = -1;
+  let maxVmAt: Vec2 = [0, 0];
+  // Peak bending stresses along/across the grain over ALL panels (for util%).
+  let peakAlong = 0, peakAcross = 0;
+
   for (const m of meshes) {
+    const p = m.panel;
     const nNodes = m.nx * m.ny;
     const disp = new Float32Array(nNodes).fill(NaN);
     let pMax = 0;
+    // Local displacement extraction: local = Rᵀ·world for both the translation
+    // triple and the rotation triple. R columns are (uAxis, vAxis, normal).
+    const ux = p.uAxis, vy = p.vAxis, nz = p.normal;
+    const toLocal3 = (wx: number, wy: number, wz: number): [number, number, number] => [
+      ux[0] * wx + ux[1] * wy + ux[2] * wz,
+      vy[0] * wx + vy[1] * wy + vy[2] * wz,
+      nz[0] * wx + nz[1] * wy + nz[2] * wz,
+    ];
     for (let iy = 0; iy < m.ny; iy++) {
       for (let ix = 0; ix < m.nx; ix++) {
         const g = m.gnode[iy * m.nx + ix];
@@ -1525,11 +1634,70 @@ export function solveAssembly(opts: AsmSolveOptions): AsmResult {
         disp[iy * m.nx + ix] = mag;
         if (mag > pMax) pMax = mag;
         if (mag > maxDisp) {
-          maxDisp = mag; maxPanelId = m.panel.id; maxAt = [ix * m.dx, iy * m.dy];
+          maxDisp = mag; maxPanelId = p.id; maxAt = [ix * m.dx, iy * m.dy];
         }
       }
     }
-    panelResults.push({ id: m.panel.id, nx: m.nx, ny: m.ny, dx: m.dx, dy: m.dy, disp, active: m.active, maxAbs: pMax });
+
+    // --- Stress recovery: per element, worst-face von Mises at the centre,
+    //     scattered to its 4 nodes and averaged. Also track grain-axis peaks. ---
+    const t = p.thicknessMm;
+    const D = panelD.get(p.id)!;
+    const vmSum = new Float64Array(nNodes);
+    const vmCnt = new Int32Array(nNodes);
+    const nodeIdx = (jx: number, jy: number) => jy * m.nx + jx;
+    for (const [ix, iy] of m.activeCells) {
+      const en = [nodeIdx(ix, iy), nodeIdx(ix + 1, iy), nodeIdx(ix + 1, iy + 1), nodeIdx(ix, iy + 1)];
+      const g = en.map((n) => m.gnode[n]);
+      if (g.some((gg) => gg < 0)) continue;
+      // Build local per-node DOF arrays: membrane [u,v]×4, bending [w,θx,θy]×4.
+      const ul: number[] = new Array(8);
+      const wl: number[] = new Array(12);
+      for (let i = 0; i < 4; i++) {
+        const gi = g[i];
+        const [lu, lv] = toLocal3(x[gi * 6], x[gi * 6 + 1], x[gi * 6 + 2]);
+        const lw = nz[0] * x[gi * 6] + nz[1] * x[gi * 6 + 1] + nz[2] * x[gi * 6 + 2];
+        const [ru, rv] = toLocal3(x[gi * 6 + 3], x[gi * 6 + 4], x[gi * 6 + 5]);
+        ul[i * 2] = lu; ul[i * 2 + 1] = lv;
+        wl[i * 3] = lw; wl[i * 3 + 1] = ru; wl[i * 3 + 2] = rv;
+      }
+      // N = Dm·ε (N/mm) ; M = Db·κ (N·mm/mm).
+      const eps = membraneStrainCentre(m.dx, m.dy, ul);
+      const kap = bendingCurvatureCentre(m.dx, m.dy, wl);
+      const N = m3v(D.Dm, eps);
+      const M = m3v(D.Db, kap);
+      // Surface stresses on the two faces: σ = N/t ± 6M/t².
+      const smx = N[0] / t, smy = N[1] / t, smxy = N[2] / t;   // membrane σ
+      const sbx = (6 * M[0]) / (t * t), sby = (6 * M[1]) / (t * t), sbxy = (6 * M[2]) / (t * t); // bending σ (outer face)
+      const top: [number, number, number] = [smx + sbx, smy + sby, smxy + sbxy];
+      const bot: [number, number, number] = [smx - sbx, smy - sby, smxy - sbxy];
+      const vmTop = vonMises(top[0], top[1], top[2]);
+      const vmBot = vonMises(bot[0], bot[1], bot[2]);
+      const vm = Math.max(vmTop, vmBot);
+      // Grain-axis peak bending stresses (magnitude of the pure-bending part).
+      const sAlongX = Math.abs(sbx), sAcrossY = Math.abs(sby);
+      const along = p.grainAlongLength ? sAlongX : sAcrossY;
+      const across = p.grainAlongLength ? sAcrossY : sAlongX;
+      if (along > peakAlong) peakAlong = along;
+      if (across > peakAcross) peakAcross = across;
+      for (const n of en) { vmSum[n] += vm; vmCnt[n] += 1; }
+    }
+
+    // Nodal average → a smooth field.
+    const vmField = new Float32Array(nNodes).fill(NaN);
+    let pVm = 0;
+    for (let iy = 0; iy < m.ny; iy++) {
+      for (let ix = 0; ix < m.nx; ix++) {
+        const n = nodeIdx(ix, iy);
+        if (!m.active[n] || vmCnt[n] === 0) continue;
+        const v = vmSum[n] / vmCnt[n];
+        vmField[n] = v;
+        if (v > pVm) pVm = v;
+        if (v > maxVm) { maxVm = v; maxVmPanelId = p.id; maxVmAt = [ix * m.dx, iy * m.dy]; }
+      }
+    }
+
+    panelResults.push({ id: p.id, nx: m.nx, ny: m.ny, dx: m.dx, dy: m.dy, disp, vm: vmField, active: m.active, maxAbs: pMax, maxVm: pVm });
   }
 
   // Non-physical / NaN backstop.
@@ -1543,8 +1711,19 @@ export function solveAssembly(opts: AsmSolveOptions): AsmResult {
   const verdict: 'ok' | 'borderline' | 'weak' =
     maxDisp < span / 300 ? 'ok' : maxDisp < limit ? 'borderline' : 'weak';
 
+  // Utilization: worst grain-axis bending stress vs the material bending
+  // strength, over all panels. Use the governing (max-vm) panel's material for
+  // the strength card — mixed-material jobs are rare and this keeps it simple.
+  const govVm = panels.find((p) => p.id === maxVmPanelId) ?? governing;
+  const fbA = govVm.material.fbAlong || 1;
+  const fbC = govVm.material.fbAcross || 1;
+  const utilPct = Math.max(peakAlong / fbA, peakAcross / fbC) * 100;
+  const stressVerdict: 'ok' | 'borderline' | 'weak' =
+    utilPct < 50 ? 'ok' : utilPct < 100 ? 'borderline' : 'weak';
+
   return {
     ok: true, panels: panelResults, maxDisp, maxPanelId, maxAt, spanMm: span, verdict,
+    maxVm, maxVmPanelId, maxVmAt, utilPct, stressVerdict,
     totalDof: nDof, totalNodes, iterations, converged,
     groundedNodes: grounded.length, resolutionLog, groundPoints,
   };

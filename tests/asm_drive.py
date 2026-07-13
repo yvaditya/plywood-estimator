@@ -184,6 +184,12 @@ def main() -> int:
                 problems.append(f"assembly result line did not report a deflection: {result_text!r}")
             if not any(v in result_text.upper() for v in ["OK", "BORDERLINE", "WEAK"]):
                 problems.append("assembly result line missing a verdict")
+            # STRESS: the result line must also report a max stress in MPa and a
+            # utilization %.
+            if "mpa" not in result_text.lower():
+                problems.append(f"assembly result line did not report a stress in MPa: {result_text!r}")
+            if "util" not in result_text.lower() or "%" not in result_text:
+                problems.append(f"assembly result line did not report a utilization %: {result_text!r}")
 
             page.wait_for_timeout(500)
 
@@ -203,6 +209,27 @@ def main() -> int:
             page.query_selector('section.panel--group[data-group="analysis"]').screenshot(
                 path=str(OUT / "analysis_section.png"))
 
+            # --- Field toggle: switch to Stress (re-textures from cache, no
+            #     re-solve) and screenshot the stress heatmap. ---
+            toggle = page.query_selector("#asmFieldToggle")
+            if toggle is None or not toggle.is_visible():
+                problems.append("Deflection/Stress field toggle not shown after a solve")
+            else:
+                stress_btn = page.query_selector("#asmFieldStress")
+                stress_btn.click()
+                page.wait_for_timeout(500)
+                stress_active = page.evaluate(
+                    "() => document.getElementById('asmFieldStress')?.classList.contains('active')"
+                )
+                if not stress_active:
+                    problems.append("Stress field tab did not become active after click")
+                canvas.screenshot(path=str(OUT / "assembly_stress_heatmap.png"))
+                page.query_selector('section.panel--group[data-group="analysis"]').screenshot(
+                    path=str(OUT / "analysis_section_stress.png"))
+                # Switch back to deflection so the export screenshot is stable.
+                page.click("#asmFieldDefl")
+                page.wait_for_timeout(300)
+
             # --- Standalone analysis PDF. ---
             an_pdf = download_to("#asmExportBtn", OUT / "standalone_assembly.pdf", timeout_ms=90_000)
             n_an, titles_an = pdf_page_titles(an_pdf)
@@ -215,6 +242,12 @@ def main() -> int:
                 problems.append("standalone assembly PDF does not list joint stiffness")
             if "verdict" not in an_all and not any(v in an_all for v in ["ok", "borderline", "weak"]):
                 problems.append("standalone assembly PDF missing a verdict")
+            # STRESS block: the standalone PDF must carry the von-Mises max (MPa)
+            # and utilization %.
+            if "mpa" not in an_all:
+                problems.append("standalone assembly PDF missing a stress (MPa) figure")
+            if "von mises" not in an_all and "utilization" not in an_all:
+                problems.append("standalone assembly PDF missing the von-Mises/utilization stress block")
 
             # --- Job PDF AFTER solve: BOTH Structure + Assembly analysis. ---
             post_pdf = download_to("#downloadPdfBtn", OUT / "job_after_solve.pdf")
@@ -231,6 +264,10 @@ def main() -> int:
                 problems.append("Structure page MISSING in job PDF after assembly solve")
             if not has_asm:
                 problems.append("Assembly analysis page MISSING in job PDF after solve")
+            # STRESS block must appear on the job PDF's assembly page too.
+            post_all = " ".join(titles_post).lower()
+            if "mpa" not in post_all:
+                problems.append("job PDF assembly page missing a stress (MPa) figure after solve")
 
             # --- Switch back to Cut planning: the estimate/sidebar must be
             #     intact (Stock/Cutting/Estimate visible again, Analysis hidden,

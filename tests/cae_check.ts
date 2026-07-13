@@ -24,7 +24,7 @@ import {
 // ---------------------------------------------------------------------------
 function iso(E: number, nu = 0.3): MaterialCard {
   const G = E / (2 * (1 + nu));
-  return { id: 'test-iso', name: 'iso', eAlong: E, eAcross: E, gShear: G, density: 600, isotropic: true };
+  return { id: 'test-iso', name: 'iso', eAlong: E, eAcross: E, gShear: G, density: 600, isotropic: true, fbAlong: 40, fbAcross: 40 };
 }
 
 let anyFail = false;
@@ -296,6 +296,69 @@ function caseF() {
   );
 }
 
+// ---------------------------------------------------------------------------
+// Case (g): STRESS RECOVERY — simply-supported strip, centre point load. The
+//   assembly solver's recovered surface von Mises at the strip centre should
+//   match beam theory:
+//     σ = M·c/I = (P·L/4)·(t/2)/(w·t³/12) = 1.5·P·L/(w·t²).
+//   For pure uniaxial bending von Mises == |σ|. The centre moment P·L/4 is a
+//   STATICS result (independent of stiffness), so the recovered stress matches
+//   theory even though the solver's soft grounding regularization perturbs
+//   absolute deflection magnitudes.
+//
+// Geometry: a horizontal strip (span L along X, width w along Y) rests at z=H
+// on two thin vertical legs at each span end. The legs stand on the floor
+// (grounded) and are HINGE-jointed to the strip → simple supports (no end
+// moment). A SHORT, THICK strip (L/t≈12) keeps the strip's own deflection tiny
+// so the distributed soft-grounding springs steal negligible load from the two
+// end reactions — the centre moment stays P·L/4 and the recovered surface
+// stress lands on theory. Centre point load pushes the strip down.
+// ---------------------------------------------------------------------------
+function caseG() {
+  const L = 240;    // support spacing = SS span (world X); L/t ≈ 12
+  const w = 120;    // strip width (world Y)
+  const t = 20;     // thickness
+  const H = 80;     // leg height
+  const ov = 20;    // small strip overhang beyond each support (keeps leg-top
+                    // contacts in the strip INTERIOR, robust joint detection).
+  const E = 8000;
+  const P = 600;    // N, centre point load
+  const mat = iso(E, 0.3);
+
+  // σ_theory = 1.5·P·L / (w·t²)   (MPa == N/mm²). L is the support spacing;
+  // symmetric overhangs don't change the centre moment (M = P·L/4).
+  const theory = (1.5 * P * L) / (w * t * t);
+
+  // Strip: local u=X, v=Y, normal +Z; spans x∈[−ov, L+ov] at z=H.
+  const strip = mkPanel(1, 'S', L + 2 * ov, w, t, mat, [-ov, 0, H], [1, 0, 0], [0, 1, 0], [0, 0, 1]);
+  // Legs: thin vertical panels, span Z (v = +Z, height H), width Y (u = +Y),
+  // face normal +X. Tops (z=H) touch the strip's underside at x=0 and x=L —
+  // interior points of the overhanging strip, so both joints detect cleanly.
+  const legL = mkPanel(2, 'L', w, H, t, mat, [0, 0, 0], [0, 1, 0], [0, 0, 1], [1, 0, 0]);
+  const legR = mkPanel(3, 'R', w, H, t, mat, [L, 0, 0], [0, 1, 0], [0, 0, 1], [1, 0, 0]);
+
+  const panels = [strip, legL, legR];
+  // Hinged joints at both ends → simple supports (legs push up, no end moment).
+  const joints = detectJoints(panels, 3).map((j) => ({ ...j, stiffness: 'hinged' as JointStiffness }));
+  const res = solveAssembly({
+    panels, joints, tolMm: 3,
+    // Load at mid-span. Strip-local x = world x + ov (origin at world x=−ov).
+    loads: [{ panelId: 1, x: L / 2 + ov, y: w / 2, N: P, shape: 'round', size: 0 }],
+  });
+
+  if (!res.ok || !Number.isFinite(res.maxVm)) {
+    anyFail = true;
+    console.log(`[FAIL] (g) SS strip stress setup — ok=${res.ok} maxVm=${res.maxVm} ` +
+      `msg=${res.message ?? ''} joints=${joints.length}`);
+    return;
+  }
+  report(
+    `(g) SS strip, centre P — surface stress  [${res.totalNodes} nodes, ${res.iterations} it, ${joints.length} joint(s)]`,
+    res.maxVm, theory, 15,
+    `util=${res.utilPct.toFixed(0)}%`,
+  );
+}
+
 console.log('=== plate solver validation ===');
 void bendingDForTest; // keep the import referenced
 caseA();
@@ -304,5 +367,6 @@ caseC();
 caseD();
 caseE();
 caseF();
+caseG();
 console.log(anyFail ? '\nRESULT: FAIL' : '\nRESULT: all cases PASS');
 process.exit(anyFail ? 1 : 0);
