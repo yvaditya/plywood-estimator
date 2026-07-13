@@ -44,7 +44,9 @@ export interface SessionStartEvent {
 }
 
 export interface ActionEvent {
-  type: 'reorder' | 'flip_edge' | 'mark_datum' | 'manual_cut' | 'undo' | 'auto_complete';
+  type:
+    | 'reorder' | 'flip_edge' | 'mark_datum' | 'manual_cut' | 'undo'
+    | 'auto_complete' | 'set_datum' | 'unset_datum';
   t: number;
   /** Stable cut key + a human-readable summary of the affected cut.
    *  (`manual_cut`/`undo` carry these; `auto_complete` may omit them.) */
@@ -58,6 +60,15 @@ export interface ActionEvent {
   /** For manual_cut: whether the cut was quoted from a manually-armed FAR
    *  reference edge. */
   armedFar?: boolean;
+  /** For set_datum / unset_datum: the piece (region key) + edge that was
+   *  (un)marked as the default measuring edge. */
+  piece_key?: string;
+  side?: 'top' | 'bottom' | 'left' | 'right';
+  /** For manual_cut: WHICH edge the cut was measured from (near/far in the
+   *  cut's own orientation → 'L'/'R'/'T'/'B') and where that edge came from:
+   *  an explicit arm, an inherited datum, or the built-in default. */
+  measuredFrom?: 'L' | 'R' | 'T' | 'B';
+  measuredProvenance?: 'armed' | 'datum' | 'default';
   /** For auto_complete: how many cuts the engine order appended. */
   added?: number;
   /** Piece-breakdown state after the action (live pieces + finished count). */

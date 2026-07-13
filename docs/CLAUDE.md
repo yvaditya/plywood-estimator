@@ -37,7 +37,7 @@ Quick orientation for a fresh session working on this repo.
 | `dxf.ts` | DXF R12 writer (layers SHEET / MARGIN / PARTS / LABELS / DIMS) |
 | `pdf.ts` | jsPDF report (cover → contents → quick ref → shopping → job-wide Panels TABLE → per-sheet (overview + panels table + cut sequence) → per-cabinet assembly + IKEA-style step pages) |
 | `cae.ts` | Quick CAE: material cards, panel weight, beam-strip sag screening, orthotropic Mindlin plate FEM (validated by tests/cae_check.ts — keep it passing) |
-| `cutEditor.ts` | "Edit cuts" popup: dependency-constrained manual reorder (sequenceLegal replays the WHOLE candidate order), per-cut measured-from-edge flip (fromFar), datum/REF marking; overrides keyed by layoutSignature + cutKeyFor in localStorage |
+| `cutEditor.ts` | "Edit cuts" popup: DIRECT cutting (click candidate line → commit). Clicking a piece EDGE opens a context popup: arm as measured-from, or set/unset a DATUM edge. Datum edges render blue, become the piece's default measuring edge (fromFar when far), and PROPAGATE to child pieces that retain the same boundary segment (datums stored as geometric line segments; persisted as `SheetOverrides.datumEdges` piece-key+side). manual_cut log records measuredFrom + provenance (armed/datum/default). Overrides keyed by layoutSignature + cutKeyFor in localStorage |
 | `trainingLog.ts` | Opt-in JSONL recorder of manual sequence edits (full layout + auto sequence context per session) — source data for future learned ordering modes |
 | `units.ts` | mm/inch conversion, fractional-inch formatting, money fmt, fmtSag (decimal, sub-mm safe) |
 | `style.css` | Notion-style light theme |

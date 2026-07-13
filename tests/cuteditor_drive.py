@@ -86,13 +86,12 @@ ARM_FAR_EDGE = """
 () => {
   const svg = document.querySelector('.cut-editor-svg');
   if (!svg) return {ok:false, reason:'no svg'};
-  // Prefer arming via the exposed test hook if present.
   const bands = Array.from(svg.querySelectorAll('rect.cut-edge-band'));
   if (!bands.length) return {ok:false, reason:'no bands'};
   // Heuristic: a FAR vertical band sits at the right of its piece; a FAR
-  // horizontal band at the bottom. We can't read JS state from here, so we
-  // click the band whose center is farthest right+down (most likely a far
-  // edge). The editor toggles arm on click.
+  // horizontal band at the bottom. Click the band whose center is farthest
+  // right+down (most likely a far edge). Clicking a band now opens the edge
+  // CONTEXT POPUP; choose "Measure next cut from this edge" to arm it.
   let best = null, bestScore = -1;
   for (const b of bands) {
     const x = parseFloat(b.getAttribute('x')) + parseFloat(b.getAttribute('width'))/2;
@@ -100,8 +99,12 @@ ARM_FAR_EDGE = """
     const score = x + y;
     if (score > bestScore) { bestScore = score; best = b; }
   }
-  const evt = new MouseEvent('click', {bubbles:true, cancelable:true, view:window});
-  best.dispatchEvent(evt);
+  best.dispatchEvent(new MouseEvent('click', {bubbles:true, cancelable:true, view:window}));
+  // Then pick the "measure from this edge" item in the popup that just opened.
+  const items = Array.from(document.querySelectorAll('.cut-edge-menu .cut-edge-menu-item'));
+  const arm = items.find(b => (b.textContent||'').toLowerCase().includes('measure next cut'));
+  if (!arm) return {ok:false, reason:'no arm item', items: items.map(b=>b.textContent)};
+  arm.dispatchEvent(new MouseEvent('click', {bubbles:true, cancelable:true, view:window}));
   return {ok:true};
 }
 """

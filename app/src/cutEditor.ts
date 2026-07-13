@@ -14,10 +14,18 @@
  *     enumerated via candidateLinesInRegion, a fan-out of pickLine's logic).
  *     The hovered candidate draws red-dashed.
  *   - Clicking a candidate commits it as the NEXT cut, measured from the
- *     piece's datum edge (left for vertical, top for horizontal) by default.
- *   - Clicking a piece's PARALLEL EDGE first (within a snap band) arms it as
- *     the measured-from edge; the next cut on that piece is quoted from it
- *     (fromFar when it's the far edge). The armed edge highlights green.
+ *     piece's DATUM edge when one exists (fromFar if the datum is the far
+ *     edge), else the built-in default (left for vertical, top for horizontal).
+ *   - Clicking a piece's PARALLEL EDGE opens a small CONTEXT POPUP at the
+ *     cursor: "Measure next cut from this edge" (arm — highlights green,
+ *     overrides the datum for that one cut), "Set / Unset datum edge" (marks
+ *     the edge BLUE as the piece's default measuring edge), "Cancel".
+ *
+ * DATUM EDGES: a datum is stored as a geometric line SEGMENT so it PROPAGATES
+ * to any child piece that retains that same boundary edge after a cut. The
+ * three trims' reference edges are implicit datums on the seed pieces (the
+ * top-left datum corner). Persisted on SheetOverrides.datumEdges (piece key +
+ * side) and replayed on reopen by matching regions.
  *
  * RIGHT PANE = a READOUT of the sequence built so far (trims first, then the
  * hand-built layout cuts). Per row: undo-to-here (↩), flip measured edge (⇄),
@@ -49,6 +57,7 @@ import {
   layoutSignature,
   type CutStep,
   type SheetOverrides,
+  type DatumEdge,
   type KerfRef,
 } from './instructions';
 import { fmtDim, type Units } from './units';
@@ -177,6 +186,59 @@ function regionFinished(r: Region, parts: NestSheet['parts']): boolean {
   const EPS = 1;
   return Math.abs(p.x - r.x) < EPS && Math.abs(p.y - r.y) < EPS &&
          Math.abs(p.w - r.w) < EPS && Math.abs(p.h - r.h) < EPS;
+}
+
+// ---------------------------------------------------------------------------
+// Datum edges — a piece's DEFAULT measuring edge. Stored geometrically as a
+// line SEGMENT in sheet space so a datum PROPAGATES to any child piece that
+// retains that same edge on its boundary after a cut. A `DatumLine` with
+// vertical=true is a constant-X edge (the piece's left/right side); the
+// [lo,hi] span is the Y-extent it originally covered.
+// ---------------------------------------------------------------------------
+
+interface DatumLine { vertical: boolean; coord: number; lo: number; hi: number }
+
+const DATUM_EPS = 1; // mm — collinear + coverage tolerance (matches region ops)
+
+/** The four edges of a region as datum-line segments, keyed by side. */
+function edgeLine(r: Region, side: DatumEdge['side']): DatumLine {
+  switch (side) {
+    case 'left':  return { vertical: true,  coord: r.x,       lo: r.y, hi: r.y + r.h };
+    case 'right': return { vertical: true,  coord: r.x + r.w, lo: r.y, hi: r.y + r.h };
+    case 'top':   return { vertical: false, coord: r.y,       lo: r.x, hi: r.x + r.w };
+    case 'bottom':return { vertical: false, coord: r.y + r.h, lo: r.x, hi: r.x + r.w };
+  }
+}
+
+/** The rounded-rect key for a region — matches cutKeyFor's parent format so a
+ *  persisted DatumEdge.piece resolves back to the region it was set on. */
+function regionKey(r: Region): string {
+  const q = (n: number) => Math.round(n);
+  return `${q(r.x)},${q(r.y)},${q(r.w)},${q(r.h)}`;
+}
+
+/** Does a region's `side` edge lie ON a datum line (collinear + fully covered
+ *  by the datum's span)? This is the propagation test: a child piece inherits
+ *  a datum when it retains that same boundary segment. */
+function edgeIsDatum(r: Region, side: DatumEdge['side'], datums: DatumLine[]): boolean {
+  const e = edgeLine(r, side);
+  return datums.some((d) =>
+    d.vertical === e.vertical &&
+    Math.abs(d.coord - e.coord) < DATUM_EPS &&
+    d.lo - DATUM_EPS <= e.lo && e.hi <= d.hi + DATUM_EPS);
+}
+
+/** Which side (if any) of a region is a datum edge — used to pick the default
+ *  measuring edge for a cut. Prefers the near datum (left/top) when both a
+ *  near and far edge are datums, matching the built-in default corner. */
+function datumSideFor(r: Region, vertical: boolean, datums: DatumLine[]): DatumEdge['side'] | null {
+  // A vertical (constant-X) cut is measured from a left/right edge; a
+  // horizontal cut from a top/bottom edge.
+  const near: DatumEdge['side'] = vertical ? 'left' : 'top';
+  const far: DatumEdge['side'] = vertical ? 'right' : 'bottom';
+  if (edgeIsDatum(r, near, datums)) return near;
+  if (edgeIsDatum(r, far, datums)) return far;
+  return null;
 }
 
 // ---------------------------------------------------------------------------
@@ -329,6 +391,9 @@ interface EditorSession {
   /** Armed measured-from edge for the NEXT cut: the region + which parallel
    *  edge (near/far) + orientation. null = default datum edge. */
   armed: { region: Region; vertical: boolean; far: boolean } | null;
+  /** User-declared datum edges, geometric line segments so they propagate to
+   *  child pieces. Seeded with the implicit trim datums (left + top). */
+  datums: DatumLine[];
   changed: boolean;
 }
 
@@ -360,12 +425,19 @@ function workingSteps(): CutStep[] {
   return all;
 }
 
-/** Persist the built sequence as customSteps (null when nothing is built). */
+/** Persist the built sequence as customSteps + the user datum edges. Clears
+ *  the override entirely only when NOTHING is set (no built cuts, no datums). */
 function persistSession(): void {
   if (!session) return;
-  if (session.built.length === 0) { setOverrides(session.sig, null); return; }
-  const customSteps = session.built.map((s) => ({ ...s }));
-  setOverrides(session.sig, { customSteps });
+  const datumEdges = userDatumEdges();
+  if (session.built.length === 0 && datumEdges.length === 0) {
+    setOverrides(session.sig, null);
+    return;
+  }
+  const ov: SheetOverrides = {};
+  if (session.built.length > 0) ov.customSteps = session.built.map((s) => ({ ...s }));
+  if (datumEdges.length > 0) ov.datumEdges = datumEdges;
+  setOverrides(session.sig, ov);
 }
 
 function metricsOf(steps: CutStep[]): SequenceMetrics {
@@ -378,16 +450,90 @@ function builtFromOverrides(ov: SheetOverrides | undefined): CutStep[] {
   return [];
 }
 
+/** Implicit trim datums: the reference edges established by the three trims —
+ *  the datum corner is top-left, so the seed pieces' outer LEFT and TOP edges
+ *  are the built-in default measuring edges (matching the current quoting).
+ *  Rendered blue already; we add them as datum lines so the default-quote path
+ *  and the datum machinery agree. */
+function implicitTrimDatums(seed: Region[]): DatumLine[] {
+  if (seed.length === 0) return [];
+  const minX = Math.min(...seed.map((r) => r.x));
+  const minY = Math.min(...seed.map((r) => r.y));
+  const maxX = Math.max(...seed.map((r) => r.x + r.w));
+  const maxY = Math.max(...seed.map((r) => r.y + r.h));
+  return [
+    { vertical: true,  coord: minX, lo: minY, hi: maxY }, // left datum edge
+    { vertical: false, coord: minY, lo: minX, hi: maxX }, // top datum edge
+  ];
+}
+
+/** Reconstruct user datum lines from a persisted DatumEdge[] by REPLAYING the
+ *  trims + built cuts and matching each entry's piece key to a live region.
+ *  A datum whose region no longer exists (layout changed) is dropped. */
+function userDatumsFromOverrides(
+  ov: SheetOverrides | undefined,
+  trims: CutStep[], built: CutStep[],
+  sheetW: number, sheetL: number, margin: number,
+): DatumLine[] {
+  if (!ov?.datumEdges || ov.datumEdges.length === 0) return [];
+  const regions = liveRegions(trims, built, sheetW, sheetL, margin);
+  const byKey = new Map<string, Region>();
+  for (const r of regions) byKey.set(regionKey(r), r);
+  const out: DatumLine[] = [];
+  for (const de of ov.datumEdges) {
+    const r = byKey.get(de.piece);
+    if (r) out.push(edgeLine(r, de.side));
+  }
+  return out;
+}
+
+/** Serialise the session's USER datum lines (implicit trim datums excluded) as
+ *  DatumEdge[] keyed by the live region they currently sit on. */
+function userDatumEdges(): DatumEdge[] {
+  if (!session) return [];
+  const { trims, built, ctx } = session;
+  const implicit = implicitTrimDatums(seedRegions(trims, ctx.sheet.sheetW, ctx.sheet.sheetL, ctx.margin));
+  const regions = liveRegions(trims, built, ctx.sheet.sheetW, ctx.sheet.sheetL, ctx.margin);
+  const out: DatumEdge[] = [];
+  const seen = new Set<string>();
+  for (const d of session.datums) {
+    // Skip the implicit trim datums — those are re-derived on reopen.
+    if (implicit.some((im) => im.vertical === d.vertical && Math.abs(im.coord - d.coord) < DATUM_EPS &&
+        Math.abs(im.lo - d.lo) < DATUM_EPS && Math.abs(im.hi - d.hi) < DATUM_EPS)) continue;
+    // Anchor the datum line to whatever live region currently owns that edge.
+    for (const r of regions) {
+      const side = (['left', 'right', 'top', 'bottom'] as DatumEdge['side'][])
+        .find((s) => {
+          const e = edgeLine(r, s);
+          return e.vertical === d.vertical && Math.abs(e.coord - d.coord) < DATUM_EPS &&
+                 e.lo >= d.lo - DATUM_EPS && e.hi <= d.hi + DATUM_EPS;
+        });
+      if (side) {
+        const key = `${regionKey(r)}|${side}`;
+        if (!seen.has(key)) { seen.add(key); out.push({ piece: regionKey(r), side }); }
+      }
+    }
+  }
+  return out;
+}
+
 /** Public entry point — open the editor for a sheet. */
 export function openCutEditor(ctx: CutEditorContext): void {
   const sig = layoutSignature(ctx.sheet);
   const ov = getOverrides(sig);
   const auto = deriveAuto(ctx);
+  const built = builtFromOverrides(ov);
+  const seed = seedRegions(auto.trims, ctx.sheet.sheetW, ctx.sheet.sheetL, ctx.margin);
+  const datums = [
+    ...implicitTrimDatums(seed),
+    ...userDatumsFromOverrides(ov, auto.trims, built, ctx.sheet.sheetW, ctx.sheet.sheetL, ctx.margin),
+  ];
   session = {
     ctx, sig,
     trims: auto.trims,
-    built: builtFromOverrides(ov),
+    built,
     armed: null,
+    datums,
     changed: false,
   };
   hovered = null;
@@ -431,6 +577,7 @@ function closeEditor(): void {
     finalMetrics: metricsOf(steps),
     note,
   });
+  closeEdgeMenu();
   overlay?.remove();
   overlay = null;
   session = null;
@@ -460,21 +607,48 @@ function pieceState(): { pieces: number; finished: number } {
 function commitCandidate(c: Candidate): void {
   if (!session) return;
   const { ctx } = session;
-  const armedFar = !!(session.armed && sameRegion(session.armed.region, c.region) && session.armed.far);
-  const step = candidateToStep(c, ctx.sheet.sheetW, ctx.sheet.sheetL, armedFar);
+  // Measured-from edge resolution, in priority order:
+  //   1. an explicit ARM for this piece (overrides the datum for this cut),
+  //   2. else the piece's DATUM edge (set fromFar when the datum is the far
+  //      parallel edge for this cut's orientation),
+  //   3. else the built-in DEFAULT (near datum corner: L for vertical, T for
+  //      horizontal → fromFar = false).
+  const armedHere = !!(session.armed && sameRegion(session.armed.region, c.region));
+  let fromFar = false;
+  let provenance: 'armed' | 'datum' | 'default' = 'default';
+  if (armedHere) {
+    fromFar = !!session.armed!.far;
+    provenance = 'armed';
+  } else {
+    const ds = datumSideFor(c.region, c.vertical, session.datums);
+    if (ds) {
+      fromFar = ds === 'right' || ds === 'bottom';
+      // The implicit near-datum corner IS the default; only call it 'datum'
+      // when a user datum drives it (far edge, or a non-corner near edge).
+      provenance = 'datum';
+    }
+  }
+  const step = candidateToStep(c, ctx.sheet.sheetW, ctx.sheet.sheetL, fromFar);
   session.built.push(step);
   session.armed = null;
   session.changed = true;
   hovered = null;
   persistSession();
 
+  // Provenance for the log: which edge (near/far in this cut's orientation)
+  // and where the choice came from.
+  const measuredFrom: 'L' | 'R' | 'T' | 'B' = c.vertical
+    ? (fromFar ? 'R' : 'L')
+    : (fromFar ? 'B' : 'T');
   trainingRecorder.append({
     type: 'manual_cut',
     t: Date.now(),
     cut: cutKeyFor(step),
     summary: humanSummary(step, ctx),
-    value: armedFar,
-    armedFar,
+    value: fromFar,
+    armedFar: provenance === 'armed' && fromFar,
+    measuredFrom,
+    measuredProvenance: provenance,
     piece: pieceState(),
     sequenceAfter: session.built.map((s) => cutKeyFor(s)),
     metricsAfter: metricsOf(workingSteps()),
@@ -544,11 +718,79 @@ function undoToHere(keepLayoutCount: number): void {
 
 function resetToTrims(): void {
   if (!session) return;
+  const { ctx } = session;
   session.built = [];
   session.armed = null;
+  // Drop user datums; keep only the implicit trim datums.
+  session.datums = implicitTrimDatums(
+    seedRegions(session.trims, ctx.sheet.sheetW, ctx.sheet.sheetL, ctx.margin));
   session.changed = true;
   hovered = null;
   setOverrides(session.sig, null);
+  ctx.onChange?.();
+  render();
+}
+
+/** Is this region's `side` currently a USER-declared datum edge (i.e. present
+ *  as a datum line that is NOT one of the implicit trim datums)? */
+function isUserDatumSide(r: Region, side: DatumEdge['side']): boolean {
+  if (!session) return false;
+  const { ctx } = session;
+  const implicit = implicitTrimDatums(
+    seedRegions(session.trims, ctx.sheet.sheetW, ctx.sheet.sheetL, ctx.margin));
+  const e = edgeLine(r, side);
+  const onImplicit = implicit.some((im) => im.vertical === e.vertical &&
+    Math.abs(im.coord - e.coord) < DATUM_EPS);
+  if (onImplicit) return false;
+  return edgeIsDatum(r, side, session.datums);
+}
+
+/** Toggle a datum edge on a live piece. Sets the edge as the DEFAULT measuring
+ *  edge for cuts on that piece (and any child that retains it). */
+function setDatumEdge(r: Region, side: DatumEdge['side']): void {
+  if (!session) return;
+  const e = edgeLine(r, side);
+  const already = session.datums.some((d) => d.vertical === e.vertical &&
+    Math.abs(d.coord - e.coord) < DATUM_EPS &&
+    d.lo - DATUM_EPS <= e.lo && e.hi <= d.hi + DATUM_EPS);
+  if (already) return;
+  session.datums.push(e);
+  session.changed = true;
+  persistSession();
+  trainingRecorder.append({
+    type: 'set_datum',
+    t: Date.now(),
+    piece_key: regionKey(r),
+    side,
+    summary: `Datum ${side} on piece ${regionKey(r)}`,
+    sequenceAfter: session.built.map((s) => cutKeyFor(s)),
+    metricsAfter: metricsOf(workingSteps()),
+  });
+  session.ctx.onChange?.();
+  render();
+}
+
+/** Remove a datum edge from a live piece (only user datums; implicit trim
+ *  datums can't be unset). Drops any datum line collinear with this edge. */
+function unsetDatumEdge(r: Region, side: DatumEdge['side']): void {
+  if (!session) return;
+  const e = edgeLine(r, side);
+  const before = session.datums.length;
+  session.datums = session.datums.filter((d) => !(d.vertical === e.vertical &&
+    Math.abs(d.coord - e.coord) < DATUM_EPS &&
+    d.lo - DATUM_EPS <= e.lo && e.hi <= d.hi + DATUM_EPS));
+  if (session.datums.length === before) return;
+  session.changed = true;
+  persistSession();
+  trainingRecorder.append({
+    type: 'unset_datum',
+    t: Date.now(),
+    piece_key: regionKey(r),
+    side,
+    summary: `Unset datum ${side} on piece ${regionKey(r)}`,
+    sequenceAfter: session.built.map((s) => cutKeyFor(s)),
+    metricsAfter: metricsOf(workingSteps()),
+  });
   session.ctx.onChange?.();
   render();
 }
@@ -795,6 +1037,22 @@ function renderDiagram(): void {
   for (const s of trims) appendCutLine(svg, s, W, L, '#2B6CB0', 3);
   for (const s of built) { if (s.isDatum) appendCutLine(svg, s, W, L, '#2B6CB0', 3); }
 
+  // Datum EDGES on pieces — BLUE, same as trim/reference cuts. Only draw USER
+  // datum edges here (implicit trim datums already render via the trims).
+  // Drawn on FINISHED pieces too so the datum stays visible after it has
+  // propagated onto a child that a later cut fully freed.
+  for (const r of regions) {
+    for (const side of ['left', 'right', 'top', 'bottom'] as DatumEdge['side'][]) {
+      if (!isUserDatumSide(r, side)) continue;
+      const e = edgeLine(r, side);
+      if (e.vertical) {
+        svg.appendChild(el('line', { x1: e.coord, y1: e.lo, x2: e.coord, y2: e.hi, stroke: '#2B6CB0', 'stroke-width': 4, class: 'cut-datum-edge' }));
+      } else {
+        svg.appendChild(el('line', { x1: e.lo, y1: e.coord, x2: e.hi, y2: e.coord, stroke: '#2B6CB0', 'stroke-width': 4, class: 'cut-datum-edge' }));
+      }
+    }
+  }
+
   // Armed measured-from edge — GREEN.
   if (session.armed) {
     const a = session.armed;
@@ -873,7 +1131,8 @@ function renderDiagram(): void {
   host.appendChild(svg);
 }
 
-/** An invisible clickable band along one edge of a live piece → arms it. */
+/** An invisible clickable band along one edge of a live piece → opens the edge
+ *  context popup (arm / set-or-unset datum / cancel) at the cursor. */
 function addEdgeBand(svg: SVGSVGElement, r: Region, vertical: boolean, far: boolean): void {
   const band = SNAP_BAND;
   let rect: Record<string, number>;
@@ -884,10 +1143,75 @@ function addEdgeBand(svg: SVGSVGElement, r: Region, vertical: boolean, far: bool
     const y = far ? r.y + r.h - band / 2 : r.y - band / 2;
     rect = { x: r.x, y, width: r.w, height: band };
   }
-  const el2 = el('rect', { ...rect, fill: 'transparent', class: 'cut-edge-band' });
-  (el2 as SVGElement).style.cursor = 'crosshair';
-  el2.addEventListener('click', (e) => { e.stopPropagation(); armEdge(r, vertical, far); });
+  const side: DatumEdge['side'] = vertical ? (far ? 'right' : 'left') : (far ? 'bottom' : 'top');
+  const el2 = el('rect', { ...rect, fill: 'transparent', class: 'cut-edge-band', 'data-side': side });
+  (el2 as SVGElement).style.cursor = 'pointer';
+  el2.addEventListener('click', (e) => { e.stopPropagation(); openEdgeMenu(e as MouseEvent, r, vertical, far, side); });
   svg.appendChild(el2);
+}
+
+// ---------------------------------------------------------------------------
+// Edge context popup — clicking a live piece's edge opens a small menu at the
+// cursor: measure-next-cut-from-here (arm), set/unset datum, cancel.
+// ---------------------------------------------------------------------------
+
+let edgeMenu: HTMLElement | null = null;
+
+function closeEdgeMenu(): void {
+  edgeMenu?.remove();
+  edgeMenu = null;
+  document.removeEventListener('mousedown', onEdgeMenuOutside, true);
+}
+
+function onEdgeMenuOutside(e: MouseEvent): void {
+  if (edgeMenu && !edgeMenu.contains(e.target as Node)) closeEdgeMenu();
+}
+
+function openEdgeMenu(
+  ev: MouseEvent, r: Region, vertical: boolean, far: boolean, side: DatumEdge['side'],
+): void {
+  closeEdgeMenu();
+  if (!session) return;
+  const isDatum = isUserDatumSide(r, side);
+
+  const menu = document.createElement('div');
+  menu.className = 'cut-edge-menu';
+  const armItem = document.createElement('button');
+  armItem.type = 'button';
+  armItem.className = 'cut-edge-menu-item';
+  armItem.textContent = 'Measure next cut from this edge';
+
+  const datumItem = document.createElement('button');
+  datumItem.type = 'button';
+  datumItem.className = 'cut-edge-menu-item';
+  datumItem.textContent = isDatum ? 'Unset datum edge' : 'Set as datum edge';
+
+  const cancelItem = document.createElement('button');
+  cancelItem.type = 'button';
+  cancelItem.className = 'cut-edge-menu-item cut-edge-menu-cancel';
+  cancelItem.textContent = 'Cancel';
+
+  armItem.addEventListener('click', (e) => { e.stopPropagation(); closeEdgeMenu(); armEdge(r, vertical, far); });
+  datumItem.addEventListener('click', (e) => {
+    e.stopPropagation(); closeEdgeMenu();
+    if (isDatum) unsetDatumEdge(r, side); else setDatumEdge(r, side);
+  });
+  cancelItem.addEventListener('click', (e) => { e.stopPropagation(); closeEdgeMenu(); });
+
+  menu.append(armItem, datumItem, cancelItem);
+  document.body.appendChild(menu);
+
+  // Position at the cursor, clamped to the viewport.
+  const mw = menu.offsetWidth, mh = menu.offsetHeight;
+  let x = ev.clientX + 2, y = ev.clientY + 2;
+  if (x + mw > window.innerWidth - 8) x = window.innerWidth - mw - 8;
+  if (y + mh > window.innerHeight - 8) y = window.innerHeight - mh - 8;
+  menu.style.left = `${Math.max(8, x)}px`;
+  menu.style.top = `${Math.max(8, y)}px`;
+
+  edgeMenu = menu;
+  // Defer the outside-click listener so THIS click doesn't immediately close it.
+  setTimeout(() => document.addEventListener('mousedown', onEdgeMenuOutside, true), 0);
 }
 
 function candLineCoords(c: Candidate, _W: number, _L: number): { x1: number; y1: number; x2: number; y2: number } {
@@ -902,15 +1226,24 @@ function candKey(c: Candidate): string {
 }
 function candEq(a: Candidate, b: Candidate): boolean { return candKey(a) === candKey(b); }
 
-/** Quote a hovered candidate the way the PDF would (kerfRef + armed edge). */
+/** Quote a hovered candidate the way the PDF would (kerfRef + measured-from
+ *  edge). Resolution matches commitCandidate: armed edge → datum edge →
+ *  built-in default. */
 function quoteForCandidate(c: Candidate): number {
   if (!session) return 0;
-  const armedFar = !!(session.armed && sameRegion(session.armed.region, c.region) && session.armed.far);
+  const armedHere = !!(session.armed && sameRegion(session.armed.region, c.region));
+  let fromFar = false;
+  if (armedHere) {
+    fromFar = !!session.armed!.far;
+  } else {
+    const ds = datumSideFor(c.region, c.vertical, session.datums);
+    if (ds) fromFar = ds === 'right' || ds === 'bottom';
+  }
   const span = c.vertical ? c.region.w : c.region.h;
   const distance = c.vertical ? c.coord - c.region.x : c.coord - c.region.y;
   const mode = session.ctx.kerfRef;
   const allowance = mode === 'keeper' ? session.ctx.kerf : mode === 'spacing' ? session.ctx.kerf / 2 : 0;
-  const base = armedFar ? span - distance : distance;
+  const base = fromFar ? span - distance : distance;
   return Math.max(0, base - allowance);
 }
 
@@ -960,7 +1293,7 @@ function renderList(): void {
   if (session.built.length === 0) {
     const hint = document.createElement('div');
     hint.className = 'cut-hint';
-    hint.textContent = 'Click a dashed line on the diagram to make the next cut. Click a piece edge first to measure the cut from that edge.';
+    hint.textContent = 'Click a dashed line on the diagram to make the next cut. Click a piece edge to arm it as the measured-from edge or set it as a datum.';
     host.appendChild(hint);
   }
 

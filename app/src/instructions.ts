@@ -68,6 +68,17 @@ export interface PerCutOverride {
   isDatum?: boolean;
 }
 
+/** A user-declared DATUM edge on a piece: the reference edge that cuts on
+ *  that piece are measured from by default. `piece` is the rounded-rect key of
+ *  the parent region (cutKeyFor's `${x},${y},${w},${h}` format); `side` is
+ *  which of the region's four edges is the datum. Persisted so the marking
+ *  survives a re-estimate that reproduces the identical layout; re-applied by
+ *  replaying the trims/cuts and matching regions geometrically. */
+export interface DatumEdge {
+  piece: string;                          // "x,y,w,h" rounded (region key)
+  side: 'top' | 'bottom' | 'left' | 'right';
+}
+
 /** A sheet's full override set: an explicit LAYOUT-cut order (cutKeys, trims
  *  excluded — trims stay pinned at the front) plus per-cut flags. */
 export interface SheetOverrides {
@@ -75,6 +86,10 @@ export interface SheetOverrides {
    *  in their engine order and are not listed here. */
   order?: string[];
   perCut?: Record<string, PerCutOverride>;
+  /** User-marked datum edges (default measuring edges) per piece. Independent
+   *  of `customSteps` — a datum drives the DEFAULT quoted edge for cuts the
+   *  user commits parallel to it without arming. */
+  datumEdges?: DatumEdge[];
   /** A hand-built FULL layout sequence (trims excluded), used when the user
    *  drew cuts on the diagram that the engine's auto tree doesn't contain —
    *  so the `order` cutKey re-ordering can't express it. When present this
