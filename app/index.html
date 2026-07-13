@@ -55,8 +55,8 @@
         <section class="panel panel--group" data-group="stock">
           <h2><span class="panel-dot" aria-hidden="true"></span>Stock</h2>
           <div class="grid2">
-            <label>Width <input id="sheetW" type="number" value="48" step="0.25" /></label>
-            <label>Length <input id="sheetL" type="number" value="96" step="0.25" /></label>
+            <label>Width <input id="sheetW" type="text" inputmode="decimal" value="48" /><span class="dim-sub" id="sheetWSub"></span></label>
+            <label>Length <input id="sheetL" type="text" inputmode="decimal" value="96" /><span class="dim-sub" id="sheetLSub"></span></label>
             <label style="grid-column: 1 / -1">Preset
               <select id="preset">
                 <option value="">— preset —</option>
@@ -88,7 +88,7 @@
         <section class="panel panel--group" data-group="cutting">
           <h2><span class="panel-dot" aria-hidden="true"></span>Cutting</h2>
           <div class="grid2">
-            <label>Edge margin <input id="margin" type="number" value="0.5" step="0.0625" /></label>
+            <label>Edge margin <input id="margin" type="text" inputmode="decimal" value="0.5" /><span class="dim-sub" id="marginSub"></span></label>
             <label>Kerf / spacing
               <select id="kerfSelect">
                 <option value="1.8" selected>1.8 mm</option>
@@ -97,7 +97,8 @@
               </select>
             </label>
             <label id="kerfCustomRow" style="grid-column: 1 / -1" hidden>Custom kerf
-              <input id="kerf" type="number" value="0.125" step="0.0156" />
+              <input id="kerf" type="text" inputmode="decimal" value="0.125" />
+              <span class="dim-sub" id="kerfSub"></span>
             </label>
             <label style="grid-column: 1 / -1">Cut strategy
               <select id="cutStrategy">

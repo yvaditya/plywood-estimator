@@ -44,7 +44,7 @@ import { openCutEditor, loadAllOverrides } from './cutEditor';
 import { splitOversizeParts, type SegmentGeo } from './splitParts';
 import { toRoman } from './nest';
 import type { SplitJoinGroup } from './pdf';
-import { fmtDim, fmtArea, fmtLinear, fmtMoney, fmtSag, toMm, fromMm, type Units } from './units';
+import { fmtDim, fmtArea, fmtLinear, fmtMoney, fmtSag, toMm, fromMm, parseDimInput, type Units } from './units';
 import {
   MATERIALS,
   DEFAULT_MATERIAL_ID,
@@ -216,6 +216,88 @@ const materialSelect = $<HTMLSelectElement>('material');
 const splitOversizeRow = $('splitOversizeRow');
 const splitOversizeCheck = $<HTMLInputElement>('splitOversize');
 const viewerEl = $('viewer');
+
+// --------------------------------------------------------------------------
+// Unit-aware dimension fields (Width / Length / Edge margin / Custom kerf)
+//
+// Each field is the display-side of a single mm-canonical value stored in the
+// element's `dataset.mm`. The user may TYPE in any unit ("24\"", "4mm",
+// "1-1/2\"", "2'") — on change/blur we parse to mm via `parseDimInput`, store
+// mm, re-render the field in the CURRENT display units, and update a small
+// subtext line showing the value in the OTHER unit system. Invalid input
+// reverts to the last-good mm (no error churn). Every downstream read goes
+// through `readFieldMm`, so Estimate/DXF/PDF always receive the same mm as
+// before.
+// --------------------------------------------------------------------------
+const dimFields: { input: HTMLInputElement; sub: HTMLSpanElement }[] = [
+  { input: sheetWInput, sub: $<HTMLSpanElement>('sheetWSub') },
+  { input: sheetLInput, sub: $<HTMLSpanElement>('sheetLSub') },
+  { input: marginInput, sub: $<HTMLSpanElement>('marginSub') },
+  { input: kerfInput,   sub: $<HTMLSpanElement>('kerfSub') },
+];
+const subFor = (input: HTMLInputElement): HTMLSpanElement | null =>
+  dimFields.find((f) => f.input === input)?.sub ?? null;
+
+/** Read a dimension field's canonical mm value. */
+function readFieldMm(input: HTMLInputElement): number {
+  const v = parseFloat(input.dataset.mm ?? '');
+  return Number.isFinite(v) ? v : 0;
+}
+
+/** Render the field text (current units) + subtext (the other unit system). */
+function renderDimField(input: HTMLInputElement, mm: number) {
+  input.dataset.mm = String(mm);
+  const disp = fmtDim(mm, state.units);
+  input.value = disp;
+  // Remember the exact display string so a later change/blur that DIDN'T
+  // retype can skip re-parsing — re-parsing the rounded display (e.g. 3/16")
+  // would drift the canonical mm away from the value the user actually typed
+  // (4 mm → 3/16" → 4.76 mm).
+  input.dataset.disp = disp;
+  const sub = subFor(input);
+  if (sub) {
+    const other: Units = state.units === 'in' ? 'mm' : 'in';
+    sub.textContent = `= ${fmtDim(mm, other)}`;
+  }
+}
+
+/** Store a new mm value on a field and re-render it. */
+function setFieldMm(input: HTMLInputElement, mm: number) {
+  renderDimField(input, mm);
+}
+
+/** Re-render every dimension field + subtext in the current units. */
+function renderAllDimFields() {
+  for (const { input } of dimFields) renderDimField(input, readFieldMm(input));
+}
+
+/** Parse the typed value; commit if valid, revert to last-good mm if not. */
+function commitDimField(input: HTMLInputElement) {
+  // Untouched since the last render (e.g. a blur right after a change) — the
+  // canonical mm is authoritative; don't re-parse the rounded display string.
+  if (input.value.trim() === (input.dataset.disp ?? '').trim()) return;
+  const parsed = parseDimInput(input.value, state.units);
+  if (parsed) {
+    setFieldMm(input, parsed.mm);
+    // The custom-kerf field also persists to localStorage so the choice
+    // survives a reload (mirrors the old #kerf 'input' handler).
+    if (input === kerfInput) persistKerf();
+  } else {
+    // Revert silently to the last-good value.
+    renderDimField(input, readFieldMm(input));
+  }
+}
+
+// Seed each field's canonical mm from its initial HTML value (interpreted in
+// the startup display units) and paint the first subtext.
+for (const { input } of dimFields) {
+  const seed = parseDimInput(input.value, state.units);
+  renderDimField(input, seed ? seed.mm : 0);
+}
+for (const { input } of dimFields) {
+  input.addEventListener('change', () => commitDimField(input));
+  input.addEventListener('blur', () => commitDimField(input));
+}
 
 // Thickness override — standard nominal plywood sizes, exact mm.
 const STANDARD_THICKNESSES_MM = [6.35, 12.7, 19.05, 25.4]; // 1/4″ 1/2″ 3/4″ 1″
@@ -1502,19 +1584,17 @@ presetSelect.addEventListener('change', () => {
   }
   deletePresetBtn.disabled = !v.startsWith('custom:');
   if (!dims) return;
-  sheetWInput.value = formatInput(fromMm(dims[0], state.units));
-  sheetLInput.value = formatInput(fromMm(dims[1], state.units));
+  setFieldMm(sheetWInput, dims[0]);
+  setFieldMm(sheetLInput, dims[1]);
 });
 
 savePresetBtn.addEventListener('click', () => {
-  const wIn = parseFloat(sheetWInput.value);
-  const lIn = parseFloat(sheetLInput.value);
-  if (!Number.isFinite(wIn) || !Number.isFinite(lIn) || wIn <= 0 || lIn <= 0) {
+  const wMm = readFieldMm(sheetWInput);
+  const lMm = readFieldMm(sheetLInput);
+  if (!Number.isFinite(wMm) || !Number.isFinite(lMm) || wMm <= 0 || lMm <= 0) {
     setStatus('Enter a valid width and length before saving a preset.', 'error');
     return;
   }
-  const wMm = toMm(wIn, state.units);
-  const lMm = toMm(lIn, state.units);
   const suggested = `${fmtDim(wMm, state.units)} × ${fmtDim(lMm, state.units)}`;
   const name = (window.prompt('Name this sheet preset:', suggested) || '').trim();
   if (!name) return;
@@ -1539,25 +1619,17 @@ deletePresetBtn.addEventListener('click', () => {
 unitsSelect.addEventListener('change', () => {
   const next = unitsSelect.value as Units;
   if (state.units === next) return;
-  const factor = next === 'in' ? 1 / 25.4 : 25.4;
-  sheetWInput.value = formatInput(parseFloat(sheetWInput.value) * factor);
-  sheetLInput.value = formatInput(parseFloat(sheetLInput.value) * factor);
-  marginInput.value = formatInput(parseFloat(marginInput.value) * factor);
-  // The kerf PRESET options are in mm regardless of units; only the custom
-  // #kerf input carries a display-unit value that needs converting.
-  kerfInput.value = formatInput(parseFloat(kerfInput.value) * factor);
   state.units = next;
+  // Dimension fields carry canonical mm in dataset.mm, so switching units is
+  // a pure re-render: field text flips to the new units, subtext flips to the
+  // other unit system. No arithmetic on the display string (which avoids the
+  // old round-trip precision drift).
+  renderAllDimFields();
   rebuildCustomPresetOptions(); // preset labels show dims in the new units
   renderBodyList();
   renderShoppingList();
   if (state.lastNest && state.lastSheet) renderResults();
 });
-
-function formatInput(v: number): string {
-  if (!Number.isFinite(v)) return '0';
-  // Trim trailing zeros while keeping precision useful for both units
-  return parseFloat(v.toFixed(state.units === 'in' ? 4 : 1)).toString();
-}
 
 // --------------------------------------------------------------------------
 // Job / currency / PDF paper
@@ -1583,7 +1655,7 @@ const KERF_KEY = 'plywood.kerf'; // { mode: 'preset'|'custom', value: mm }
 
 /** Effective kerf in mm from the current select / custom input. */
 function readKerfMm(): number {
-  if (kerfSelect.value === 'custom') return toMm(parseFloat(kerfInput.value), state.units);
+  if (kerfSelect.value === 'custom') return readFieldMm(kerfInput);
   const mm = parseFloat(kerfSelect.value);
   return Number.isFinite(mm) ? mm : 1.8;
 }
@@ -1600,7 +1672,8 @@ function persistKerf() {
   } catch { /* quota */ }
 }
 kerfSelect.addEventListener('change', () => { syncKerfCustomVisibility(); persistKerf(); });
-kerfInput.addEventListener('input', persistKerf);
+// The custom-kerf #kerf field commits (and persists) on change/blur via the
+// shared dimension-field handler — no separate 'input' listener needed.
 // Restore persisted kerf choice.
 try {
   const raw = localStorage.getItem(KERF_KEY);
@@ -1608,7 +1681,7 @@ try {
     const saved = JSON.parse(raw);
     if (saved?.mode === 'custom') {
       kerfSelect.value = 'custom';
-      kerfInput.value = formatInput(fromMm(saved.value, state.units));
+      setFieldMm(kerfInput, saved.value);
     } else if (saved?.mode === 'preset') {
       kerfSelect.value = String(saved.value);
     }
@@ -1725,9 +1798,9 @@ renderShoppingList();
 async function runEstimate(opts: { seed?: number; deepSearch?: boolean } = {}) {
   const selected = state.bodies.filter((b) => b.selected);
   if (selected.length === 0) return;
-  const sheetW = toMm(parseFloat(sheetWInput.value), state.units);
-  const sheetL = toMm(parseFloat(sheetLInput.value), state.units);
-  const margin = toMm(parseFloat(marginInput.value), state.units);
+  const sheetW = readFieldMm(sheetWInput);
+  const sheetL = readFieldMm(sheetLInput);
+  const margin = readFieldMm(marginInput);
   const kerf = readKerfMm();
   const restarts = parseInt(restartsSelect.value) || 8;
 
