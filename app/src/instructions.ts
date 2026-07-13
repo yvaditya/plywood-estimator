@@ -47,6 +47,68 @@ export interface CutStep {
    *  step — with a parallel guide the flip stops are already set, so the
    *  user just slides the stock against them and cuts. */
   sameSetting?: boolean;
+  /** Manual override: quote the dimension from the FAR parallel edge of the
+   *  parent (R for vertical cuts, B for horizontal) instead of the near
+   *  datum edge (L/T). The green measured-from highlight + PDF caption move
+   *  with it. */
+  fromFar?: boolean;
+  /** Manual override: this cut is a REFERENCE (datum) cut — rendered blue
+   *  like trims (drawn after the fade) and chipped "REF" in the editor.
+   *  Trim cuts are datum by default. */
+  isDatum?: boolean;
+}
+
+// ---------------------------------------------------------------------------
+// Manual cut-sequence overrides (edited in the popup, persisted by main.ts).
+// ---------------------------------------------------------------------------
+
+/** Per-cut manual flags keyed by `cutKeyFor(step)`. */
+export interface PerCutOverride {
+  fromFar?: boolean;
+  isDatum?: boolean;
+}
+
+/** A sheet's full override set: an explicit LAYOUT-cut order (cutKeys, trims
+ *  excluded — trims stay pinned at the front) plus per-cut flags. */
+export interface SheetOverrides {
+  /** Ordered cutKeys for the NON-TRIM steps. Trims are always emitted first
+   *  in their engine order and are not listed here. */
+  order?: string[];
+  perCut?: Record<string, PerCutOverride>;
+}
+
+/**
+ * Stable identity for a cut step, used as the override map key and the
+ * training-log identifier. Axis + rounded parent rect + rounded distance —
+ * survives a re-estimate that produces the identical layout. Rounded to 1mm
+ * to match the countFreedParts / parent-matching tolerance.
+ */
+export function cutKeyFor(s: {
+  axis: 'rip' | 'cross';
+  distance: number;
+  parentX: number; parentY: number; parentW: number; parentH: number;
+}): string {
+  const r = (n: number) => Math.round(n);
+  return `${s.axis}|${r(s.parentX)},${r(s.parentY)},${r(s.parentW)},${r(s.parentH)}|${r(s.distance)}`;
+}
+
+/**
+ * Signature of a sheet LAYOUT (dims + part rects + the auto cut list). The
+ * override map is keyed by this so overrides re-apply only when a
+ * re-estimate reproduces the identical layout. Independent of margin/kerf so
+ * it stays stable while the user is only tweaking the sequence.
+ */
+export function layoutSignature(sheet: NestSheet): string {
+  const r = (n: number) => Math.round(n);
+  const dims = `${r(sheet.sheetW)}x${r(sheet.sheetL)}x${r(sheet.thickness * 10)}`;
+  const parts = sheet.parts
+    .map((p) => `${r(p.x)},${r(p.y)},${r(p.w)},${r(p.h)}`)
+    .sort()
+    .join(';');
+  const cuts = (sheet.cuts ?? [])
+    .map((c) => `${c.axis}${r(c.parentX)},${r(c.parentY)},${r(c.parentW)},${r(c.parentH)},${r(c.distance)}`)
+    .join('|');
+  return `${dims}#${parts}#${cuts}`;
 }
 
 export interface SheetCuts {
@@ -125,12 +187,20 @@ export function indexToLetters(i: number): string {
  *     APPROXIMATION — such lines may cross neighbouring panels — kept solely
  *     as a defensive last resort.
  */
+/** Kerf-reference mode — how the far reference trim is placed and how cut
+ *  dimensions are quoted (the latter lives in pdf.ts quotedDistance). In
+ *  'spacing' mode the far long trim lands exactly at the last part's edge
+ *  (no +kerf/2), so the quoted spacing lands on the part face. */
+export type KerfRef = 'keeper' | 'center' | 'spacing';
+
 export function cutStepsForSheet(
   sheet: NestSheet,
   sheetIndex: number,
   groupIndex: number,
   margin = 0,
   kerf = 0,
+  overrides?: SheetOverrides,
+  kerfRef: KerfRef = 'keeper',
 ): SheetCuts {
   const W = sheet.sheetW;
   const L = sheet.sheetL;
@@ -180,7 +250,11 @@ export function cutStepsForSheet(
       const ext = longVertical
         ? Math.max(...sheet.parts.map((p) => p.x + p.w))
         : Math.max(...sheet.parts.map((p) => p.y + p.h));
-      farLongAt = Math.min(farLongAt, ext + kerf / 2);
+      // 'spacing' mode registers on the part face itself — the trim lands
+      // exactly at the last part's edge (no blade offset); other modes push
+      // half a kerf into the waste to square the edge cleanly.
+      const off = kerfRef === 'spacing' ? 0 : kerf / 2;
+      farLongAt = Math.min(farLongAt, ext + off);
     }
     const longs = () => longVertical
       ? (addV(m, true), addV(farLongAt, false))
@@ -200,6 +274,41 @@ export function cutStepsForSheet(
       const p = all[i - 1], c = all[i];
       if (c.axis === p.axis && Math.abs(c.distance - p.distance) < 0.5) c.sameSetting = true;
     }
+    return all;
+  };
+
+  // Apply manual overrides to a [trims..., layout...] step list. Trims stay
+  // pinned at the front in their engine order; the layout tail is reordered
+  // to the saved `order` (any cutKeys not present keep their relative order,
+  // appended after). Per-cut fromFar/isDatum flags are stamped on. Trims are
+  // datum by default. Step indices + sameSetting are recomputed by the caller
+  // via markSameSetting after this returns.
+  const applyOverrides = (trims: CutStep[], layout: CutStep[]): CutStep[] => {
+    let orderedLayout = layout;
+    if (overrides?.order && overrides.order.length > 0) {
+      const rank = new Map<string, number>();
+      overrides.order.forEach((k, i) => rank.set(k, i));
+      // Stable sort by saved rank; unknown keys sink to the end preserving
+      // their engine order.
+      orderedLayout = layout
+        .map((s, i) => ({ s, i }))
+        .sort((a, b) => {
+          const ra = rank.has(cutKeyFor(a.s)) ? rank.get(cutKeyFor(a.s))! : Number.MAX_SAFE_INTEGER;
+          const rb = rank.has(cutKeyFor(b.s)) ? rank.get(cutKeyFor(b.s))! : Number.MAX_SAFE_INTEGER;
+          return ra - rb || a.i - b.i;
+        })
+        .map((e) => e.s);
+    }
+    const all = [...trims, ...orderedLayout];
+    for (const s of all) {
+      if (s.isTrim) { s.isDatum = true; continue; }
+      const o = overrides?.perCut?.[cutKeyFor(s)];
+      if (o) {
+        if (o.fromFar) s.fromFar = true;
+        if (o.isDatum) s.isDatum = true;
+      }
+    }
+    all.forEach((s, i) => { s.index = i + 1; });
     return all;
   };
 
@@ -243,7 +352,7 @@ export function cutStepsForSheet(
     return {
       sheetIndex, globalIndex: sheet.globalIndex || sheetIndex, groupIndex,
       thickness: sheet.thickness, sheetW: W, sheetL: L,
-      steps: markSameSetting([...trimSteps, ...deduped]),
+      steps: markSameSetting(applyOverrides(trimSteps, deduped)),
       isGuillotineTree: true,
     };
   }
@@ -274,7 +383,7 @@ export function cutStepsForSheet(
   return {
     sheetIndex, globalIndex: sheet.globalIndex || sheetIndex, groupIndex,
     thickness: sheet.thickness, sheetW: W, sheetL: L,
-    steps: markSameSetting([...trimSteps, ...steps]),
+    steps: markSameSetting(applyOverrides(trimSteps, steps)),
     isGuillotineTree: false,
   };
 }
@@ -368,12 +477,22 @@ function comparePanelCode(a: string, b: string): number {
   return a.localeCompare(b);
 }
 
-/** Generate cut step lists for every sheet in the job, in order. */
-export function allCutSteps(result: NestResult, margin = 0, kerf = 0): SheetCuts[] {
+/** Generate cut step lists for every sheet in the job, in order.
+ *  `overridesBySig` maps a sheet's `layoutSignature` → its manual overrides;
+ *  when a sheet's signature is present the saved order/edges/datum flags are
+ *  applied (see cutStepsForSheet). */
+export function allCutSteps(
+  result: NestResult,
+  margin = 0,
+  kerf = 0,
+  overridesBySig?: Record<string, SheetOverrides>,
+  kerfRef: KerfRef = 'keeper',
+): SheetCuts[] {
   const out: SheetCuts[] = [];
   result.groups.forEach((g, gi) => {
     g.sheets.forEach((s, si) => {
-      out.push(cutStepsForSheet(s, si + 1, gi + 1, margin, kerf));
+      const ov = overridesBySig?.[layoutSignature(s)];
+      out.push(cutStepsForSheet(s, si + 1, gi + 1, margin, kerf, ov, kerfRef));
     });
   });
   return out;

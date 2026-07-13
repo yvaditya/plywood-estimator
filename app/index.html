@@ -79,8 +79,17 @@
                 <option value="mm">mm</option>
               </select>
             </label>
-            <label>Edge margin <input id="margin" type="number" value="0.25" step="0.0625" /></label>
-            <label style="grid-column: 1 / -1">Kerf / spacing <input id="kerf" type="number" value="0.125" step="0.0156" /></label>
+            <label>Edge margin <input id="margin" type="number" value="0.5" step="0.0625" /></label>
+            <label>Kerf / spacing
+              <select id="kerfSelect">
+                <option value="1.8" selected>1.8 mm</option>
+                <option value="2.5">2.5 mm</option>
+                <option value="custom">Custom…</option>
+              </select>
+            </label>
+            <label id="kerfCustomRow" style="grid-column: 1 / -1" hidden>Custom kerf
+              <input id="kerf" type="number" value="0.125" step="0.0156" />
+            </label>
           </div>
         </section>
 
@@ -119,9 +128,12 @@
                 <option value="25.4">1″ (4/4) · 25.4 mm</option>
               </select>
             </label>
-            <label class="check-row" style="grid-column: 1 / -1" title="Quote each cut as the flip-stop setting: from the registered edge to the near side of the kerf">
-              <input type="checkbox" id="parallelGuide" checked />
-              <span>Parallel guide dims (measure to cut edge)</span>
+            <label style="grid-column: 1 / -1" title="How each cut's dimension is quoted at the saw">Kerf reference
+              <select id="kerfRef">
+                <option value="keeper" selected>Parallel guide — keeper edge</option>
+                <option value="center">Kerf centre</option>
+                <option value="spacing">Spacing only — no blade compensation</option>
+              </select>
             </label>
             <label id="splitOversizeRow" class="check-row" style="grid-column: 1 / -1" hidden>
               <input type="checkbox" id="splitOversize" />

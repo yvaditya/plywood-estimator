@@ -38,7 +38,8 @@ import {
   saveJobName,
   type ShoppingRow,
 } from './shoppingList';
-import { assignPartLabels, type PartLabel } from './instructions';
+import { assignPartLabels, type PartLabel, type KerfRef } from './instructions';
+import { openCutEditor, loadAllOverrides } from './cutEditor';
 import { splitOversizeParts, type SegmentGeo } from './splitParts';
 import { toRoman } from './nest';
 import type { SplitJoinGroup } from './pdf';
@@ -72,6 +73,8 @@ const state: {
   shopping: ShoppingRow[];
   currentSheetKey: string | null;   // "g{groupIdx}-s{sheetIdx}"
   currency: string;
+  /** How each cut's dimension is quoted at the saw (persisted). */
+  kerfRef: KerfRef;
   jobName: string;
   partLabels: Map<string, PartLabel>;
   nonSheetCount: number;
@@ -102,6 +105,7 @@ const state: {
   shopping: [],
   currentSheetKey: null,
   currency: 'USD',
+  kerfRef: 'keeper',
   jobName: '',
   partLabels: new Map(),
   nonSheetCount: 0,
@@ -193,7 +197,9 @@ const shopTotals = $('shopTotals');
 const jobNameInput = $<HTMLInputElement>('jobName');
 const currencySelect = $<HTMLSelectElement>('currency');
 const pdfPaperSelect = $<HTMLSelectElement>('pdfPaper');
-const parallelGuideCheck = $<HTMLInputElement>('parallelGuide');
+const kerfRefSelect = $<HTMLSelectElement>('kerfRef');
+const kerfSelect = $<HTMLSelectElement>('kerfSelect');
+const kerfCustomRow = $('kerfCustomRow');
 
 // --------------------------------------------------------------------------
 // Viewer
@@ -826,6 +832,8 @@ unitsSelect.addEventListener('change', () => {
   sheetWInput.value = formatInput(parseFloat(sheetWInput.value) * factor);
   sheetLInput.value = formatInput(parseFloat(sheetLInput.value) * factor);
   marginInput.value = formatInput(parseFloat(marginInput.value) * factor);
+  // The kerf PRESET options are in mm regardless of units; only the custom
+  // #kerf input carries a display-unit value that needs converting.
   kerfInput.value = formatInput(parseFloat(kerfInput.value) * factor);
   state.units = next;
   rebuildCustomPresetOptions(); // preset labels show dims in the new units
@@ -852,6 +860,58 @@ jobNameInput.addEventListener('input', () => {
 currencySelect.addEventListener('change', () => {
   state.currency = currencySelect.value;
   renderShoppingList();
+});
+
+// --------------------------------------------------------------------------
+// Kerf select — options are labelled in mm regardless of display units; the
+// preset values (1.8 / 2.5 mm) are stored in mm. "Custom…" reveals the
+// numeric #kerf input, which stays in the user's display units (as before).
+// --------------------------------------------------------------------------
+const KERFREF_KEY = 'plywood.kerfRef';
+const KERF_KEY = 'plywood.kerf'; // { mode: 'preset'|'custom', value: mm }
+
+/** Effective kerf in mm from the current select / custom input. */
+function readKerfMm(): number {
+  if (kerfSelect.value === 'custom') return toMm(parseFloat(kerfInput.value), state.units);
+  const mm = parseFloat(kerfSelect.value);
+  return Number.isFinite(mm) ? mm : 1.8;
+}
+function syncKerfCustomVisibility() {
+  kerfCustomRow.hidden = kerfSelect.value !== 'custom';
+}
+function persistKerf() {
+  try {
+    localStorage.setItem(KERF_KEY, JSON.stringify(
+      kerfSelect.value === 'custom'
+        ? { mode: 'custom', value: readKerfMm() }
+        : { mode: 'preset', value: kerfSelect.value },
+    ));
+  } catch { /* quota */ }
+}
+kerfSelect.addEventListener('change', () => { syncKerfCustomVisibility(); persistKerf(); });
+kerfInput.addEventListener('input', persistKerf);
+// Restore persisted kerf choice.
+try {
+  const raw = localStorage.getItem(KERF_KEY);
+  if (raw) {
+    const saved = JSON.parse(raw);
+    if (saved?.mode === 'custom') {
+      kerfSelect.value = 'custom';
+      kerfInput.value = formatInput(fromMm(saved.value, state.units));
+    } else if (saved?.mode === 'preset') {
+      kerfSelect.value = String(saved.value);
+    }
+  }
+} catch { /* ignore */ }
+syncKerfCustomVisibility();
+
+// Kerf-reference mode (keeper / center / spacing) — persisted like currency.
+state.kerfRef = (localStorage.getItem(KERFREF_KEY) as KerfRef) || 'keeper';
+kerfRefSelect.value = state.kerfRef;
+kerfRefSelect.addEventListener('change', () => {
+  state.kerfRef = kerfRefSelect.value as KerfRef;
+  try { localStorage.setItem(KERFREF_KEY, state.kerfRef); } catch { /* quota */ }
+  if (state.lastNest) renderResults();
 });
 
 // --------------------------------------------------------------------------
@@ -957,7 +1017,7 @@ async function runEstimate(opts: { seed?: number; deepSearch?: boolean } = {}) {
   const sheetW = toMm(parseFloat(sheetWInput.value), state.units);
   const sheetL = toMm(parseFloat(sheetLInput.value), state.units);
   const margin = toMm(parseFloat(marginInput.value), state.units);
-  const kerf = toMm(parseFloat(kerfInput.value), state.units);
+  const kerf = readKerfMm();
   const restarts = parseInt(restartsSelect.value) || 8;
 
   const parts: NestPart[] = selected.map((b) => ({
@@ -1315,6 +1375,28 @@ function renderResults() {
           ${fmtDim(tw, state.units)} × ${fmtDim(tl, state.units)}
         </div>`;
       entry.appendChild(head);
+      // "Edit cuts" — opens the manual cut-sequence editor for this sheet.
+      // Panel-saw / track-saw sheets only (CNC sheets have no cut tree).
+      if (!isCncStrategy(state.lastStrategy) && sh.cuts && sh.cuts.length > 0) {
+        const editBtn = document.createElement('button');
+        editBtn.type = 'button';
+        editBtn.className = 'edit-cuts-btn';
+        editBtn.textContent = 'Edit cuts';
+        editBtn.addEventListener('click', (e) => {
+          e.stopPropagation();
+          openCutEditor({
+            sheet: sh,
+            margin: sz.margin,
+            kerf: sz.kerf,
+            units: state.units,
+            kerfRef: state.kerfRef,
+            strategy: state.lastStrategy,
+            jobName: state.jobName || 'Plywood cut estimate',
+            onChange: () => { /* overrides persisted by the editor; PDF reads them */ },
+          });
+        });
+        head.appendChild(editBtn);
+      }
       const svgWrap = document.createElement('div');
       svgWrap.className = 'sheet-entry-svg';
       svgWrap.appendChild(buildSheetSvg(sh, tw, tl, sz.margin, true));
@@ -2019,7 +2101,8 @@ async function exportPdf(btn: HTMLButtonElement, paper: string) {
     inventoryCheck: invChecks,
     jobName: state.jobName || 'Plywood cut estimate',
     paper: paper as any,
-    parallelGuide: parallelGuideCheck.checked,
+    kerfRef: state.kerfRef,
+    overridesBySig: loadAllOverrides(),
     currency: state.currency,
     jobCost: totalCost(state.shopping),
     edgeBandingMm: edgeMm,
