@@ -217,8 +217,8 @@ export function buildStep(parts: StepPart[], isoDate: string): string {
   return [
     'ISO-10303-21;',
     'HEADER;',
-    "FILE_DESCRIPTION(('Unplaced parts from furniture-companion'),'2;1');",
-    `FILE_NAME('unplaced-parts.step','${isoDate}',(''),(''),'furniture-companion','furniture-companion','');`,
+    "FILE_DESCRIPTION(('Unplaced parts from woodworking-companion'),'2;1');",
+    `FILE_NAME('unplaced-parts.step','${isoDate}',(''),(''),'woodworking-companion','woodworking-companion','');`,
     "FILE_SCHEMA(('AUTOMOTIVE_DESIGN { 1 0 10303 214 1 1 1 1 }'));",
     'ENDSEC;',
     'DATA;',

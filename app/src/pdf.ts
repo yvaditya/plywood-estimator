@@ -12,7 +12,7 @@
 import { jsPDF } from 'jspdf';
 import type { NestResult, NestSheet, PlacedPart } from './nest';
 import { fmtDim, fmtArea, fmtSag, type Units } from './units';
-import { assignPartLabels, allCutSteps, groupPanelsBySize, groupAllPanelsBySize, type PartLabel, type PanelSizeRow, type SheetOverrides, type KerfRef } from './instructions';
+import { assignPartLabels, allCutSteps, cutKeyFor, groupPanelsBySize, groupAllPanelsBySize, type CutStep, type PartLabel, type PanelSizeRow, type SheetOverrides, type KerfRef } from './instructions';
 
 export type PdfPaper =
   | 'widescreen-16-9'
@@ -998,9 +998,15 @@ function drawMobileCutPage(
   } else {
     label = cur.axis === 'rip' ? 'Rip' : 'Crosscut';
     // Distances run from the parent's datum corner (top-left): vertical
-    // lines measure from the LEFT edge, horizontal lines from the TOP.
+    // lines measure from the LEFT edge, horizontal lines from the TOP —
+    // unless flipped to the far edge, or chain-dimensioned off a previous cut.
     const vertical = (sc.sheetL >= sc.sheetW) ? cur.axis === 'rip' : cur.axis === 'cross';
-    edgeRef = vertical ? 'from the LEFT edge' : 'from the TOP edge';
+    const refCut = cur.measureFromCut ? findCutByKey(sc, cur.measureFromCut) : null;
+    edgeRef = refCut
+      ? `from cut ${refCut.index}`
+      : vertical
+        ? (cur.fromFar ? 'from the RIGHT edge' : 'from the LEFT edge')
+        : (cur.fromFar ? 'from the BOTTOM edge' : 'from the TOP edge');
   }
   doc.setFont('helvetica', 'bold');
   doc.setFontSize(26);
@@ -2672,7 +2678,7 @@ function drawHeaderFooter(
   doc.setDrawColor(225);
   doc.line(PAGE_PAD, fy - 8, PAGE_W - PAGE_PAD, fy - 8);
   doc.setTextColor(140);
-  doc.text('furniture-companion', PAGE_PAD, fy);
+  doc.text('woodworking-companion', PAGE_PAD, fy);
   doc.text(`Page ${pageNum} of ${pageTotal}`, PAGE_W / 2, fy, { align: 'center' });
   doc.text(dateStr, PAGE_W - PAGE_PAD, fy, { align: 'right' });
   doc.setTextColor(0);
@@ -2717,10 +2723,15 @@ function drawCutCard(
     // Distances run from the parent's datum corner (top-left): vertical
     // lines measure from the LEFT edge, horizontal lines from the TOP —
     // unless flipped to the FAR edge (R for vertical, B for horizontal).
+    // A `measureFromCut` chain-dimensions off a PREVIOUS cut's fresh edge:
+    // caption reads "from cut N" (N = that cut's index in the final sequence).
     const vertical = (sc.sheetL >= sc.sheetW) ? cur.axis === 'rip' : cur.axis === 'cross';
-    edgeRef = vertical
-      ? (cur.fromFar ? 'from R edge' : 'from L edge')
-      : (cur.fromFar ? 'from B edge' : 'from T edge');
+    const refCut = cur.measureFromCut ? findCutByKey(sc, cur.measureFromCut) : null;
+    edgeRef = refCut
+      ? `from cut ${refCut.index}`
+      : vertical
+        ? (cur.fromFar ? 'from R edge' : 'from L edge')
+        : (cur.fromFar ? 'from B edge' : 'from T edge');
   }
   const refChip = cur.isDatum && !cur.isTrim ? '  ·  REF' : '';
   const settingNote = cur.sameSetting ? '  ·  same setting' : '';
@@ -2743,8 +2754,8 @@ function drawCutCard(
  *     value is parentSpan − distance − kerfAllowance.
  */
 function quotedDistance(
-  cur: { isTrim?: boolean; distance: number; axis: 'rip' | 'cross'; parentW: number; parentH: number; fromFar?: boolean },
-  sc: { sheetW: number; sheetL: number },
+  cur: CutStep,
+  sc: { sheetW: number; sheetL: number; steps: CutStep[] },
   opt: PdfOptions,
 ): number {
   const lengthIsY = sc.sheetL >= sc.sheetW;
@@ -2753,8 +2764,27 @@ function quotedDistance(
   if (cur.isTrim) return Math.min(cur.distance, span - cur.distance);
   const mode = opt.kerfRef ?? 'keeper';
   const allowance = mode === 'keeper' ? opt.kerf : mode === 'spacing' ? opt.kerf / 2 : 0;
+  // Chain dimensioning: quote from a PREVIOUS parallel cut's fresh edge —
+  // |this line − that line| minus the kerf allowance (the parallel-guide
+  // flip-stop registers off the fresh-cut edge, same kerf comp as any keeper).
+  if (cur.measureFromCut) {
+    const ref = findCutByKey(sc, cur.measureFromCut);
+    if (ref) {
+      const thisLine = (vertical ? cur.parentX : cur.parentY) + cur.distance;
+      const refVertical = lengthIsY ? ref.axis === 'rip' : ref.axis === 'cross';
+      const refLine = (refVertical ? ref.parentX : ref.parentY) + ref.distance;
+      return Math.max(0, Math.abs(thisLine - refLine) - allowance);
+    }
+  }
   const base = cur.fromFar ? span - cur.distance : cur.distance;
   return Math.max(0, base - allowance);
+}
+
+/** Find a step in the sheet's final sequence by its cutKeyFor() key — used to
+ *  resolve a `measureFromCut` reference to the actual referenced cut (for its
+ *  index in the caption + its line coordinate in the green highlight). */
+function findCutByKey(sc: { steps: CutStep[] }, key: string): CutStep | null {
+  return sc.steps.find((s) => cutKeyFor(s) === key) ?? null;
 }
 
 /**
@@ -2895,10 +2925,24 @@ function drawCutDiagram(
   // ("from L/T" near edge, or "from R/B" far edge when fromFar). Left/top for
   // vertical/horizontal cuts by default; the opposite edge when flipped. This
   // is where the parallel-guide stops register.
+  //
+  // Chain dimensioning (`measureFromCut`): the reference is a PREVIOUS cut's
+  // fresh edge, not a piece edge — draw the green highlight on that CUT LINE
+  // (within its own parent piece) instead.
   const measVertical = (sc.sheetL >= sc.sheetW) ? cur.axis === 'rip' : cur.axis === 'cross';
   doc.setDrawColor(47, 133, 90);
   doc.setLineWidth(1.6);
-  if (measVertical) {
+  const refCut = cur.measureFromCut ? findCutByKey(sc, cur.measureFromCut) : null;
+  if (refCut) {
+    const refVertical = (sc.sheetL >= sc.sheetW) ? refCut.axis === 'rip' : refCut.axis === 'cross';
+    if (refVertical) {
+      const rx = ox + (refCut.parentX + refCut.distance) * scale;
+      doc.line(rx, oy + refCut.parentY * scale, rx, oy + (refCut.parentY + refCut.parentH) * scale);
+    } else {
+      const ry = oy + (refCut.parentY + refCut.distance) * scale;
+      doc.line(ox + refCut.parentX * scale, ry, ox + (refCut.parentX + refCut.parentW) * scale, ry);
+    }
+  } else if (measVertical) {
     const gx = cur.fromFar ? pX + pW : pX;
     doc.line(gx, pY, gx, pY + pH);
   } else {
