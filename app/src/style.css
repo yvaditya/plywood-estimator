@@ -181,11 +181,11 @@ body {
    cards — only as gently zoned regions separated by the existing hairlines.
    --------------------------------------------------------------------------- */
 :root {
-  --tint-stock:   hsl(40, 46%, 97.2%);   /* warm sand      */
-  --tint-cutting: hsl(212, 40%, 97.3%);  /* cool blue-grey */
-  --tint-parts:   hsl(142, 30%, 97.3%);  /* faint green    */
-  --tint-job:     hsl(268, 34%, 97.6%);  /* faint violet   */
-  --tint-shopping:hsl(38, 60%, 96.8%);   /* faint amber    */
+  --tint-stock:   hsl(40, 56%, 96.2%);   /* warm sand      */
+  --tint-cutting: hsl(212, 50%, 96.3%);  /* cool blue-grey */
+  --tint-parts:   hsl(142, 40%, 96.3%);  /* faint green    */
+  --tint-job:     hsl(268, 44%, 96.6%);  /* faint violet   */
+  --tint-shopping:hsl(38, 70%, 95.8%);   /* faint amber    */
 }
 .panel--group {
   margin-left: -12px;
@@ -204,6 +204,32 @@ body {
 .panel--group[data-group="parts"]    { background: var(--tint-parts); }
 .panel--group[data-group="job"]      { background: var(--tint-job); }
 .panel--group[data-group="shopping"] { background: var(--tint-shopping); }
+
+/* Group headings — distinct from body text: right-indexed (right-aligned),
+   colored to the group's own hue so each zone labels itself. #sidebar bumps
+   specificity above the base `.panel h2` rule. */
+#sidebar .panel--group > h2 {
+  display: flex;
+  justify-content: flex-end;
+  text-align: right;
+  letter-spacing: 0.12em;
+  font-weight: 700;
+}
+/* Header rows that carry buttons (Parts, Shopping): heading moves to the
+   right end of the row, actions to the left — same right index. */
+#sidebar .panel--group > .row-between h2 {
+  order: 2;
+  margin-left: auto;
+  letter-spacing: 0.12em;
+  font-weight: 700;
+}
+#sidebar .panel--group > .row-between .row-gap { order: 1; }
+#sidebar .panel--group[data-group="stock"] h2    { color: hsl(40, 55%, 38%); }
+#sidebar .panel--group[data-group="cutting"] h2  { color: hsl(212, 45%, 42%); }
+#sidebar .panel--group[data-group="parts"] h2    { color: hsl(142, 40%, 34%); }
+#sidebar .panel--group[data-group="job"] h2      { color: hsl(268, 35%, 44%); }
+#sidebar .panel--group[data-group="shopping"] h2 { color: hsl(38, 60%, 36%); }
+
 
 .panel h2 {
   margin: 0 0 10px;
