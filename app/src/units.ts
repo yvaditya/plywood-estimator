@@ -54,6 +54,16 @@ export function fmtDim(mm: number, units: Units, denom = 16): string {
   return `${mm.toFixed(1)} mm`;
 }
 
+/**
+ * Format a small deflection/sag length. Fractional-inch rounding (1/16")
+ * swallows sub-millimetre sags to 0", so sag gets decimal precision:
+ * mm → 1 dp, inches → 2 dp (0.02"), always with the unit suffix.
+ */
+export function fmtSag(mm: number, units: Units): string {
+  if (units === 'in') return `${(mm / MM_PER_INCH).toFixed(2)}"`;
+  return `${mm.toFixed(mm < 10 ? 2 : 1)} mm`;
+}
+
 /** Format an area given in mm². */
 export function fmtArea(mm2: number, units: Units): string {
   if (units === 'in') {

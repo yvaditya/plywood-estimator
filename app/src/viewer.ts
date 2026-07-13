@@ -106,6 +106,15 @@ export class Viewer {
   private root = new THREE.Group();
   private grainGroup = new THREE.Group();
   private nonSheetGroup = new THREE.Group();
+  /** Overlays for the quick-CAE feature: deflection heatmap meshes, force
+   *  arrows, and the "weak panel" outline tints. Cleared per body via the
+   *  clearCae* helpers so they never permanently alter the body material. */
+  private caeGroup = new THREE.Group();
+  private caeWeakOutlines = new Map<number, THREE.LineSegments>();
+  private caeOverlays = new Map<number, THREE.Object3D>();
+  /** When set, the next body-face click is captured for force placement
+   *  instead of toggling selection. */
+  private caePlacePick: { bodyId: number; cb: (p: THREE.Vector3, n: THREE.Vector3) => void } | null = null;
   private grainArrows = new Map<number, THREE.Group>();
   private grainConfigs = new Map<number, GrainArrowConfig>();
   private grainStates = new Map<number, GrainLock>();
@@ -226,6 +235,7 @@ export class Viewer {
     this.scene.add(this.root);
     this.scene.add(this.grainGroup);
     this.scene.add(this.nonSheetGroup);
+    this.scene.add(this.caeGroup);
 
     // ----- Post-processing chain -------------------------------------------
     // We render into a HalfFloat target so AgX has headroom and the outline
@@ -401,6 +411,128 @@ export class Viewer {
     }
   }
 
+  // -------------------------------------------------------------------------
+  // Quick-CAE overlays
+  // -------------------------------------------------------------------------
+
+  /**
+   * Mark a set of bodies as "structurally weak" (screening verdict === weak).
+   * Renders a subtle orange edge outline over each — no halo, no fill change,
+   * just a slightly warmer outline that survives dimming. Minimal-UI rule.
+   */
+  setWeakBodies(ids: Iterable<number>) {
+    const want = new Set(ids);
+    // remove outlines no longer wanted
+    for (const [id, ls] of this.caeWeakOutlines) {
+      if (!want.has(id)) {
+        this.caeGroup.remove(ls);
+        disposeObject3D(ls);
+        this.caeWeakOutlines.delete(id);
+      }
+    }
+    for (const id of want) {
+      if (this.caeWeakOutlines.has(id)) continue;
+      const body = this.bodies.find((b) => b.id === id);
+      if (!body) continue;
+      const geom = new THREE.EdgesGeometry(body.mesh.geometry as THREE.BufferGeometry, 25);
+      const ls = new THREE.LineSegments(
+        geom,
+        new THREE.LineBasicMaterial({ color: 0xe8871e, transparent: true, opacity: 0.9, depthTest: true }),
+      );
+      // body meshes carry raw world-coord vertices with identity transform, so
+      // the outline sits exactly on the body without extra placement.
+      ls.renderOrder = 4;
+      this.caeGroup.add(ls);
+      this.caeWeakOutlines.set(id, ls);
+    }
+  }
+
+  /** Enter "place force" mode for a body — the next click on that body's face
+   *  fires `cb(point, faceNormal)` (world coords) instead of selecting. */
+  beginForcePlacement(bodyId: number, cb: (point: [number, number, number], normal: [number, number, number]) => void) {
+    this.caePlacePick = {
+      bodyId,
+      cb: (p, n) => cb([p.x, p.y, p.z], [n.x, n.y, n.z]),
+    };
+  }
+  cancelForcePlacement() { this.caePlacePick = null; }
+
+  /** Draw a red arrow at `point`, pointing along `-dir` (into the face). */
+  showForceArrow(bodyId: number, point: [number, number, number], dir: [number, number, number], len: number) {
+    this.clearForceArrow(bodyId);
+    const origin = new THREE.Vector3(...point);
+    const d = new THREE.Vector3(...dir).normalize();
+    // Arrow points INTO the face: start above the surface, aim at the point.
+    const start = origin.clone().addScaledVector(d, len);
+    const arrow = new THREE.ArrowHelper(d.clone().negate(), start, len, 0xd6353b, len * 0.28, len * 0.16);
+    arrow.userData.caeArrowFor = bodyId;
+    (arrow.line.material as THREE.LineBasicMaterial).linewidth = 2;
+    arrow.renderOrder = 6;
+    this.caeGroup.add(arrow);
+    this.caeOverlays.set(-bodyId - 1, arrow); // negative key so it doesn't clash with heatmap
+  }
+  clearForceArrow(bodyId: number) {
+    const a = this.caeOverlays.get(-bodyId - 1);
+    if (a) { this.caeGroup.remove(a); disposeObject3D(a); this.caeOverlays.delete(-bodyId - 1); }
+  }
+
+  /**
+   * Paint a deflection heatmap on a body's face. `tex` is a CanvasTexture the
+   * caller built from the solver grid; `plane` describes how to lay it on the
+   * body face: origin (a corner of the outline bbox in world), and the two
+   * in-face world axes (uAxis spans bbox width w, vAxis spans height h). The
+   * overlay is a thin quad clone floated a hair off the face along the normal.
+   */
+  showDeflectionOverlay(
+    bodyId: number,
+    tex: THREE.CanvasTexture,
+    plane: {
+      origin: [number, number, number];
+      uAxis: [number, number, number]; // unit, world
+      vAxis: [number, number, number]; // unit, world
+      normal: [number, number, number];
+      w: number; h: number; // mm
+    },
+  ) {
+    this.clearDeflectionOverlay(bodyId);
+    const o = new THREE.Vector3(...plane.origin);
+    const u = new THREE.Vector3(...plane.uAxis).normalize();
+    const v = new THREE.Vector3(...plane.vAxis).normalize();
+    const n = new THREE.Vector3(...plane.normal).normalize();
+    // Float 0.5 mm proud of the face so it wins the depth test cleanly.
+    const off = o.clone().addScaledVector(n, 0.5);
+    const c0 = off.clone();
+    const c1 = off.clone().addScaledVector(u, plane.w);
+    const c2 = off.clone().addScaledVector(u, plane.w).addScaledVector(v, plane.h);
+    const c3 = off.clone().addScaledVector(v, plane.h);
+    const geom = new THREE.BufferGeometry();
+    const positions = new Float32Array([
+      c0.x, c0.y, c0.z,  c1.x, c1.y, c1.z,  c2.x, c2.y, c2.z,
+      c0.x, c0.y, c0.z,  c2.x, c2.y, c2.z,  c3.x, c3.y, c3.z,
+    ]);
+    const uvs = new Float32Array([0, 0, 1, 0, 1, 1, 0, 0, 1, 1, 0, 1]);
+    geom.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+    geom.setAttribute('uv', new THREE.BufferAttribute(uvs, 2));
+    geom.computeVertexNormals();
+    const mat = new THREE.MeshBasicMaterial({ map: tex, transparent: true, opacity: 0.86, side: THREE.DoubleSide, depthWrite: false });
+    const mesh = new THREE.Mesh(geom, mat);
+    mesh.renderOrder = 5;
+    mesh.userData.caeOverlayFor = bodyId;
+    this.caeGroup.add(mesh);
+    this.caeOverlays.set(bodyId, mesh);
+  }
+  clearDeflectionOverlay(bodyId: number) {
+    const m = this.caeOverlays.get(bodyId);
+    if (m) { this.caeGroup.remove(m); disposeObject3D(m); this.caeOverlays.delete(bodyId); }
+  }
+
+  /** Remove ALL CAE overlays for a body (heatmap + arrow), keep weak tint. */
+  clearCae(bodyId: number) {
+    this.clearDeflectionOverlay(bodyId);
+    this.clearForceArrow(bodyId);
+    this.cancelForcePlacement();
+  }
+
   resize(container: HTMLElement) {
     const w = container.clientWidth;
     const h = container.clientHeight;
@@ -430,6 +562,12 @@ export class Viewer {
     this.grainArrows.clear();
     this.grainStates.clear();
     this.grainConfigs.clear();
+    // CAE overlays
+    for (const o of this.caeOverlays.values()) { this.caeGroup.remove(o); disposeObject3D(o); }
+    this.caeOverlays.clear();
+    for (const ls of this.caeWeakOutlines.values()) { this.caeGroup.remove(ls); disposeObject3D(ls); }
+    this.caeWeakOutlines.clear();
+    this.caePlacePick = null;
   }
 
   /**
@@ -1110,6 +1248,28 @@ export class Viewer {
     this.pointer.x = ((ev.clientX - rect.left) / rect.width) * 2 - 1;
     this.pointer.y = -((ev.clientY - rect.top) / rect.height) * 2 + 1;
     this.raycaster.setFromCamera(this.pointer, this.camera);
+
+    // Force-placement mode: capture the next click on the target body's face.
+    if (this.caePlacePick) {
+      const pick = this.caePlacePick;
+      const body = this.bodies.find((b) => b.id === pick.bodyId);
+      if (body) {
+        const hit = this.raycaster.intersectObject(body.mesh, false)[0];
+        if (hit) {
+          const n = (hit.face
+            ? hit.face.normal.clone()
+            : new THREE.Vector3(0, 0, 1));
+          // face.normal is in local space; body meshes have identity transform,
+          // so local == world here. Normalise for safety.
+          n.normalize();
+          this.caePlacePick = null;
+          pick.cb(hit.point.clone(), n);
+          return;
+        }
+      }
+      // click missed the body — stay in place mode, ignore this click.
+      return;
+    }
 
     // Test grain-arrow hits first so the arrow can intercept clicks that
     // would otherwise be treated as body picks.
