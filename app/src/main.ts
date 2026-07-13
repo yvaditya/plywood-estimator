@@ -27,7 +27,7 @@ import {
 } from './nest';
 import { sheetToDxf, downloadDxf } from './dxf';
 import { buildStep, type StepPart } from './stepExport';
-import { buildPdf, buildAnalysisPdf, downloadPdf, type InventoryCheck, type CaePanelAnalysis } from './pdf';
+import { buildPdf, buildAssemblyAnalysisPdf, downloadPdf, type InventoryCheck } from './pdf';
 import {
   buildShoppingList,
   setHave,
@@ -51,10 +51,14 @@ import {
   materialById,
   panelWeightKg,
   screenPanel,
-  solvePlate,
-  type EdgeSupport,
-  type EdgeSupports,
+  detectJoints,
+  solveAssembly,
   type Verdict,
+  type AsmPanel,
+  type AsmJoint,
+  type AsmLoad,
+  type AsmPanelResult,
+  type JointStiffness,
 } from './cae';
 
 // --------------------------------------------------------------------------
@@ -74,31 +78,17 @@ interface BodyState {
   color: string;
   /** Per-body material override id, or null → use the job-default material. */
   material: string | null;
-  /** Whether the inline "Analyze bending" CAE block is expanded. */
-  caeOpen?: boolean;
-  /** Footprint loads placed on this body. Each carries magnitude + unit,
-   *  position (outline mm; null until placed → panel centre), footprint shape
-   *  + size, and direction. */
-  caeLoads?: CaeLoad[];
-  /** Optional uniform load, in kg (0 / undefined = off). */
-  caeUniformKg?: number;
-  /** Shelf-pin point supports in outline (2D mm) coords. */
-  caePins?: { x: number; y: number }[];
-  /** Per-edge support overrides (outline frame). null → auto-prefill. */
-  caeSupports?: EdgeSupports | null;
-  /** Last solve result summary line, shown in the CAE block. */
-  caeSolveMsg?: string;
-  /** Captured analysis for the PDF — only set after a successful solve this
-   *  session. Presence gates the Structure + Analysis pages in the job PDF. */
-  caeAnalysis?: CaeAnalysis | null;
 }
 
-/** One footprint load in the CAE panel. Magnitude is entered as val+unit;
- *  `down` toggles between a downward force (↓) and an upward reaction (↑). */
+/** One footprint load in the Analysis section. Magnitude is entered as
+ *  val+unit; `down` toggles between a downward force (↓) and an upward
+ *  reaction (↑). `panelId` is the body it's placed on (null until placed).
+ *  This is the SAME row UI the per-panel CAE used, now assembly-scoped. */
 interface CaeLoad {
   val: number;
   unit: 'N' | 'kg' | 'lbf';
-  /** Placement in outline mm; null → panel centre. */
+  /** Panel this load sits on + its outline-mm position. null → unplaced. */
+  panelId: number | null;
   pt: { x: number; y: number } | null;
   shape: 'square' | 'round';
   /** Footprint size in mm (side length or diameter). */
@@ -106,20 +96,54 @@ interface CaeLoad {
   down: boolean;
 }
 
-/** Everything the PDF needs to render an Analysis page for a solved panel. */
-interface CaeAnalysis {
+/** A detected joint row in the Analysis section (mirrors cae.AsmJoint plus a
+ *  cached label for the list). */
+interface JointRow {
+  a: number; b: number;
+  labelA: string; labelB: string;
+  p0: [number, number, number];
+  p1: [number, number, number];
+  length: number;
+  stiffness: JointStiffness;
+}
+
+/** Everything the PDF needs to render the Assembly analysis page. Captured
+ *  only after a successful assembly solve this session — its presence gates
+ *  the Structure table + Assembly analysis page in the job PDF. */
+interface AssemblyAnalysis {
   heatmapPng: string;
   imgW: number;
   imgH: number;
-  materialName: string;
-  loads: { magN: number; unit: string; magDisplay: string; shape: string; sizeMm: number; down: boolean; x: number; y: number }[];
-  uniformKg: number;
-  supports: EdgeSupports;
-  pinCount: number;
+  cabinetTag: string;
+  panelCount: number;
+  joints: { labelA: string; labelB: string; length: number; stiffness: string }[];
+  loads: { magDisplay: string; shape: string; sizeMm: number; down: boolean; panelLabel: string }[];
+  groundedNodes: number;
   maxSagMm: number;
+  maxPanelLabel: string;
   maxAt: [number, number];
   spanMm: number;
   verdict: string;
+  resolutionLog: string;
+  iterations: number;
+}
+
+/** Per-cabinet Analysis-section session state (joints, loads, last result). */
+interface AsmState {
+  /** fileTag of the cabinet currently targeted by the Analysis section. */
+  cabinet: string | null;
+  /** Join tolerance in mm. */
+  tolMm: number;
+  /** Detected joints for the current cabinet (persist per session). */
+  joints: JointRow[];
+  /** Loads placed across the cabinet's panels. */
+  loads: CaeLoad[];
+  /** Last solve summary line. */
+  solveMsg: string;
+  /** Captured analysis for the PDF (gates Structure + Assembly page). */
+  analysis: AssemblyAnalysis | null;
+  /** True once "Detect joints" has run for the current cabinet. */
+  detected: boolean;
 }
 
 const state: {
@@ -157,6 +181,8 @@ const state: {
   splitInfo: { name: string; pieces: number }[];
   /** Job-default material card id (per-body overrides fall back to this). */
   jobMaterial: string;
+  /** Assembly Analysis-section state (joints, loads, last solve). */
+  asm: AsmState;
 } = {
   result: null,
   bodies: [],
@@ -177,6 +203,7 @@ const state: {
   splitSegmentGeo: new Map(),
   splitInfo: [],
   jobMaterial: DEFAULT_MATERIAL_ID,
+  asm: { cabinet: null, tolMm: 2, joints: [], loads: [], solveMsg: '', analysis: null, detected: false },
 };
 
 // --------------------------------------------------------------------------
@@ -643,6 +670,8 @@ function clearAll() {
   state.partLabels = new Map();
   nextBodyId = 0;
   cumulativeRightX = 0;
+  state.asm = { cabinet: null, tolMm: state.asm.tolMm, joints: [], loads: [], solveMsg: '', analysis: null, detected: false };
+  viewer.clearAssemblyOverlay();
   viewer.clear();
   renderBodyList();
   updateNestBtn();
@@ -677,15 +706,13 @@ window.addEventListener('drop', (e) => {
 // Body list rendering
 // --------------------------------------------------------------------------
 function renderBodyList() {
-  // Edge-pick is re-armed per open CAE panel during build; drop any stale one
-  // so a body whose panel is now closed no longer intercepts edge clicks.
-  viewer.cancelEdgePick();
   // "15 sheet / 19 total" when some imports were skipped as non-sheet.
   bodyCount.textContent = state.nonSheetCount > 0
     ? `${state.bodies.length} sheet / ${state.bodies.length + state.nonSheetCount} total`
     : String(state.bodies.length);
   if (state.bodies.length === 0) {
     bodyList.innerHTML = '<div class="empty">No file loaded.</div>';
+    renderAnalysisSection();
     return;
   }
   bodyList.innerHTML = '';
@@ -765,6 +792,10 @@ function renderBodyList() {
 
     bodyList.appendChild(group);
   }
+
+  // Keep the Analysis section (cabinet list, joints, loads) in sync with the
+  // current selection.
+  renderAnalysisSection();
 }
 
 /** Render one body row (used inside each file group). Mostly the same UI as
@@ -851,14 +882,16 @@ function buildBodyRow(b: BodyState): HTMLDivElement {
     });
     row.appendChild(extra);
 
-    // --- Screening / weight line + Analyze bending block ---
+    // --- Screening / weight line (read-only; the interactive CAE now lives in
+    //     the sidebar Analysis section, which works on the whole assembly). ---
     row.appendChild(buildCaeBlock(b));
   }
   return row;
 }
 
-/** Build the per-body structure line (weight + screening verdict) plus the
- *  collapsible "Analyze bending" CAE panel. */
+/** Build the per-body structure line: panel weight + the formula-screening
+ *  bending verdict under the default uniform load. Read-only — the interactive
+ *  structural analysis is the whole-assembly Analysis section in the sidebar. */
 function buildCaeBlock(b: BodyState): HTMLDivElement {
   const wrap = document.createElement('div');
   wrap.className = 'body-cae';
@@ -873,24 +906,11 @@ function buildCaeBlock(b: BodyState): HTMLDivElement {
     <span class="cae-sep">·</span>
     <span class="cae-verdict cae-${scr.verdict}">sag ~${fmtSag(scr.sagMm, state.units)} over ${fmtDim(scr.span, state.units)} — ${verdictLabel[scr.verdict]}</span>`;
   wrap.appendChild(line);
-
-  const toggle = document.createElement('button');
-  toggle.type = 'button';
-  toggle.className = 'cae-toggle ghost';
-  toggle.textContent = b.caeOpen ? 'Hide bending analysis' : 'Analyze bending';
-  toggle.addEventListener('click', () => {
-    b.caeOpen = !b.caeOpen;
-    if (!b.caeOpen) { viewer.cancelForcePlacement(); viewer.cancelEdgePick(b.id); }
-    renderBodyList();
-  });
-  wrap.appendChild(toggle);
-
-  if (b.caeOpen) wrap.appendChild(buildCaePanel(b));
   return wrap;
 }
 
 // --------------------------------------------------------------------------
-// Quick CAE — interactive bending analysis panel
+// Assembly frame helpers (shared with the Analysis section)
 // --------------------------------------------------------------------------
 type Vec3 = [number, number, number];
 const v3add = (a: Vec3, b: Vec3): Vec3 => [a[0] + b[0], a[1] + b[1], a[2] + b[2]];
@@ -913,55 +933,6 @@ function outlineFrame(b: BodyState): { origin: Vec3; uAxis: Vec3; vAxis: Vec3; n
     v3scale(vAxis, -h / 2),
   );
   return { origin, uAxis, vAxis, normal };
-}
-
-/** World AABB of a body (from its analysis outline extruded by thickness). */
-function bodyWorldAabb(b: BodyState): { min: Vec3; max: Vec3 } {
-  const f = outlineFrame(b);
-  const w = b.analysis.outline.bbox.w;
-  const h = b.analysis.outline.bbox.h;
-  const t = b.analysis.thickness;
-  const corners: Vec3[] = [];
-  for (const su of [0, w]) for (const sv of [0, h]) for (const sn of [-t / 2, t / 2]) {
-    corners.push(v3add(v3add(v3add(f.origin, v3scale(f.uAxis, su)), v3scale(f.vAxis, sv)), v3scale(f.normal, sn)));
-  }
-  const min: Vec3 = [Infinity, Infinity, Infinity];
-  const max: Vec3 = [-Infinity, -Infinity, -Infinity];
-  for (const c of corners) for (let k = 0; k < 3; k++) {
-    if (c[k] < min[k]) min[k] = c[k];
-    if (c[k] > max[k]) max[k] = c[k];
-  }
-  return { min, max };
-}
-
-/** True if two world AABBs are within `tol` mm of touching (overlap or gap ≤ tol). */
-function aabbAdjacent(a: { min: Vec3; max: Vec3 }, b: { min: Vec3; max: Vec3 }, tol: number): boolean {
-  for (let k = 0; k < 3; k++) {
-    if (a.min[k] - b.max[k] > tol) return false;
-    if (b.min[k] - a.max[k] > tol) return false;
-  }
-  return true;
-}
-
-/** Auto-prefill the four edge supports: an edge defaults to 'simple' when the
- *  midpoint of that outline edge is near (≤2 mm) another SELECTED body's world
- *  AABB, else 'free'. */
-function autoSupports(b: BodyState): EdgeSupports {
-  const f = outlineFrame(b);
-  const w = b.analysis.outline.bbox.w;
-  const h = b.analysis.outline.bbox.h;
-  const others = state.bodies.filter((o) => o !== b && o.selected).map((o) => bodyWorldAabb(o));
-  const edgeMid = (edge: 'top' | 'bottom' | 'left' | 'right'): Vec3 => {
-    const mid = { top: [w / 2, h], bottom: [w / 2, 0], left: [0, h / 2], right: [w, h / 2] }[edge];
-    return v3add(v3add(f.origin, v3scale(f.uAxis, mid[0])), v3scale(f.vAxis, mid[1]));
-  };
-  const near = (edge: 'top' | 'bottom' | 'left' | 'right'): boolean => {
-    const p = edgeMid(edge);
-    const pAabb = { min: p, max: p };
-    return others.some((o) => aabbAdjacent(pAabb, o, 2));
-  };
-  const pick = (edge: 'top' | 'bottom' | 'left' | 'right'): EdgeSupport => (near(edge) ? 'simple' : 'free');
-  return { top: pick('top'), bottom: pick('bottom'), left: pick('left'), right: pick('right') };
 }
 
 function forceToN(val: number, unit: 'N' | 'kg' | 'lbf'): number {
@@ -995,25 +966,27 @@ function heatColor(t: number): [number, number, number] {
   return stops[stops.length - 1][1];
 }
 
-/** Build a CanvasTexture of the deflection field for the overlay. */
-function buildHeatTexture(res: import('./cae').SolveResult): THREE.CanvasTexture {
-  const { nx, ny, w, active, maxAbsW } = res;
+/** Build a CanvasTexture of one panel's deflection field for the overlay. The
+ *  `denom` is the WHOLE-ASSEMBLY max displacement so every panel shares one
+ *  colour scale (a global fringe plot). */
+function buildAsmHeatTexture(pr: AsmPanelResult, denom: number): THREE.CanvasTexture {
+  const { nx, ny, disp, active } = pr;
   const canvas = document.createElement('canvas');
   canvas.width = nx;
   canvas.height = ny;
   const ctx = canvas.getContext('2d')!;
   const img = ctx.createImageData(nx, ny);
-  const denom = maxAbsW || 1;
+  const d = denom || 1;
   for (let iy = 0; iy < ny; iy++) {
     for (let ix = 0; ix < nx; ix++) {
       const n = iy * nx + ix;
       // Flip Y so texture V matches outline +Y (canvas is top-down).
       const dst = ((ny - 1 - iy) * nx + ix) * 4;
-      if (!active[n] || Number.isNaN(w[n])) {
+      if (!active[n] || Number.isNaN(disp[n])) {
         img.data[dst + 3] = 0; // transparent outside the part
         continue;
       }
-      const [r, g, bl] = heatColor(Math.abs(w[n]) / denom);
+      const [r, g, bl] = heatColor(Math.abs(disp[n]) / d);
       img.data[dst] = r;
       img.data[dst + 1] = g;
       img.data[dst + 2] = bl;
@@ -1049,58 +1022,398 @@ function outlineToWorld(b: BodyState, ox: number, oy: number): Vec3 {
 /** Default footprint size (mm) for a fresh load ≈ 40mm. */
 const DEFAULT_FOOTPRINT_MM = 40;
 
-/** A fresh footprint load: 25 kg downward, round, default footprint, unplaced. */
-function newCaeLoad(): CaeLoad {
-  return { val: 25, unit: 'kg', pt: null, shape: 'round', sizeMm: DEFAULT_FOOTPRINT_MM, down: true };
-}
+// ==========================================================================
+// ASSEMBLY ANALYSIS — the sidebar "Analysis" section. Analyses the whole
+// cabinet (all selected bodies of one STEP file) as a coupled shell.
+// ==========================================================================
+const asmCabinetSelect = $<HTMLSelectElement>('asmCabinet');
+const asmDetectBtn = $<HTMLButtonElement>('asmDetectBtn');
+const asmTolInput = $<HTMLInputElement>('asmTol');
+const asmJointsList = $('asmJointsList');
+const asmLoadsList = $('asmLoadsList');
+const asmAddLoadBtn = $<HTMLButtonElement>('asmAddLoad');
+const asmPreset50 = $<HTMLButtonElement>('asmPreset50');
+const asmPresetShelf = $<HTMLButtonElement>('asmPresetShelf');
+const asmPresetClear = $<HTMLButtonElement>('asmPresetClear');
+const asmSolveBtn = $<HTMLButtonElement>('asmSolveBtn');
+const asmClearBtn = $<HTMLButtonElement>('asmClearBtn');
+const asmExportBtn = $<HTMLButtonElement>('asmExportBtn');
+const asmResult = $('asmResult');
 
-/** Redraw every load marker + pin marker + edge-support line for a body. */
-function repaintCaeMarkers(b: BodyState) {
-  const f = outlineFrame(b);
-  const arrowLen = Math.max(30, Math.min(b.analysis.length, b.analysis.width) * 0.35);
-  viewer.clearLoadMarkers(b.id);
-  (b.caeLoads ?? []).forEach((ld, i) => {
-    const pt = ld.pt ?? { x: b.analysis.outline.bbox.w / 2, y: b.analysis.outline.bbox.h / 2 };
-    const world = outlineToWorld(b, pt.x, pt.y);
-    viewer.showLoadMarker(b.id, i, world, f.normal, arrowLen,
-      { shape: ld.shape, size: ld.sizeMm, uAxis: f.uAxis, vAxis: f.vAxis }, ld.down);
-  });
-  if (b.caePins && b.caePins.length) {
-    const scale = Math.max(6, Math.min(b.analysis.length, b.analysis.width) * 0.03);
-    viewer.showPins(b.id, b.caePins.map((p) => ({ point: outlineToWorld(b, p.x, p.y), normal: f.normal })), scale);
-  } else {
-    viewer.clearPins(b.id);
+/** Distinct cabinet tags that currently have ≥1 selected sheet body. */
+function analysisCabinets(): string[] {
+  const seen: string[] = [];
+  for (const b of state.bodies) {
+    if (b.selected && !seen.includes(b.fileTag)) seen.push(b.fileTag);
   }
-  const s = b.caeSupports ?? autoSupports(b);
-  viewer.showEdgeSupports(b.id, {
-    origin: f.origin, uAxis: f.uAxis, vAxis: f.vAxis, normal: f.normal,
-    w: b.analysis.outline.bbox.w, h: b.analysis.outline.bbox.h,
-  }, s);
+  return seen;
 }
 
-function buildCaePanel(b: BodyState): HTMLDivElement {
-  const panel = document.createElement('div');
-  panel.className = 'cae-panel';
+/** The selected bodies of the Analysis section's current cabinet. */
+function cabinetPanels(): BodyState[] {
+  const cab = state.asm.cabinet;
+  return state.bodies.filter((b) => b.selected && b.fileTag === cab);
+}
 
-  const mat = bodyMaterial(b);
-  if (!b.caeSupports) b.caeSupports = autoSupports(b);
-  if (!b.caeLoads) b.caeLoads = [newCaeLoad()];
-  if (!b.caePins) b.caePins = [];
-  const supports = b.caeSupports;
+/** Short label for a body within its cabinet: index-letter ("1a", "1e"). The
+ *  leading number is the cabinet's 1-based position; the letter walks a..z by
+ *  the body's order within the cabinet. */
+function panelLabel(b: BodyState): string {
+  const cabs = Array.from(new Set(state.bodies.map((x) => x.fileTag)));
+  const cabNo = Math.max(1, cabs.indexOf(b.fileTag) + 1);
+  const within = state.bodies.filter((x) => x.fileTag === b.fileTag);
+  const idx = within.indexOf(b);
+  const letter = idx < 26 ? String.fromCharCode(97 + idx) : `z${idx - 25}`;
+  return `${cabNo}${letter}`;
+}
 
-  const edgeCycle: Record<EdgeSupport, EdgeSupport> = { free: 'simple', simple: 'fixed', fixed: 'free' };
-  const edgeLabel: Record<EdgeSupport, string> = { free: 'free', simple: 'supported', fixed: 'fixed' };
-  // Footprint size input is in the user's units (raw number; mm stored). Round
-  // to 2 dp for inches, 0 dp for mm.
+/** Build a solver AsmPanel from a body using its world outline frame. */
+function asmPanelForBody(b: BodyState): AsmPanel {
+  const f = outlineFrame(b);
+  return {
+    id: b.id,
+    label: panelLabel(b),
+    outline: b.analysis.outline,
+    thicknessMm: b.analysis.thickness,
+    material: bodyMaterial(b),
+    grainAlongLength: b.grain !== 'width',
+    origin: f.origin,
+    uAxis: f.uAxis,
+    vAxis: f.vAxis,
+    normal: f.normal,
+  };
+}
+
+/** Keep state.asm.cabinet valid; default to the first cabinet with a body. */
+function ensureAsmCabinet() {
+  const cabs = analysisCabinets();
+  if (cabs.length === 0) { state.asm.cabinet = null; return; }
+  if (!state.asm.cabinet || !cabs.includes(state.asm.cabinet)) {
+    state.asm.cabinet = cabs[0];
+    // A cabinet switch invalidates joints/result but keeps loads placed on
+    // still-present panels.
+    state.asm.joints = [];
+    state.asm.detected = false;
+  }
+}
+
+/** Detect joints for the current cabinet and populate the list. */
+function detectAssemblyJoints() {
+  ensureAsmCabinet();
+  const panels = cabinetPanels();
+  if (panels.length < 2) {
+    state.asm.joints = [];
+    state.asm.detected = true;
+    state.asm.solveMsg = 'Select at least two panels of the cabinet to detect joints.';
+    renderAnalysisSection();
+    return;
+  }
+  const asmPanels = panels.map(asmPanelForBody);
+  const byId = new Map(panels.map((b) => [b.id, b] as const));
+  const raw = detectJoints(asmPanels, state.asm.tolMm);
+  state.asm.joints = raw.map((j) => ({
+    a: j.a, b: j.b,
+    labelA: panelLabel(byId.get(j.a)!),
+    labelB: panelLabel(byId.get(j.b)!),
+    p0: j.p0, p1: j.p1, length: j.length, stiffness: j.stiffness,
+  }));
+  state.asm.detected = true;
+  state.asm.solveMsg = state.asm.joints.length
+    ? `${state.asm.joints.length} joint${state.asm.joints.length === 1 ? '' : 's'} detected — set stiffness, add loads, then Solve.`
+    : 'No touching panel edges found. Raise the join tolerance if panels should be joined.';
+  // Clear a stale solved overlay/result — joints changed.
+  state.asm.analysis = null;
+  viewer.clearAssemblyOverlay();
+  paintAssemblyPreview();
+  renderAnalysisSection();
+}
+
+/** Draw joint lines + floor glyphs + load markers for the current (unsolved
+ *  or solved) assembly state. */
+function paintAssemblyPreview() {
+  const panels = cabinetPanels();
+  const byId = new Map(panels.map((b) => [b.id, b] as const));
+  // Joint lines coloured by stiffness.
+  viewer.showAssemblyJoints(state.asm.joints.map((j) => ({
+    p0: j.p0, p1: j.p1, stiffness: j.stiffness,
+  })));
+  // Floor glyphs: the floor datum is the assembly's LOWEST world z (the base
+  // the cabinet stands on). Mark each panel corner/edge-mid near that plane.
+  const cornerPts: [number, number, number][] = [];
+  for (const b of panels) {
+    const f = outlineFrame(b);
+    const w = b.analysis.outline.bbox.w, h = b.analysis.outline.bbox.h;
+    for (const [su, sv] of [[0, 0], [w, 0], [w, h], [0, h], [w / 2, 0], [w / 2, h]] as [number, number][]) {
+      cornerPts.push(v3add(v3add(f.origin, v3scale(f.uAxis, su)), v3scale(f.vAxis, sv)));
+    }
+  }
+  let floorZ = Infinity;
+  for (const p of cornerPts) if (p[2] < floorZ) floorZ = p[2];
+  const band = Math.max(state.asm.tolMm, 6);
+  const glyphs = cornerPts.filter((p) => p[2] - floorZ <= band);
+  viewer.showFloorGlyphs(glyphs);
+  // Load markers.
+  repaintAsmLoadMarkers();
+  void byId;
+}
+
+/** Redraw every assembly load marker (reuses the per-body load marker API). */
+function repaintAsmLoadMarkers() {
+  // Clear markers for every cabinet body, then repaint placed loads.
+  for (const b of cabinetPanels()) viewer.clearLoadMarkers(b.id);
+  const grouped = new Map<number, CaeLoad[]>();
+  for (const ld of state.asm.loads) {
+    if (ld.panelId == null) continue;
+    const arr = grouped.get(ld.panelId) ?? [];
+    arr.push(ld);
+    grouped.set(ld.panelId, arr);
+  }
+  for (const [pid, lds] of grouped) {
+    const b = state.bodies.find((x) => x.id === pid);
+    if (!b) continue;
+    const f = outlineFrame(b);
+    const arrowLen = Math.max(30, Math.min(b.analysis.length, b.analysis.width) * 0.35);
+    lds.forEach((ld, i) => {
+      const pt = ld.pt ?? { x: b.analysis.outline.bbox.w / 2, y: b.analysis.outline.bbox.h / 2 };
+      const world = outlineToWorld(b, pt.x, pt.y);
+      viewer.showLoadMarker(b.id, i, world, f.normal, arrowLen,
+        { shape: ld.shape, size: ld.sizeMm, uAxis: f.uAxis, vAxis: f.vAxis }, ld.down);
+    });
+  }
+}
+
+/** A fresh load for the Analysis section: 25 kg down, round, unplaced. */
+function newAsmLoad(): CaeLoad {
+  return { val: 25, unit: 'kg', panelId: null, pt: null, shape: 'round', sizeMm: DEFAULT_FOOTPRINT_MM, down: true };
+}
+
+/** Preset: N kg spread evenly as one downward load on the highest panel
+ *  ("on top"). Populates the editable loads list. */
+function presetOnTop(totalKg: number) {
+  const panels = cabinetPanels();
+  if (panels.length === 0) return;
+  // Highest panel = the one whose face centre has the max world z.
+  let top = panels[0], topZ = -Infinity;
+  for (const b of panels) {
+    const z = b.analysis.faceCenter[2];
+    if (z > topZ) { topZ = z; top = b; }
+  }
+  const l: CaeLoad = {
+    val: totalKg, unit: 'kg', panelId: top.id,
+    pt: { x: top.analysis.outline.bbox.w / 2, y: top.analysis.outline.bbox.h / 2 },
+    shape: 'square', sizeMm: Math.min(top.analysis.length, top.analysis.width) * 0.6, down: true,
+  };
+  state.asm.loads.push(l);
+}
+
+/** Preset: kgPerShelf on every horizontal panel that isn't the top or a
+ *  vertical side (a shelf ≈ face normal near ±Z, not the very top). */
+function presetPerShelf(kgPerShelf: number) {
+  const panels = cabinetPanels();
+  const shelves = panels.filter((b) => Math.abs(b.analysis.faceNormal[2]) > 0.7);
+  // Drop the single highest (that's the "top", loaded separately if wanted).
+  shelves.sort((a, b) => a.analysis.faceCenter[2] - b.analysis.faceCenter[2]);
+  const targets = shelves.length > 1 ? shelves.slice(0, shelves.length - 1) : shelves;
+  for (const b of targets) {
+    state.asm.loads.push({
+      val: kgPerShelf, unit: 'kg', panelId: b.id,
+      pt: { x: b.analysis.outline.bbox.w / 2, y: b.analysis.outline.bbox.h / 2 },
+      shape: 'square', sizeMm: Math.min(b.analysis.length, b.analysis.width) * 0.6, down: true,
+    });
+  }
+}
+
+/** Run the assembly solve, paint the whole-cabinet heatmap, capture the PDF. */
+async function solveAssemblyForCabinet() {
+  ensureAsmCabinet();
+  const panels = cabinetPanels();
+  if (panels.length < 1) {
+    state.asm.solveMsg = 'No panels selected for this cabinet.';
+    renderAnalysisSection();
+    return;
+  }
+  if (!state.asm.detected) {
+    state.asm.solveMsg = 'Detect joints first.';
+    renderAnalysisSection();
+    return;
+  }
+  const asmPanels = panels.map(asmPanelForBody);
+  const byId = new Map(panels.map((b) => [b.id, b] as const));
+
+  const joints: AsmJoint[] = state.asm.joints
+    .filter((j) => byId.has(j.a) && byId.has(j.b))
+    .map((j) => ({ a: j.a, b: j.b, p0: j.p0, p1: j.p1, length: j.length, stiffness: j.stiffness }));
+
+  const loads: AsmLoad[] = state.asm.loads
+    .filter((l) => l.val > 0 && l.panelId != null && byId.has(l.panelId))
+    .map((l) => {
+      const b = byId.get(l.panelId!)!;
+      const pt = l.pt ?? { x: b.analysis.outline.bbox.w / 2, y: b.analysis.outline.bbox.h / 2 };
+      const magN = forceToN(l.val, l.unit);
+      return { panelId: l.panelId!, x: pt.x, y: pt.y, N: l.down ? magN : -magN, shape: l.shape, size: l.sizeMm };
+    });
+
+  if (loads.length === 0) {
+    state.asm.solveMsg = 'No load — add a load or apply a preset first.';
+    renderAnalysisSection();
+    return;
+  }
+
+  const res = solveAssembly({ panels: asmPanels, joints, loads, tolMm: state.asm.tolMm });
+  console.log('[assembly]', res.resolutionLog, '→', res.ok ? `${res.iterations} it` : res.message);
+
+  if (!res.ok) {
+    viewer.clearAssemblyOverlay();
+    viewer.clearDeflectionOverlay(-1); // no-op safety
+    for (const b of panels) viewer.clearDeflectionOverlay(b.id);
+    state.asm.analysis = null;
+    state.asm.solveMsg = res.message ?? 'Solve failed.';
+    renderAnalysisSection();
+    return;
+  }
+
+  // Paint the whole-assembly heatmap: one shared colour scale (res.maxDisp).
+  for (const b of panels) viewer.clearDeflectionOverlay(b.id);
+  const prById = new Map(res.panels.map((p) => [p.id, p] as const));
+  for (const b of panels) {
+    const pr = prById.get(b.id);
+    if (!pr) continue;
+    const tex = buildAsmHeatTexture(pr, res.maxDisp);
+    const f = outlineFrame(b);
+    viewer.showDeflectionOverlay(b.id, tex, {
+      origin: f.origin, uAxis: f.uAxis, vAxis: f.vAxis, normal: f.normal,
+      w: b.analysis.outline.bbox.w, h: b.analysis.outline.bbox.h, thickness: b.analysis.thickness,
+    });
+  }
+  paintAssemblyPreview();
+
+  const maxBody = byId.get(res.maxPanelId);
+  const maxLabel = maxBody ? panelLabel(maxBody) : '?';
+  const limit = res.spanMm / 200;
+  state.asm.solveMsg =
+    `Max deflection ${fmtSag(res.maxDisp, state.units)} on ${maxLabel} at ` +
+    `(${fmtDim(res.maxAt[0], state.units)}, ${fmtDim(res.maxAt[1], state.units)}) — ` +
+    `${res.verdict.toUpperCase()} vs span/200 (${fmtSag(limit, state.units)})`;
+
+  await captureAssemblyAnalysis(res, panels, maxLabel);
+  renderAnalysisSection();
+}
+
+/** Snapshot the solved cabinet + overlay for the PDF and store the analysis. */
+async function captureAssemblyAnalysis(
+  res: ReturnType<typeof solveAssembly>, panels: BodyState[], maxLabel: string,
+) {
+  await yieldFrame();
+  const SHOT = { w: 1400, h: 1000 };
+  let heatmapPng = '', imgW = SHOT.w, imgH = SHOT.h;
+  const visibleIds = new Set(panels.map((b) => b.id));
+  viewer.enterPdfBg();
+  try {
+    viewer.beginSnapshotBatch(SHOT);
+    const shot = viewer.snapshotFiltered(visibleIds, null, 0, undefined, SHOT);
+    heatmapPng = shot.dataUrl; imgW = shot.width; imgH = shot.height;
+  } catch (err) {
+    console.warn('assembly snapshot failed', err);
+  } finally {
+    viewer.endSnapshotBatch();
+    viewer.exitPdfBg();
+  }
+  const byId = new Map(panels.map((b) => [b.id, b] as const));
+
+  state.asm.analysis = {
+    heatmapPng, imgW, imgH,
+    cabinetTag: state.asm.cabinet ?? '',
+    panelCount: panels.length,
+    joints: state.asm.joints.map((j) => ({
+      labelA: j.labelA, labelB: j.labelB, length: j.length, stiffness: j.stiffness,
+    })),
+    loads: state.asm.loads.filter((l) => l.val > 0 && l.panelId != null).map((l) => ({
+      magDisplay: `${l.val} ${l.unit}`, shape: l.shape, sizeMm: l.sizeMm, down: l.down,
+      panelLabel: byId.has(l.panelId!) ? panelLabel(byId.get(l.panelId!)!) : '?',
+    })),
+    groundedNodes: res.groundedNodes,
+    maxSagMm: res.maxDisp,
+    maxPanelLabel: maxLabel,
+    maxAt: [res.maxAt[0], res.maxAt[1]],
+    spanMm: res.spanMm,
+    verdict: res.verdict,
+    resolutionLog: res.resolutionLog,
+    iterations: res.iterations,
+  };
+}
+
+/** Clear the assembly analysis: overlay, joints, loads, result. */
+function clearAssembly() {
+  viewer.clearAssemblyOverlay();
+  for (const b of state.bodies) viewer.clearLoadMarkers(b.id);
+  for (const b of state.bodies) viewer.clearDeflectionOverlay(b.id);
+  state.asm.joints = [];
+  state.asm.loads = [];
+  state.asm.solveMsg = '';
+  state.asm.analysis = null;
+  state.asm.detected = false;
+  renderAnalysisSection();
+}
+
+/** True once an assembly has been solved this session (gates PDF Structure +
+ *  Assembly analysis page). */
+function assemblySolved(): boolean {
+  return !!state.asm.analysis;
+}
+
+// --- Analysis section rendering -------------------------------------------
+const stiffnessLabel: Record<JointStiffness, string> = {
+  rigid: 'rigid', 'semi-rigid': 'semi-rigid', hinged: 'hinged',
+};
+
+/** (Re)build the Analysis sidebar section from state.asm. */
+function renderAnalysisSection() {
+  ensureAsmCabinet();
+  const cabs = analysisCabinets();
+  const hasBodies = cabs.length > 0;
+
+  // Cabinet select — only meaningful with ≥2 cabinets, but always populated.
+  asmCabinetSelect.innerHTML = cabs.map((c) =>
+    `<option value="${escapeHtml(c)}" ${c === state.asm.cabinet ? 'selected' : ''}>${escapeHtml(c)}</option>`).join('');
+  asmCabinetSelect.parentElement!.style.display = cabs.length > 1 ? '' : 'none';
+
+  asmDetectBtn.disabled = !hasBodies;
+  asmTolInput.value = state.units === 'in'
+    ? String(Number(fromMm(state.asm.tolMm, 'in').toFixed(3)))
+    : String(Number(fromMm(state.asm.tolMm, 'mm').toFixed(1)));
+
+  // Joints list.
+  if (!state.asm.detected) {
+    asmJointsList.innerHTML = '<div class="asm-hint">Detect joints to list touching panel edges.</div>';
+  } else if (state.asm.joints.length === 0) {
+    asmJointsList.innerHTML = '<div class="asm-hint">No joints found. Raise the tolerance if panels should touch.</div>';
+  } else {
+    asmJointsList.innerHTML = state.asm.joints.map((j, i) => `
+      <div class="asm-joint-row" data-joint="${i}">
+        <span class="asm-joint-name">${escapeHtml(j.labelA)} ⟂ ${escapeHtml(j.labelB)}</span>
+        <span class="asm-joint-len">${fmtDim(j.length, state.units)}</span>
+        <select data-jf="stiff">
+          <option value="rigid" ${j.stiffness === 'rigid' ? 'selected' : ''}>rigid</option>
+          <option value="semi-rigid" ${j.stiffness === 'semi-rigid' ? 'selected' : ''}>semi-rigid</option>
+          <option value="hinged" ${j.stiffness === 'hinged' ? 'selected' : ''}>hinged</option>
+        </select>
+      </div>`).join('');
+  }
+
+  // Loads list — the SAME row UI as the per-panel CAE, plus a panel picker via
+  // the "Place" button (click a panel in 3D).
+  const panels = cabinetPanels();
+  const byId = new Map(panels.map((b) => [b.id, b] as const));
   const sizeInUnits = (mm: number) => {
     const v = fromMm(mm, state.units);
     return state.units === 'in' ? Number(v.toFixed(2)) : Math.round(v);
   };
-
-  const loadRows = b.caeLoads.map((ld, i) => {
-    const placed = ld.pt ? `@(${fmtDim(ld.pt.x, state.units)}, ${fmtDim(ld.pt.y, state.units)})` : 'centre';
+  asmLoadsList.innerHTML = state.asm.loads.map((ld, i) => {
+    const where = ld.panelId != null && byId.has(ld.panelId)
+      ? `${panelLabel(byId.get(ld.panelId)!)}${ld.pt ? ` @(${fmtDim(ld.pt.x, state.units)}, ${fmtDim(ld.pt.y, state.units)})` : ''}`
+      : 'unplaced';
     return `
-    <div class="cae-load-row" data-load="${i}">
+    <div class="asm-load-row" data-load="${i}">
       <input type="number" min="0" step="1" value="${ld.val}" data-lf="val" title="magnitude" />
       <select data-lf="unit">
         <option value="N" ${ld.unit === 'N' ? 'selected' : ''}>N</option>
@@ -1113,54 +1426,46 @@ function buildCaePanel(b: BodyState): HTMLDivElement {
         <option value="square" ${ld.shape === 'square' ? 'selected' : ''}>□</option>
       </select>
       <input type="number" min="0" step="${state.units === 'in' ? '0.25' : '1'}" value="${sizeInUnits(ld.sizeMm)}" data-lf="size" title="footprint size (${state.units})" />
-      <button type="button" class="ghost cae-place-load" data-lf="place" title="place on panel">Place</button>
-      <span class="cae-load-at">${placed}</span>
+      <button type="button" class="ghost cae-place-load" data-lf="place" title="place on a panel">Place</button>
+      <span class="cae-load-at">${escapeHtml(where)}</span>
       <button type="button" class="cae-x" data-lf="remove" title="remove">×</button>
     </div>`;
   }).join('');
 
-  const pinRows = (b.caePins ?? []).map((p, i) => `
-    <div class="cae-pin-row" data-pin="${i}">
-      <span class="cae-pin-at">Pin @(${fmtDim(p.x, state.units)}, ${fmtDim(p.y, state.units)})</span>
-      <button type="button" class="cae-x" data-pf="remove" title="remove">×</button>
-    </div>`).join('');
+  // Actions state.
+  asmSolveBtn.disabled = !hasBodies;
+  asmExportBtn.disabled = !state.asm.analysis;
 
-  panel.innerHTML = `
-    <div class="cae-row cae-mat">Material: <strong>${escapeHtml(mat.name)}</strong></div>
-    <div class="cae-row cae-loads">
-      <span class="cae-subtitle">Loads</span>
-      <div class="cae-load-list">${loadRows}</div>
-      <button type="button" class="ghost cae-add" data-cae="addLoad">+ Add load</button>
-      <label class="cae-uniform">Uniform
-        <input type="number" min="0" step="1" value="${b.caeUniformKg ?? 0}" data-cae="uniformKg" /> kg
-      </label>
-    </div>
-    <div class="cae-row cae-edges">
-      <span class="cae-edges-title">Edge supports <span class="cae-hint">(or click an edge in 3D)</span></span>
-      <div class="cae-edge-grid">
-        <button type="button" class="cae-edge" data-edge="top">Top: <strong>${edgeLabel[supports.top]}</strong></button>
-        <button type="button" class="cae-edge" data-edge="bottom">Bottom: <strong>${edgeLabel[supports.bottom]}</strong></button>
-        <button type="button" class="cae-edge" data-edge="left">Left: <strong>${edgeLabel[supports.left]}</strong></button>
-        <button type="button" class="cae-edge" data-edge="right">Right: <strong>${edgeLabel[supports.right]}</strong></button>
-      </div>
-    </div>
-    <div class="cae-row cae-pins">
-      <span class="cae-subtitle">Pins</span>
-      <div class="cae-pin-list">${pinRows}</div>
-      <button type="button" class="ghost cae-add" data-cae="addPin">+ Add pin</button>
-    </div>
-    <div class="cae-row cae-actions">
-      <button type="button" class="ghost" data-cae="solve">Solve</button>
-      <button type="button" class="ghost" data-cae="clear">Clear</button>
-      <button type="button" class="ghost" data-cae="exportPdf" ${b.caeAnalysis ? '' : 'disabled'}>Export analysis PDF</button>
-    </div>
-    <div class="cae-row cae-result">${b.caeSolveMsg ? escapeHtml(b.caeSolveMsg) : '<span class="cae-hint">Add a load, support ≥2 edges (or add pins), then Solve.</span>'}</div>
-  `;
+  // Result line.
+  const verdictClass = state.asm.analysis
+    ? `cae-${state.asm.analysis.verdict}` : '';
+  asmResult.className = `asm-result ${verdictClass}`;
+  asmResult.innerHTML = state.asm.solveMsg
+    ? escapeHtml(state.asm.solveMsg)
+    : '<span class="asm-hint">Detect joints, add loads, then Solve assembly.</span>';
 
-  // --- Per-load-row controls ---
-  panel.querySelectorAll<HTMLElement>('.cae-load-row').forEach((row) => {
+  refreshSolvedDot();
+  wireAnalysisSection();
+}
+
+/** Attach event handlers to the freshly-rendered Analysis section. */
+function wireAnalysisSection() {
+  // Joint stiffness selects.
+  asmJointsList.querySelectorAll<HTMLElement>('.asm-joint-row').forEach((row) => {
+    const i = +row.dataset.joint!;
+    row.querySelector<HTMLSelectElement>('[data-jf="stiff"]')!.addEventListener('change', (e) => {
+      state.asm.joints[i].stiffness = (e.target as HTMLSelectElement).value as JointStiffness;
+      // Result is stale once a joint changes.
+      state.asm.analysis = null;
+      paintAssemblyPreview();
+      renderAnalysisSection();
+    });
+  });
+
+  // Load rows.
+  asmLoadsList.querySelectorAll<HTMLElement>('.asm-load-row').forEach((row) => {
     const i = +row.dataset.load!;
-    const ld = b.caeLoads![i];
+    const ld = state.asm.loads[i];
     row.querySelector<HTMLInputElement>('[data-lf="val"]')!.addEventListener('change', (e) => {
       ld.val = Math.max(0, parseFloat((e.target as HTMLInputElement).value) || 0);
     });
@@ -1168,262 +1473,145 @@ function buildCaePanel(b: BodyState): HTMLDivElement {
       ld.unit = (e.target as HTMLSelectElement).value as CaeLoad['unit'];
     });
     row.querySelector<HTMLButtonElement>('[data-lf="dir"]')!.addEventListener('click', () => {
-      ld.down = !ld.down;
-      repaintCaeMarkers(b);
-      renderBodyList();
+      ld.down = !ld.down; repaintAsmLoadMarkers(); renderAnalysisSection();
     });
     row.querySelector<HTMLSelectElement>('[data-lf="shape"]')!.addEventListener('change', (e) => {
-      ld.shape = (e.target as HTMLSelectElement).value as CaeLoad['shape'];
-      repaintCaeMarkers(b);
+      ld.shape = (e.target as HTMLSelectElement).value as CaeLoad['shape']; repaintAsmLoadMarkers();
     });
     row.querySelector<HTMLInputElement>('[data-lf="size"]')!.addEventListener('change', (e) => {
-      const disp = Math.max(0, parseFloat((e.target as HTMLInputElement).value) || 0);
-      ld.sizeMm = toMm(disp, state.units);
-      repaintCaeMarkers(b);
+      ld.sizeMm = toMm(Math.max(0, parseFloat((e.target as HTMLInputElement).value) || 0), state.units);
+      repaintAsmLoadMarkers();
     });
     row.querySelector<HTMLButtonElement>('[data-lf="place"]')!.addEventListener('click', (e) => {
       const btn = e.target as HTMLButtonElement;
-      btn.classList.add('armed');
-      btn.textContent = 'Click…';
-      viewer.beginForcePlacement(b.id, (point) => {
+      btn.classList.add('armed'); btn.textContent = 'Click a panel…';
+      // The next click on ANY cabinet panel places the load on that panel.
+      viewer.beginAssemblyPlacement((bodyId, point) => {
+        const b = state.bodies.find((x) => x.id === bodyId && x.selected && x.fileTag === state.asm.cabinet);
+        if (!b) return; // ignore clicks on panels outside this cabinet
+        ld.panelId = bodyId;
         ld.pt = worldToOutline(b, point);
-        repaintCaeMarkers(b);
-        renderBodyList();
+        repaintAsmLoadMarkers();
+        renderAnalysisSection();
       });
     });
     row.querySelector<HTMLButtonElement>('[data-lf="remove"]')!.addEventListener('click', () => {
-      b.caeLoads!.splice(i, 1);
-      repaintCaeMarkers(b);
-      renderBodyList();
+      state.asm.loads.splice(i, 1); repaintAsmLoadMarkers(); renderAnalysisSection();
     });
   });
-
-  panel.querySelector<HTMLButtonElement>('[data-cae="addLoad"]')!.addEventListener('click', () => {
-    b.caeLoads!.push(newCaeLoad());
-    repaintCaeMarkers(b);
-    renderBodyList();
-  });
-
-  panel.querySelector<HTMLInputElement>('[data-cae="uniformKg"]')!.addEventListener('change', (e) => {
-    b.caeUniformKg = Math.max(0, parseFloat((e.target as HTMLInputElement).value) || 0);
-  });
-
-  // Edge toggle buttons — cycle free→simple→fixed.
-  panel.querySelectorAll<HTMLButtonElement>('.cae-edge').forEach((btn) => {
-    btn.addEventListener('click', () => {
-      const edge = btn.dataset.edge as keyof EdgeSupports;
-      b.caeSupports![edge] = edgeCycle[b.caeSupports![edge]];
-      repaintCaeMarkers(b);
-      renderBodyList();
-    });
-  });
-
-  // --- Pins ---
-  panel.querySelectorAll<HTMLElement>('.cae-pin-row').forEach((row) => {
-    const i = +row.dataset.pin!;
-    row.querySelector<HTMLButtonElement>('[data-pf="remove"]')!.addEventListener('click', () => {
-      b.caePins!.splice(i, 1);
-      repaintCaeMarkers(b);
-      renderBodyList();
-    });
-  });
-  panel.querySelector<HTMLButtonElement>('[data-cae="addPin"]')!.addEventListener('click', (e) => {
-    const btn = e.target as HTMLButtonElement;
-    btn.classList.add('armed');
-    btn.textContent = 'Click the panel…';
-    viewer.beginForcePlacement(b.id, (point) => {
-      b.caePins!.push(worldToOutline(b, point));
-      repaintCaeMarkers(b);
-      renderBodyList();
-    });
-  });
-
-  // Solve — run the plate solver (yield first so the button can show busy).
-  panel.querySelector<HTMLButtonElement>('[data-cae="solve"]')!.addEventListener('click', async (e) => {
-    const btn = e.target as HTMLButtonElement;
-    btn.disabled = true;
-    btn.textContent = 'Solving…';
-    await new Promise((r) => setTimeout(r, 0));
-    try {
-      await runCaeSolve(b);
-    } catch (err) {
-      console.error('CAE solve failed', err);
-      b.caeSolveMsg = 'Solve failed — see console.';
-    }
-    renderBodyList();
-  });
-
-  // Clear — remove overlay + all markers.
-  panel.querySelector<HTMLButtonElement>('[data-cae="clear"]')!.addEventListener('click', () => {
-    viewer.clearCae(b.id);
-    for (const ld of b.caeLoads ?? []) ld.pt = null;
-    b.caePins = [];
-    b.caeSolveMsg = undefined;
-    b.caeAnalysis = null;
-    repaintCaeMarkers(b);
-    renderBodyList();
-  });
-
-  // Export analysis PDF — one-page standalone report for this body.
-  panel.querySelector<HTMLButtonElement>('[data-cae="exportPdf"]')!.addEventListener('click', () => {
-    exportAnalysisPdf(b);
-  });
-
-  // Arm the in-3D edge picker while this panel is open, and paint markers.
-  const f = outlineFrame(b);
-  viewer.beginEdgePick(b.id, {
-    origin: f.origin, uAxis: f.uAxis, vAxis: f.vAxis,
-    w: b.analysis.outline.bbox.w, h: b.analysis.outline.bbox.h,
-  }, (edge) => {
-    b.caeSupports![edge] = edgeCycle[b.caeSupports![edge]];
-    repaintCaeMarkers(b);
-    renderBodyList();
-  });
-  // Paint after the DOM settles so outlineFrame is valid.
-  setTimeout(() => repaintCaeMarkers(b), 0);
-
-  return panel;
 }
 
-/** Generalised constraint check — see the requirement. Returns null if OK, else
- *  a message explaining what's missing. */
-function caeUnderConstrained(b: BodyState, supports: EdgeSupports): string | null {
-  const edgeKinds = [supports.top, supports.bottom, supports.left, supports.right];
-  const nFixed = edgeKinds.filter((k) => k === 'fixed').length;
-  const nSupported = edgeKinds.filter((k) => k !== 'free').length;
-  const pins = b.caePins ?? [];
-  const nPins = pins.length;
-  // ≥3 non-collinear pins?
-  let nonCollinearPins = false;
-  if (nPins >= 3) {
-    for (let i = 0; i < nPins && !nonCollinearPins; i++) {
-      for (let j = i + 1; j < nPins && !nonCollinearPins; j++) {
-        for (let k = j + 1; k < nPins; k++) {
-          const ax = pins[j].x - pins[i].x, ay = pins[j].y - pins[i].y;
-          const bx = pins[k].x - pins[i].x, by = pins[k].y - pins[i].y;
-          if (Math.abs(ax * by - ay * bx) > 1e-3) { nonCollinearPins = true; break; }
-        }
-      }
-    }
-  }
-  // 1 supported edge + ≥1 pin off that edge — treat any pin not exactly on the
-  // supported edge line as "off it".
-  const pinOffAnEdge = nSupported >= 1 && nPins >= 1;
-  const constrained =
-    nFixed >= 1 || nSupported >= 2 || nonCollinearPins || pinOffAnEdge;
-  if (constrained) return null;
-  return 'Under-constrained: fix an edge, support ≥2 edges, add ≥3 non-collinear pins, or combine a supported edge with a pin so the panel can\'t tip.';
+/** Standalone Assembly-analysis PDF for the current cabinet. */
+function exportAssemblyPdf() {
+  const an = state.asm.analysis;
+  if (!an) return;
+  const doc = buildAssemblyAnalysisPdf(toAsmPdf(an), {
+    sheetW: state.lastSheet?.w ?? 2440,
+    sheetL: state.lastSheet?.l ?? 1220,
+    margin: state.lastSheet?.margin ?? 0,
+    kerf: state.lastSheet?.kerf ?? 0,
+    units: state.units,
+    jobName: state.jobName || 'Plywood cut estimate',
+    paper: (pdfPaperSelect.value as any) || 'widescreen-16-9',
+  });
+  const job = (state.jobName || 'plywood').replace(/[^a-z0-9_-]+/gi, '_').toLowerCase();
+  const tag = (an.cabinetTag || 'assembly').replace(/[^a-z0-9_-]+/gi, '_').toLowerCase();
+  downloadPdf(`${job}_assembly_${tag}.pdf`, doc);
 }
 
-/** Run the plate solve for a body, paint the heatmap, capture the analysis. */
-async function runCaeSolve(b: BodyState) {
-  const mat = bodyMaterial(b);
-  const bbox = b.analysis.outline.bbox;
-  const supports = b.caeSupports ?? autoSupports(b);
-  const grainAlongLength = b.grain !== 'width'; // 'free'/'length' → grain along length
-
-  const msg = caeUnderConstrained(b, supports);
-  if (msg) {
-    viewer.clearDeflectionOverlay(b.id);
-    b.caeSolveMsg = msg;
-    b.caeAnalysis = null;
-    return;
-  }
-
-  // Build the load list — signed magnitude for direction (down +, up −).
-  const loads = (b.caeLoads ?? []).filter((l) => l.val > 0).map((l) => {
-    const magN = forceToN(l.val, l.unit);
-    const pt = l.pt ?? { x: bbox.w / 2, y: bbox.h / 2 };
-    return { x: pt.x, y: pt.y, N: l.down ? magN : -magN, shape: l.shape, size: l.sizeMm };
-  });
-  const uniformKg = b.caeUniformKg ?? 0;
-
-  if (loads.length === 0 && uniformKg <= 0) {
-    viewer.clearDeflectionOverlay(b.id);
-    b.caeSolveMsg = 'No load — add a point load or a uniform kg first.';
-    b.caeAnalysis = null;
-    return;
-  }
-
-  const res = solvePlate({
-    outline: b.analysis.outline,
-    thicknessMm: b.analysis.thickness,
-    material: mat,
-    grainAlongLength,
-    supports,
-    loads,
-    uniform: uniformKg > 0 ? { totalKg: uniformKg } : undefined,
-    pointSupports: b.caePins ?? [],
-  });
-
-  if (!res.converged || !Number.isFinite(res.maxAbsW) || res.maxAbsW > b.analysis.length) {
-    viewer.clearDeflectionOverlay(b.id);
-    b.caeSolveMsg = 'Solve did not converge — the supports leave the panel free to move. Add more supports.';
-    b.caeAnalysis = null;
-    return;
-  }
-
-  // Paint the heatmap on the face.
-  const tex = buildHeatTexture(res);
-  const f = outlineFrame(b);
-  viewer.showDeflectionOverlay(b.id, tex, {
-    origin: f.origin, uAxis: f.uAxis, vAxis: f.vAxis, normal: f.normal,
-    w: bbox.w, h: bbox.h, thickness: b.analysis.thickness,
-  });
-  repaintCaeMarkers(b);
-
-  const span = Math.max(b.analysis.length, b.analysis.width);
-  const limit = span / 200;
-  const verdict = res.maxAbsW < span / 300 ? 'OK' : res.maxAbsW < limit ? 'borderline' : 'weak';
-  b.caeSolveMsg =
-    `Max sag ${fmtSag(res.maxAbsW, state.units)} at ` +
-    `(${fmtDim(res.maxAt[0], state.units)}, ${fmtDim(res.maxAt[1], state.units)}) — ` +
-    `${verdict} vs span/200 (${fmtSag(limit, state.units)})`;
-
-  // Capture the analysis for the PDF — snapshot the body with its CAE overlay,
-  // white PDF background. Only this body visible so the heatmap fills the frame.
-  await captureCaeAnalysis(b, res, span, verdict);
-}
-
-/** Snapshot the solved body + overlay for the PDF and store the analysis. */
-async function captureCaeAnalysis(b: BodyState, res: import('./cae').SolveResult, span: number, verdict: string) {
-  await yieldFrame();
-  const SHOT = { w: 1200, h: 900 };
-  let heatmapPng = '', imgW = SHOT.w, imgH = SHOT.h;
-  viewer.enterPdfBg();
-  try {
-    viewer.beginSnapshotBatch(SHOT);
-    const shot = viewer.snapshotFiltered(new Set([b.id]), null, 0, undefined, SHOT);
-    heatmapPng = shot.dataUrl; imgW = shot.width; imgH = shot.height;
-  } catch (err) {
-    console.warn('CAE snapshot failed', err);
-  } finally {
-    viewer.endSnapshotBatch();
-    viewer.exitPdfBg();
-  }
-
-  const loads = (b.caeLoads ?? []).filter((l) => l.val > 0).map((l) => {
-    const pt = l.pt ?? { x: b.analysis.outline.bbox.w / 2, y: b.analysis.outline.bbox.h / 2 };
-    return {
-      magN: forceToN(l.val, l.unit), unit: l.unit,
-      magDisplay: `${l.val} ${l.unit}`,
-      shape: l.shape, sizeMm: l.sizeMm, down: l.down, x: pt.x, y: pt.y,
-    };
-  });
-
-  b.caeAnalysis = {
-    heatmapPng, imgW, imgH,
-    materialName: bodyMaterial(b).name,
-    loads,
-    uniformKg: b.caeUniformKg ?? 0,
-    supports: { ...(b.caeSupports ?? autoSupports(b)) },
-    pinCount: (b.caePins ?? []).length,
-    maxSagMm: res.maxAbsW,
-    maxAt: [res.maxAt[0], res.maxAt[1]],
-    spanMm: span,
-    verdict,
+/** Convert captured AssemblyAnalysis → the PDF's AssemblyAnalysisPage input. */
+function toAsmPdf(an: AssemblyAnalysis): import('./pdf').AssemblyAnalysisPage {
+  return {
+    cabinet: an.cabinetTag,
+    image: { dataUrl: an.heatmapPng, width: an.imgW, height: an.imgH },
+    panelCount: an.panelCount,
+    joints: an.joints.map((j) => ({ pair: `${j.labelA} ⟂ ${j.labelB}`, length: j.length, stiffness: j.stiffness })),
+    loads: an.loads.map((l) => ({ magDisplay: l.magDisplay, shape: l.shape as 'square' | 'round', sizeMm: l.sizeMm, down: l.down, panelLabel: l.panelLabel })),
+    groundedNodes: an.groundedNodes,
+    maxSagMm: an.maxSagMm,
+    maxPanelLabel: an.maxPanelLabel,
+    maxAt: an.maxAt,
+    spanMm: an.spanMm,
+    verdict: an.verdict,
+    resolutionLog: an.resolutionLog,
+    iterations: an.iterations,
   };
 }
+
+// --- Analysis section event wiring (once) ---------------------------------
+asmCabinetSelect.addEventListener('change', () => {
+  state.asm.cabinet = asmCabinetSelect.value || null;
+  state.asm.joints = [];
+  state.asm.detected = false;
+  state.asm.analysis = null;
+  viewer.clearAssemblyOverlay();
+  renderAnalysisSection();
+});
+asmTolInput.addEventListener('change', () => {
+  const v = Math.max(0, parseFloat(asmTolInput.value) || 0);
+  state.asm.tolMm = toMm(v, state.units);
+});
+asmDetectBtn.addEventListener('click', () => detectAssemblyJoints());
+asmAddLoadBtn.addEventListener('click', () => {
+  state.asm.loads.push(newAsmLoad());
+  renderAnalysisSection();
+});
+asmPreset50.addEventListener('click', () => { presetOnTop(50); repaintAsmLoadMarkers(); renderAnalysisSection(); });
+asmPresetShelf.addEventListener('click', () => { presetPerShelf(20); repaintAsmLoadMarkers(); renderAnalysisSection(); });
+asmPresetClear.addEventListener('click', () => {
+  state.asm.loads = [];
+  repaintAsmLoadMarkers();
+  renderAnalysisSection();
+});
+asmSolveBtn.addEventListener('click', async () => {
+  asmSolveBtn.disabled = true;
+  asmSolveBtn.textContent = 'Solving…';
+  await yieldFrame();
+  try {
+    await solveAssemblyForCabinet();
+  } catch (err) {
+    console.error('assembly solve failed', err);
+    state.asm.solveMsg = 'Solve failed — see console.';
+    renderAnalysisSection();
+  }
+  asmSolveBtn.textContent = 'Solve assembly';
+  asmSolveBtn.disabled = false;
+});
+asmClearBtn.addEventListener('click', () => clearAssembly());
+asmExportBtn.addEventListener('click', () => exportAssemblyPdf());
+
+// --- Sidebar mode switch (Cut planning / Analysis) ------------------------
+const sidebarEl = $('sidebar');
+const modeCutBtn = $<HTMLButtonElement>('modeCutBtn');
+const modeAnalysisBtn = $<HTMLButtonElement>('modeAnalysisBtn');
+const modeAnalysisDot = $('modeAnalysisDot');
+const MODE_KEY = 'plywood.sidebarMode';
+type SidebarMode = 'cut' | 'analysis';
+
+function applySidebarMode(mode: SidebarMode) {
+  sidebarEl.classList.toggle('mode-cut', mode === 'cut');
+  sidebarEl.classList.toggle('mode-analysis', mode === 'analysis');
+  modeCutBtn.classList.toggle('active', mode === 'cut');
+  modeAnalysisBtn.classList.toggle('active', mode === 'analysis');
+  modeCutBtn.setAttribute('aria-selected', String(mode === 'cut'));
+  modeAnalysisBtn.setAttribute('aria-selected', String(mode === 'analysis'));
+  try { localStorage.setItem(MODE_KEY, mode); } catch {}
+}
+
+/** Show/hide the green solved-state dot on the Analysis tab. */
+function refreshSolvedDot() {
+  modeAnalysisDot.hidden = !assemblySolved();
+}
+
+modeCutBtn.addEventListener('click', () => applySidebarMode('cut'));
+modeAnalysisBtn.addEventListener('click', () => {
+  applySidebarMode('analysis');
+  // Ensure the section is populated for the current selection.
+  renderAnalysisSection();
+});
+applySidebarMode(((): SidebarMode => {
+  try { return localStorage.getItem(MODE_KEY) === 'analysis' ? 'analysis' : 'cut'; } catch { return 'cut'; }
+})());
 
 function syncViewerSelectionFromState() {
   viewer.setSelection(state.bodies.filter((b) => b.selected).map((b) => b.id));
@@ -2302,78 +2490,6 @@ function buildStructureRows(idByBodyPartId: Map<string, string[]>): import('./pd
   return rows;
 }
 
-/** True when the user ran CAE this session (≥1 panel solved). Gates the whole
- *  Structure + Analysis section in the job PDF. */
-function anyPanelSolved(): boolean {
-  return state.bodies.some((b) => !!b.caeAnalysis);
-}
-
-/** Convert a body's captured analysis to the PDF's CaePanelAnalysis. `codes`
- *  are the panel labels this body placed (may be empty for standalone). */
-function toPanelAnalysis(b: BodyState, codes: string[]): CaePanelAnalysis | null {
-  const a = b.caeAnalysis;
-  if (!a) return null;
-  return {
-    code: codes.join(', '),
-    name: b.name,
-    image: { dataUrl: a.heatmapPng, width: a.imgW, height: a.imgH },
-    materialName: a.materialName,
-    loads: a.loads.map((l) => ({ magDisplay: l.magDisplay, shape: l.shape as 'square' | 'round', sizeMm: l.sizeMm, down: l.down, x: l.x, y: l.y })),
-    uniformKg: a.uniformKg,
-    supports: a.supports,
-    pinCount: a.pinCount,
-    maxSagMm: a.maxSagMm,
-    maxAt: a.maxAt,
-    spanMm: a.spanMm,
-    verdict: a.verdict,
-  };
-}
-
-/** Build the job-PDF Analysis pages: one per solved body, ordered like the
- *  Structure table (weakest first). */
-function buildAnalyses(idByBodyPartId: Map<string, string[]>): CaePanelAnalysis[] {
-  const rank: Record<string, number> = { weak: 0, borderline: 1, ok: 2, OK: 0 };
-  const out: { an: CaePanelAnalysis; sag: number; v: number }[] = [];
-  for (const b of state.bodies) {
-    if (!b.caeAnalysis) continue;
-    const codes = idByBodyPartId.get(String(b.id)) ?? [];
-    const an = toPanelAnalysis(b, codes);
-    if (an) out.push({ an, sag: an.maxSagMm, v: rank[an.verdict] ?? 3 });
-  }
-  out.sort((a, b) => (a.v - b.v) || (b.sag - a.sag));
-  return out.map((o) => o.an);
-}
-
-/** Standalone Analysis PDF for one body. */
-function exportAnalysisPdf(b: BodyState) {
-  if (!b.caeAnalysis) return;
-  // Codes if this body was nested; else none.
-  const codes: string[] = [];
-  if (state.lastNest) {
-    for (const g of state.lastNest.groups) {
-      for (const s of g.sheets) {
-        for (const p of s.parts) {
-          if (p.partId === String(b.id)) codes.push(`${s.globalIndex}${p.panelLabel}`);
-        }
-      }
-    }
-  }
-  const an = toPanelAnalysis(b, codes);
-  if (!an) return;
-  const doc = buildAnalysisPdf(an, {
-    sheetW: state.lastSheet?.w ?? 2440,
-    sheetL: state.lastSheet?.l ?? 1220,
-    margin: state.lastSheet?.margin ?? 0,
-    kerf: state.lastSheet?.kerf ?? 0,
-    units: state.units,
-    jobName: state.jobName || 'Plywood cut estimate',
-    paper: (pdfPaperSelect.value as any) || 'widescreen-16-9',
-  });
-  const job = (state.jobName || 'plywood').replace(/[^a-z0-9_-]+/gi, '_').toLowerCase();
-  const tag = (codes[0] || b.name || `body_${b.id}`).replace(/[^a-z0-9_-]+/gi, '_').toLowerCase();
-  downloadPdf(`${job}_analysis_${tag}.pdf`, doc);
-}
-
 function buildSplitJoins(): SplitJoinGroup[] {
   if (!state.lastNest || state.splitSegmentGeo.size === 0) return [];
   // First placement of each segment id → its sheet + label.
@@ -2812,13 +2928,14 @@ async function exportPdf(btn: HTMLButtonElement, paper: string) {
     }
   }
 
-  // Structure + Analysis are ONLY included when the user actually ran CAE this
-  // session (≥1 panel solved). If nobody solved, the job PDF has no Structure
-  // table, no Analysis pages, and no TOC entries for them — as if the feature
-  // didn't exist. The live sidebar screening line + weak badges are unaffected.
-  const caeRan = anyPanelSolved();
+  // Structure + Assembly analysis are ONLY included when the user actually ran
+  // an ASSEMBLY solve this session. If nobody solved, the job PDF has no
+  // Structure table, no Assembly analysis page, and no TOC entries for them —
+  // as if the feature didn't exist. The live sidebar screening line + weak
+  // badges are unaffected (that screening is always on, read-only).
+  const caeRan = assemblySolved();
   const structure = caeRan ? buildStructureRows(idByBodyPartId) : undefined;
-  const analyses = caeRan ? buildAnalyses(idByBodyPartId) : undefined;
+  const assembly = caeRan && state.asm.analysis ? toAsmPdf(state.asm.analysis) : undefined;
 
   // Use a clean WHITE scene background + faint shadow floor for all PDF
   // snapshots — the dark studio backdrop the live viewer uses prints
@@ -2928,7 +3045,7 @@ async function exportPdf(btn: HTMLButtonElement, paper: string) {
     cnc: isCncStrategy(state.lastStrategy),
     splitJoins: buildSplitJoins(),
     structure,
-    analyses,
+    assembly,
   });
   setProgress('Saving…', 98);
   await yieldFrame();
