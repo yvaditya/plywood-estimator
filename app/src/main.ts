@@ -1146,6 +1146,7 @@ function runCaeSolve(b: BodyState) {
     normal: f.normal,
     w: bbox.w,
     h: bbox.h,
+    thickness: b.analysis.thickness,
   });
 
   const span = Math.max(b.analysis.length, b.analysis.width);

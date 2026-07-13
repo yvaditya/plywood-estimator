@@ -492,6 +492,9 @@ export class Viewer {
       vAxis: [number, number, number]; // unit, world
       normal: [number, number, number];
       w: number; h: number; // mm
+      /** Panel thickness — when given, the heatmap is painted on BOTH faces
+       *  (the analyzed outline face can be the hidden underside). */
+      thickness?: number;
     },
   ) {
     this.clearDeflectionOverlay(bodyId);
@@ -499,27 +502,34 @@ export class Viewer {
     const u = new THREE.Vector3(...plane.uAxis).normalize();
     const v = new THREE.Vector3(...plane.vAxis).normalize();
     const n = new THREE.Vector3(...plane.normal).normalize();
-    // Float 0.5 mm proud of the face so it wins the depth test cleanly.
-    const off = o.clone().addScaledVector(n, 0.5);
-    const c0 = off.clone();
-    const c1 = off.clone().addScaledVector(u, plane.w);
-    const c2 = off.clone().addScaledVector(u, plane.w).addScaledVector(v, plane.h);
-    const c3 = off.clone().addScaledVector(v, plane.h);
-    const geom = new THREE.BufferGeometry();
-    const positions = new Float32Array([
-      c0.x, c0.y, c0.z,  c1.x, c1.y, c1.z,  c2.x, c2.y, c2.z,
-      c0.x, c0.y, c0.z,  c2.x, c2.y, c2.z,  c3.x, c3.y, c3.z,
-    ]);
-    const uvs = new Float32Array([0, 0, 1, 0, 1, 1, 0, 0, 1, 1, 0, 1]);
-    geom.setAttribute('position', new THREE.BufferAttribute(positions, 3));
-    geom.setAttribute('uv', new THREE.BufferAttribute(uvs, 2));
-    geom.computeVertexNormals();
-    const mat = new THREE.MeshBasicMaterial({ map: tex, transparent: true, opacity: 0.86, side: THREE.DoubleSide, depthWrite: false });
-    const mesh = new THREE.Mesh(geom, mat);
-    mesh.renderOrder = 5;
-    mesh.userData.caeOverlayFor = bodyId;
-    this.caeGroup.add(mesh);
-    this.caeOverlays.set(bodyId, mesh);
+    const group = new THREE.Group();
+    // Opaque fringe plot (standard CAE display) — a translucent map over the
+    // part's own color muddies the scale beyond reading.
+    const mat = new THREE.MeshBasicMaterial({ map: tex, transparent: true, side: THREE.DoubleSide, depthWrite: false });
+    // Float 0.5 mm proud of each face so it wins the depth test cleanly.
+    const offsets = plane.thickness ? [0.5, -(plane.thickness + 0.5)] : [0.5];
+    for (const d of offsets) {
+      const off = o.clone().addScaledVector(n, d);
+      const c0 = off.clone();
+      const c1 = off.clone().addScaledVector(u, plane.w);
+      const c2 = off.clone().addScaledVector(u, plane.w).addScaledVector(v, plane.h);
+      const c3 = off.clone().addScaledVector(v, plane.h);
+      const geom = new THREE.BufferGeometry();
+      const positions = new Float32Array([
+        c0.x, c0.y, c0.z,  c1.x, c1.y, c1.z,  c2.x, c2.y, c2.z,
+        c0.x, c0.y, c0.z,  c2.x, c2.y, c2.z,  c3.x, c3.y, c3.z,
+      ]);
+      const uvs = new Float32Array([0, 0, 1, 0, 1, 1, 0, 0, 1, 1, 0, 1]);
+      geom.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+      geom.setAttribute('uv', new THREE.BufferAttribute(uvs, 2));
+      geom.computeVertexNormals();
+      const mesh = new THREE.Mesh(geom, mat);
+      mesh.renderOrder = 5;
+      group.add(mesh);
+    }
+    group.userData.caeOverlayFor = bodyId;
+    this.caeGroup.add(group);
+    this.caeOverlays.set(bodyId, group);
   }
   clearDeflectionOverlay(bodyId: number) {
     const m = this.caeOverlays.get(bodyId);
