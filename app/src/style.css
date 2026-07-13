@@ -170,6 +170,41 @@ body {
   margin-top: 4px;
 }
 
+/* ---------------------------------------------------------------------------
+   Workflow zoning — each stage of the pipeline (Stock → Cutting → Parts →
+   Job & export → Shopping) gets a full-bleed, very-low-saturation background
+   tint. The tint reads as a whisper of hue over the sidebar gray, mapping
+   color to workflow stage. NO card chrome: no radius, no shadow, no inset box.
+   The tint bleeds past the sidebar's 12px horizontal padding to reach both
+   edges; the 12px is added back as inner padding so the controls don't shift.
+   Distinct hues, all pinned to ~97% lightness so they never read as colored
+   cards — only as gently zoned regions separated by the existing hairlines.
+   --------------------------------------------------------------------------- */
+:root {
+  --tint-stock:   hsl(40, 46%, 97.2%);   /* warm sand      */
+  --tint-cutting: hsl(212, 40%, 97.3%);  /* cool blue-grey */
+  --tint-parts:   hsl(142, 30%, 97.3%);  /* faint green    */
+  --tint-job:     hsl(268, 34%, 97.6%);  /* faint violet   */
+  --tint-shopping:hsl(38, 60%, 96.8%);   /* faint amber    */
+}
+.panel--group {
+  margin-left: -12px;
+  margin-right: -12px;
+  padding-left: 18px;
+  padding-right: 18px;
+}
+/* Keep the hairline divider stacking correct when a tinted group follows
+   another panel — the 4px gap would otherwise expose a sliver of sidebar
+   gray. Pull the divider flush to the tint's top edge. */
+.panel + .panel--group { margin-top: 0; }
+.panel--group + .panel { margin-top: 0; border-top: 1px solid var(--line); }
+
+.panel--group[data-group="stock"]    { background: var(--tint-stock); }
+.panel--group[data-group="cutting"]  { background: var(--tint-cutting); }
+.panel--group[data-group="parts"]    { background: var(--tint-parts); }
+.panel--group[data-group="job"]      { background: var(--tint-job); }
+.panel--group[data-group="shopping"] { background: var(--tint-shopping); }
+
 .panel h2 {
   margin: 0 0 10px;
   font-size: 11px;
