@@ -756,10 +756,13 @@ function spmv(rowPtr: Int32Array, colIdx: Int32Array, val: Float64Array, x: Floa
   }
 }
 
-/** Jacobi-preconditioned CG. Returns iteration count + convergence flag. */
+/** Jacobi-preconditioned CG. Returns iteration count + convergence flag.
+ *  `onIter(iter, relRes)` (optional) fires every 50 iterations for UI progress
+ *  — kept coarse so the callback overhead never dominates the loop. */
 function pcg(
   rowPtr: Int32Array, colIdx: Int32Array, val: Float64Array, diag: Float64Array,
   b: Float64Array, x: Float64Array, tol: number, maxIter: number,
+  onIter?: (iter: number, relRes: number) => void,
 ): { iterations: number; converged: boolean } {
   const n = b.length;
   const r = new Float64Array(n);
@@ -794,6 +797,7 @@ function pcg(
     }
     rnorm = Math.sqrt(rnorm);
     if (rnorm / bnorm < tol) { iter++; return { iterations: iter, converged: true }; }
+    if (onIter && (iter % 50) === 0) onIter(iter, rnorm / bnorm);
     for (let i = 0; i < n; i++) z[i] = invDiag[i] * r[i];
     let rzNew = 0;
     for (let i = 0; i < n; i++) rzNew += r[i] * z[i];
@@ -822,7 +826,9 @@ export function rectOutline(length: number, width: number): PolygonOutline {
 // per node in world 3D (ux uy uz θx θy θz). Panels are stitched where their
 // edges touch (joint detection) with penalty springs whose stiffness depends
 // on the joint class (rigid / semi-rigid / hinged). Nodes near the floor are
-// grounded. Solved with Jacobi-PCG.
+// grounded. The linear system is solved by Eigen's SimplicialLDLT compiled to
+// WASM (opts.backend, from solverBackend.ts) when it loads, else the built-in
+// Jacobi-PCG fallback — both handed the identical symmetric CSR (==CSC) system.
 //
 // The per-panel API above is untouched; this section only ADDS exports.
 // ===========================================================================
@@ -876,6 +882,31 @@ export interface AsmLoad {
   size: number;
 }
 
+/** A pluggable sparse-direct linear-solve backend (e.g. Eigen SimplicialLDLT
+ *  compiled to WASM — see solverBackend.ts). Injected into solveAssembly; when
+ *  absent, the built-in Jacobi-PCG is used. The system handed to it is the
+ *  penalty-conditioned SYMMETRIC CSR (== CSC) stiffness matrix. */
+export interface DirectLinearSolver {
+  readonly name: string;
+  factorize(n: number, indptr: Int32Array, indices: Int32Array, data: Float64Array): boolean;
+  solve(rhs: Float64Array): Float64Array | null;
+  dispose(): void;
+}
+
+/** Progress stages surfaced to the UI (Analysis Solve button). The `pct` is a
+ *  0..100 hint for the progress bar; PCG reports incremental iteration progress
+ *  through the `solving` stage, LDLT reports an atomic factorize pulse. */
+export type SolveStage =
+  | 'meshing' | 'assembling' | 'factorizing' | 'solving' | 'recovering' | 'done';
+
+export interface SolveProgress {
+  stage: SolveStage;
+  /** 0..100 progress hint. */
+  pct: number;
+  /** Optional human detail, e.g. "58320 DOF" or "iter 200 · res 1e-4". */
+  detail?: string;
+}
+
 export interface AsmSolveOptions {
   panels: AsmPanel[];
   joints: AsmJoint[];
@@ -886,7 +917,17 @@ export interface AsmSolveOptions {
   targetNodesPerPanel?: number;
   /** Hard cap on total assembly DOF. */
   maxDof?: number;
+  /** Optional sparse-direct backend (Eigen LDLT wasm). When present AND its
+   *  factorize succeeds, it replaces PCG for the assembly solve. On any failure
+   *  the solve falls back to PCG so a result is always produced. */
+  backend?: DirectLinearSolver | null;
+  /** Optional progress callback (staged UI feedback). Called synchronously at
+   *  each stage boundary; the caller yields to the browser between stages. */
+  onProgress?: (p: SolveProgress) => void;
 }
+
+/** Which linear backend actually solved the system (for the result/log line). */
+export type SolveBackend = 'Eigen LDLT (wasm)' | 'PCG';
 
 /** Per-panel deflection field, in that panel's local grid (like SolveResult). */
 export interface AsmPanelResult {
@@ -931,6 +972,12 @@ export interface AsmResult {
   totalNodes: number;
   iterations: number;
   converged: boolean;
+  /** Which linear backend solved the system ('Eigen LDLT (wasm)' or 'PCG'). */
+  backend: SolveBackend;
+  /** Factorization time (ms) — LDLT only; 0 for PCG. */
+  factorMs: number;
+  /** Solve time (ms): the LDLT triangular solves, or the whole PCG loop. */
+  solveMs: number;
   /** Floor-grounded node count (for the glyph overlay + reporting). */
   groundedNodes: number;
   /** Resolution log line, e.g. "6 panels · 3480 nodes · 20880 DOF". */
@@ -938,6 +985,10 @@ export interface AsmResult {
   /** Grounded node world positions (for glyphs). */
   groundPoints: Vec3World[];
 }
+
+/** Monotonic-ish millisecond clock, usable in both browser and node/tsx. */
+const nowMs = (): number =>
+  (typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now();
 
 // --- small 3D helpers (local to the assembly solver) ---
 const w3sub = (a: Vec3World, b: Vec3World): Vec3World => [a[0] - b[0], a[1] - b[1], a[2] - b[2]];
@@ -1271,16 +1322,21 @@ export function solveAssembly(opts: AsmSolveOptions): AsmResult {
   const { panels, joints, loads, tolMm } = opts;
   const maxDof = opts.maxDof ?? 60000;
   let target = opts.targetNodesPerPanel ?? 600;
+  const report = opts.onProgress ?? (() => {});
 
   const empty = (msg: string): AsmResult => ({
     ok: false, message: msg, panels: [], maxDisp: 0, maxPanelId: -1, maxAt: [0, 0],
     spanMm: 0, verdict: 'ok', maxVm: 0, maxVmPanelId: -1, maxVmAt: [0, 0],
     utilPct: 0, stressVerdict: 'ok',
     totalDof: 0, totalNodes: 0, iterations: 0, converged: false,
+    backend: 'PCG', factorMs: 0, solveMs: 0,
     groundedNodes: 0, resolutionLog: '', groundPoints: [],
   });
 
   if (panels.length === 0) return empty('No panels selected.');
+
+  // --- STAGE: preprocessing (meshing) — OUR TypeScript. ---
+  report({ stage: 'meshing', pct: 5, detail: `${panels.length} panel${panels.length === 1 ? '' : 's'}` });
 
   // Auto-coarsen so total DOF ≈ 6 · Σ activeNodes ≤ maxDof.
   let meshes: PanelMesh[] = [];
@@ -1312,6 +1368,9 @@ export function solveAssembly(opts: AsmSolveOptions): AsmResult {
   const nDof = totalNodes * 6;
   const resolutionLog =
     `${panels.length} panel${panels.length === 1 ? '' : 's'} · ${totalNodes} nodes · ${nDof} DOF · target ${target}/panel`;
+
+  // --- STAGE: assembling the global stiffness — OUR TypeScript. ---
+  report({ stage: 'assembling', pct: 25, detail: `${nDof.toLocaleString()} DOF` });
 
   // Rebuild the global node table (positions) so we can ground + couple.
   const nodePos: Vec3World[] = new Array(totalNodes);
@@ -1599,9 +1658,60 @@ export function solveAssembly(opts: AsmSolveOptions): AsmResult {
     }
   }
 
-  // Solve — Jacobi-PCG, rel tol 1e-7, cap 20k.
+  // --- LINEAR SOLVE: the open-source WASM core (Eigen LDLT) when available,
+  //     else our built-in Jacobi-PCG. Both solve the same symmetric CSR (==CSC)
+  //     penalty-conditioned SPD system. ---
   const x = new Float64Array(nDof);
-  const { iterations, converged } = pcg(rowPtr, colIdx, val, diag, F, x, 1e-7, 20000);
+  let iterations = 0;
+  let converged = false;
+  let backend: SolveBackend = 'PCG';
+  let factorMs = 0;
+  let solveMs = 0;
+
+  let usedDirect = false;
+  if (opts.backend) {
+    // Try the direct sparse solver. factorize builds+factors K (symmetric CSR
+    // loads directly as Eigen CSC); solve back-substitutes for x.
+    report({ stage: 'factorizing', pct: 55, detail: opts.backend.name });
+    const tf0 = nowMs();
+    const okFac = opts.backend.factorize(nDof, rowPtr, colIdx, val);
+    factorMs = nowMs() - tf0;
+    if (okFac) {
+      report({ stage: 'solving', pct: 75, detail: opts.backend.name });
+      const ts0 = nowMs();
+      const sol = opts.backend.solve(F);
+      solveMs = nowMs() - ts0;
+      if (sol && sol.length === nDof) {
+        x.set(sol);
+        usedDirect = true;
+        converged = true;   // a direct factor+solve is "converged" by definition
+        iterations = 0;
+        backend = 'Eigen LDLT (wasm)';
+      }
+      opts.backend.dispose();
+    } else {
+      // Factorization failed (singular pivot etc.) — release + fall through.
+      opts.backend.dispose();
+    }
+  }
+
+  if (!usedDirect) {
+    // Jacobi-PCG, rel tol 1e-7, cap 20k.
+    report({ stage: 'solving', pct: 60, detail: 'PCG' });
+    const ts0 = nowMs();
+    const pcgRes = pcg(rowPtr, colIdx, val, diag, F, x, 1e-7, 20000,
+      (it, relRes) => report({
+        stage: 'solving', pct: Math.min(90, 60 + (it / 20000) * 30),
+        detail: `PCG iter ${it} · res ${relRes.toExponential(1)}`,
+      }));
+    solveMs = nowMs() - ts0;
+    iterations = pcgRes.iterations;
+    converged = pcgRes.converged;
+    backend = 'PCG';
+  }
+
+  // --- STAGE: stress recovery / post-processing — OUR TypeScript. ---
+  report({ stage: 'recovering', pct: 92 });
 
   // Scatter per-panel translational displacement magnitude + recover stresses.
   const panelResults: AsmPanelResult[] = [];
@@ -1704,8 +1814,10 @@ export function solveAssembly(opts: AsmSolveOptions): AsmResult {
   const governing = panels.find((p) => p.id === maxPanelId) ?? panels[0];
   const span = Math.max(governing.outline.bbox.w, governing.outline.bbox.h);
   if (!Number.isFinite(maxDisp) || maxDisp > span * 2) {
-    return { ...empty('Solve produced a non-physical result — check the joints and grounding.'), resolutionLog, totalNodes, totalDof: nDof, iterations };
+    return { ...empty('Solve produced a non-physical result — check the joints and grounding.'), resolutionLog, totalNodes, totalDof: nDof, iterations, backend, factorMs, solveMs };
   }
+
+  report({ stage: 'done', pct: 100 });
 
   const limit = span / 200;
   const verdict: 'ok' | 'borderline' | 'weak' =
@@ -1725,6 +1837,7 @@ export function solveAssembly(opts: AsmSolveOptions): AsmResult {
     ok: true, panels: panelResults, maxDisp, maxPanelId, maxAt, spanMm: span, verdict,
     maxVm, maxVmPanelId, maxVmAt, utilPct, stressVerdict,
     totalDof: nDof, totalNodes, iterations, converged,
+    backend, factorMs, solveMs,
     groundedNodes: grounded.length, resolutionLog, groundPoints,
   };
 }

@@ -17,3 +17,8 @@ __pycache__/
 .idea
 .vscode/*
 !.vscode/extensions.json
+
+# Eigen source — fetched by app/native/fetch-eigen.ps1, never committed.
+# Only the fetch script + version pin (README) live in git; the built
+# app/src/wasm/eigen-solver.{js,wasm} artifacts ARE committed.
+app/native/eigen/

@@ -172,12 +172,45 @@ def main() -> int:
             page.screenshot(path=str(OUT / "analysis_configured.png"), full_page=True)
 
             # --- Solve assembly. ---
+            # Install a MutationObserver on the Solve button BEFORE clicking so
+            # we capture the staged progress labels (Meshing → Assembling →
+            # Factorizing/Solving → Recovering → Rendering) even though the
+            # solve is fast. window.__asmStages collects each distinct label.
+            page.evaluate(
+                """() => {
+                    window.__asmStages = [];
+                    const btn = document.getElementById('asmSolveBtn');
+                    const obs = new MutationObserver(() => {
+                        const lbl = btn.querySelector('.asm-solve-stage');
+                        if (lbl) {
+                            const t = lbl.textContent || '';
+                            const arr = window.__asmStages;
+                            if (t && (arr.length === 0 || arr[arr.length - 1] !== t)) arr.push(t);
+                        }
+                    });
+                    obs.observe(btn, { childList: true, subtree: true, characterData: true });
+                    window.__asmStageObs = obs;
+                }"""
+            )
             page.click("#asmSolveBtn")
             page.wait_for_function(
                 "() => { const el = document.getElementById('asmResult'); "
                 "return el && /(deflection|floor|non-physical|under-constrained|nothing)/i.test(el.textContent || ''); }",
                 timeout=60_000,
             )
+            stages = page.evaluate(
+                "() => { if (window.__asmStageObs) window.__asmStageObs.disconnect(); return window.__asmStages || []; }"
+            )
+            print(f"[solve] progress stages observed = {stages}")
+            # Assert the staged pipeline feedback appeared during the solve.
+            joined = " ".join(stages).lower()
+            expect_stages = ["mesh", "assembl", "solv"]  # solving OR factorizing
+            missing = [s for s in expect_stages if s not in joined and not ("factoriz" in joined and s == "solv")]
+            if not stages:
+                problems.append("no progress stages observed on the Solve button during a solve")
+            elif missing:
+                problems.append(f"Solve progress bar missing stages {missing}; saw {stages}")
+
             result_text = page.eval_on_selector("#asmResult", "el => el.textContent")
             print(f"[solve] result = {result_text!r}")
             if "deflection" not in result_text.lower():
@@ -190,6 +223,19 @@ def main() -> int:
                 problems.append(f"assembly result line did not report a stress in MPa: {result_text!r}")
             if "util" not in result_text.lower() or "%" not in result_text:
                 problems.append(f"assembly result line did not report a utilization %: {result_text!r}")
+
+            # BACKEND: the result line must NAME the linear backend that ran —
+            # either the Eigen LDLT (wasm) direct solver or the PCG fallback.
+            if not ("eigen ldlt" in result_text.lower() or "pcg" in result_text.lower()):
+                problems.append(f"assembly result line did not name the solve backend: {result_text!r}")
+            # The console log line must also name the backend (for the drive).
+            backend_logged = any(
+                ("eigen ldlt" in c.lower() or "pcg" in c.lower()) and "[assembly]" in c.lower()
+                for c in console
+            )
+            print(f"[solve] backend named in console log = {backend_logged}")
+            if not backend_logged:
+                problems.append("[assembly] console log line did not name the solve backend")
 
             page.wait_for_timeout(500)
 

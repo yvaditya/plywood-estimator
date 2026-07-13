@@ -59,7 +59,9 @@ import {
   type AsmLoad,
   type AsmPanelResult,
   type JointStiffness,
+  type SolveProgress,
 } from './cae';
+import { getDirectSolver } from './solverBackend';
 
 // --------------------------------------------------------------------------
 // State
@@ -1342,8 +1344,24 @@ function presetPerShelf(kgPerShelf: number) {
   }
 }
 
-/** Run the assembly solve, paint the whole-cabinet heatmap, capture the PDF. */
-async function solveAssemblyForCabinet() {
+/** Stage labels for the Solve progress bar. The framing (deliberately) mirrors
+ *  the pipeline: preprocessing = our TS, the SOLVE = the WASM core, post =
+ *  browser/our TS. `detail` carries the real DOF count / backend / iteration. */
+const SOLVE_STAGE_LABEL: Record<SolveProgress['stage'], string> = {
+  meshing: 'Meshing panels…',
+  assembling: 'Assembling…',
+  factorizing: 'Factorizing…',
+  solving: 'Solving…',
+  recovering: 'Recovering stresses…',
+  done: 'Rendering…',
+};
+
+/** Run the assembly solve, paint the whole-cabinet heatmap, capture the PDF.
+ *  `onStage` (optional) receives staged progress for the Solve button bar. */
+async function solveAssemblyForCabinet(
+  onStage?: (label: string, pct: number) => void | Promise<void>,
+) {
+  const stage = onStage ?? (() => {});
   ensureAsmCabinet();
   const panels = cabinetPanels();
   if (panels.length < 1) {
@@ -1378,8 +1396,47 @@ async function solveAssemblyForCabinet() {
     return;
   }
 
-  const res = solveAssembly({ panels: asmPanels, joints, loads, tolMm: state.asm.tolMm });
-  console.log('[assembly]', res.resolutionLog, '→', res.ok ? `${res.iterations} it` : res.message);
+  // Load the sparse-direct WASM backend (Eigen LDLT) once. null → PCG fallback.
+  await stage('Loading solver…', 3);
+  await yieldFrame();
+  const backend = await getDirectSolver();
+
+  // Buffer the latest progress stage from the (synchronous) solve so the button
+  // bar can be painted around it. Because solveAssembly runs synchronously, we
+  // paint the pre-solve stages with real yields BEFORE the heavy call, let the
+  // solve emit its own stage sequence (captured here), then paint the last
+  // stage + recovering/rendering with yields AFTER. Fast systems still show the
+  // full staged sequence.
+  let sawSolving = false;
+  const onProgress = (p: SolveProgress) => {
+    if (p.stage === 'solving' || p.stage === 'factorizing') sawSolving = true;
+  };
+
+  // Pre-solve stages (these paint because we yield between them).
+  await stage(SOLVE_STAGE_LABEL.meshing, 10);
+  await yieldFrame();
+  await stage(SOLVE_STAGE_LABEL.assembling, 25);
+  await yieldFrame();
+  await stage(
+    backend ? SOLVE_STAGE_LABEL.factorizing : SOLVE_STAGE_LABEL.solving,
+    backend ? 55 : 60,
+  );
+  await yieldFrame();
+
+  const res = solveAssembly({
+    panels: asmPanels, joints, loads, tolMm: state.asm.tolMm,
+    backend, onProgress,
+  });
+  void sawSolving;
+  console.log(
+    '[assembly]', res.resolutionLog, '→',
+    res.ok
+      ? `${res.backend} · ${res.iterations} it · factor ${res.factorMs.toFixed(1)}ms · solve ${res.solveMs.toFixed(1)}ms`
+      : res.message,
+  );
+
+  await stage(SOLVE_STAGE_LABEL.recovering, 92);
+  await yieldFrame();
 
   if (!res.ok) {
     viewer.clearAssemblyOverlay();
@@ -1404,23 +1461,29 @@ async function solveAssemblyForCabinet() {
   const vmLabel = vmBody ? panelLabel(vmBody) : '?';
   state.asm.solveMsg = assemblyResultLine(res, maxLabel, vmLabel);
 
+  await stage(SOLVE_STAGE_LABEL.done, 98);
   await captureAssemblyAnalysis(res, panels, maxLabel, vmLabel);
   renderAnalysisSection();
 }
 
-/** Combined deflection + stress result line, verdict = worst of the two. */
+/** Combined deflection + stress result line, verdict = worst of the two. Also
+ *  names the linear backend + its timing so the user sees whether the fast
+ *  Eigen LDLT (wasm) core ran or the PCG fallback did. */
 function assemblyResultLine(
   res: ReturnType<typeof solveAssembly>, maxLabel: string, vmLabel: string,
 ): string {
   const rank: Record<string, number> = { ok: 0, borderline: 1, weak: 2 };
   const worst = rank[res.verdict] >= rank[res.stressVerdict] ? res.verdict : res.stressVerdict;
   const limit = res.spanMm / 200;
+  const timing = res.backend === 'Eigen LDLT (wasm)'
+    ? `${res.backend}: factor ${res.factorMs.toFixed(0)} ms + solve ${res.solveMs.toFixed(0)} ms`
+    : `${res.backend}: ${res.iterations} iters, ${res.solveMs.toFixed(0)} ms`;
   return (
     `Max deflection ${fmtSag(res.maxDisp, state.units)} on ${maxLabel} ` +
     `(vs span/200 ${fmtSag(limit, state.units)}). ` +
     `Max stress ${res.maxVm.toFixed(res.maxVm < 10 ? 1 : 0)} MPa on ${vmLabel} ` +
     `(util ${Math.round(res.utilPct)}%). ` +
-    `${worst.toUpperCase()}`
+    `${worst.toUpperCase()} · ${timing}`
   );
 }
 
@@ -1756,15 +1819,26 @@ asmPresetClear.addEventListener('click', () => {
 });
 asmSolveBtn.addEventListener('click', async () => {
   asmSolveBtn.disabled = true;
-  asmSolveBtn.textContent = 'Solving…';
-  await yieldFrame();
+  // Progress bar inside the button, matching the PDF export pattern. Each stage
+  // yields a frame so the bar actually paints between the (fast) heavy phases.
+  const originalLabel = asmSolveBtn.innerHTML;
+  asmSolveBtn.classList.add('busy');
+  const setStage = async (label: string, pct: number) => {
+    asmSolveBtn.innerHTML =
+      `<span class="progress-bar"><span class="progress-fill" style="width:${pct.toFixed(0)}%"></span></span>` +
+      `<span class="progress-label asm-solve-stage">${escapeHtml(label)}</span>`;
+    await yieldFrame();
+  };
+  await setStage('Starting…', 2);
   try {
-    await solveAssemblyForCabinet();
+    await solveAssemblyForCabinet(setStage);
   } catch (err) {
     console.error('assembly solve failed', err);
     state.asm.solveMsg = 'Solve failed — see console.';
     renderAnalysisSection();
   }
+  asmSolveBtn.classList.remove('busy');
+  asmSolveBtn.innerHTML = originalLabel;
   asmSolveBtn.textContent = 'Solve assembly';
   asmSolveBtn.disabled = false;
 });
