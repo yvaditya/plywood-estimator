@@ -635,7 +635,7 @@ function thinStripsTop(placements: PackPlacement[], inflated: Rect[], binH: numb
   }
 }
 
-function deriveGuillotineCuts(rects: Rect[], binW: number, binH: number): Cut[] {
+export function deriveGuillotineCuts(rects: Rect[], binW: number, binH: number): Cut[] {
   const EPS = 0.5; // mm — tolerant of STEP-tessellation float noise on edges
   // A clean tree needs < 2·N cuts; cap well above that so a pathological
   // input can never spin (every cut is expected to make progress anyway).

@@ -75,6 +75,16 @@ export interface SheetOverrides {
    *  in their engine order and are not listed here. */
   order?: string[];
   perCut?: Record<string, PerCutOverride>;
+  /** A hand-built FULL layout sequence (trims excluded), used when the user
+   *  drew cuts on the diagram that the engine's auto tree doesn't contain —
+   *  so the `order` cutKey re-ordering can't express it. When present this
+   *  REPLACES the engine's layout tail wholesale: the trims are still emitted
+   *  first (engine order), then these steps in the order given. Each step
+   *  carries its own parent rect (in the sheet frame) so every downstream
+   *  renderer — the PDF cut cards especially — works with no extra plumbing.
+   *  `order`/`perCut` are ignored when `customSteps` is set (the steps already
+   *  carry their fromFar/isDatum flags baked in). */
+  customSteps?: CutStep[];
 }
 
 /**
@@ -311,6 +321,24 @@ export function cutStepsForSheet(
     all.forEach((s, i) => { s.index = i + 1; });
     return all;
   };
+
+  // Custom-sequence path: the user hand-drew a full layout sequence in the
+  // editor that the engine's auto tree can't express as a re-ordering. Emit
+  // the trims (engine order) then the saved custom steps verbatim. Each step
+  // already carries its parent rect + fromFar/isDatum, so nothing else here
+  // has to interpret them — just renumber + re-flag same-setting runs.
+  if (overrides?.customSteps && overrides.customSteps.length > 0) {
+    const custom = overrides.customSteps.map((s) => ({ ...s, isTrim: false }));
+    const all = [...trimSteps, ...custom];
+    for (const s of all) { if (s.isTrim) s.isDatum = true; }
+    all.forEach((s, i) => { s.index = i + 1; });
+    return {
+      sheetIndex, globalIndex: sheet.globalIndex || sheetIndex, groupIndex,
+      thickness: sheet.thickness, sheetW: W, sheetL: L,
+      steps: markSameSetting(all),
+      isGuillotineTree: true,
+    };
+  }
 
   // Cut-tree path: a recorded tree exists (shelf packer, or recovered from a
   // MaxRects layout) — translate each Cut → CutStep within its sub-piece.

@@ -44,16 +44,24 @@ export interface SessionStartEvent {
 }
 
 export interface ActionEvent {
-  type: 'reorder' | 'flip_edge' | 'mark_datum';
+  type: 'reorder' | 'flip_edge' | 'mark_datum' | 'manual_cut' | 'undo' | 'auto_complete';
   t: number;
-  /** Stable cut key + a human-readable summary of the affected cut. */
-  cut: string;
-  summary: string;
+  /** Stable cut key + a human-readable summary of the affected cut.
+   *  (`manual_cut`/`undo` carry these; `auto_complete` may omit them.) */
+  cut?: string;
+  summary?: string;
   /** For reorder: source / destination positions in the layout tail. */
   from?: number;
   to?: number;
-  /** For flip_edge / mark_datum: the new boolean value. */
+  /** For flip_edge / mark_datum / manual_cut(fromFar): the new boolean value. */
   value?: boolean;
+  /** For manual_cut: whether the cut was quoted from a manually-armed FAR
+   *  reference edge. */
+  armedFar?: boolean;
+  /** For auto_complete: how many cuts the engine order appended. */
+  added?: number;
+  /** Piece-breakdown state after the action (live pieces + finished count). */
+  piece?: { pieces: number; finished: number };
   /** Cut keys in order AFTER the action (layout tail, trims excluded). */
   sequenceAfter: string[];
   metricsAfter: SequenceMetrics;

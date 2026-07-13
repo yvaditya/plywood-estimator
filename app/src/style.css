@@ -1637,6 +1637,33 @@ input[type="checkbox"]:focus-visible { box-shadow: 0 0 0 2px var(--accent-ring);
 .cut-btn:disabled { opacity: 0.3; cursor: default; }
 .cut-btn.on { color: #fff; background: #2B6CB0; border-color: #2B6CB0; }
 
+/* Direct-cutting editor: hint line + candidate lines + completion summary. */
+.cut-hint {
+  font-size: 11.5px;
+  line-height: 1.5;
+  color: var(--muted);
+  padding: 8px 10px 12px;
+}
+.cut-candidate { transition: stroke-width 0.08s ease; }
+.cut-candidate:hover { stroke: #E03E3E; }
+.cut-summary {
+  margin: 12px 8px 4px;
+  padding: 10px 12px;
+  border-top: 1px solid var(--line);
+}
+.cut-summary-title {
+  font-size: 12.5px;
+  font-weight: 700;
+  color: var(--good, #2F855A);
+  margin-bottom: 4px;
+}
+.cut-summary-row {
+  font-size: 11.5px;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+  line-height: 1.6;
+}
+
 @media (max-width: 720px) {
   .cut-editor-body { grid-template-columns: 1fr; grid-template-rows: 40% 60%; }
   .cut-editor-diagram { border-right: 0; border-bottom: 1px solid var(--line); }
