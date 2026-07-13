@@ -52,20 +52,12 @@
           <div id="loadStatus" class="status"></div>
         </section>
 
-        <section class="panel">
-          <h2><span class="panel-dot" aria-hidden="true"></span>Sheet</h2>
+        <section class="panel panel--group" data-group="stock">
+          <h2><span class="panel-dot" aria-hidden="true"></span>Stock</h2>
           <div class="grid2">
             <label>Width <input id="sheetW" type="number" value="48" step="0.25" /></label>
             <label>Length <input id="sheetL" type="number" value="96" step="0.25" /></label>
-            <label>Edge margin <input id="margin" type="number" value="0.25" step="0.0625" /></label>
-            <label>Kerf / spacing <input id="kerf" type="number" value="0.125" step="0.0156" /></label>
-            <label>Units
-              <select id="units">
-                <option value="in" selected>inches</option>
-                <option value="mm">mm</option>
-              </select>
-            </label>
-            <label>Preset
+            <label style="grid-column: 1 / -1">Preset
               <select id="preset">
                 <option value="">— preset —</option>
                 <optgroup label="Standard">
@@ -81,6 +73,29 @@
               <button type="button" id="savePresetBtn" class="ghost">+ Save current size</button>
               <button type="button" id="deletePresetBtn" class="ghost" disabled>Delete preset</button>
             </div>
+            <label>Units
+              <select id="units">
+                <option value="in" selected>inches</option>
+                <option value="mm">mm</option>
+              </select>
+            </label>
+            <label>Edge margin <input id="margin" type="number" value="0.25" step="0.0625" /></label>
+            <label style="grid-column: 1 / -1">Kerf / spacing <input id="kerf" type="number" value="0.125" step="0.0156" /></label>
+          </div>
+        </section>
+
+        <section class="panel panel--group" data-group="cutting">
+          <h2><span class="panel-dot" aria-hidden="true"></span>Cutting</h2>
+          <div class="grid2">
+            <label style="grid-column: 1 / -1">Cut strategy
+              <select id="cutStrategy">
+                <option value="free">Max yield (any cuts)</option>
+                <option value="guillotine" selected>Min cuts (track saw / panel saw)</option>
+                <option value="guillotine-exact">Min cuts+ (exhaustive search, slower)</option>
+                <option value="save-last">Max yield, save last sheet</option>
+                <option value="cnc">CNC nest (any angle · router / waterjet)</option>
+              </select>
+            </label>
             <label>Optimize tries
               <select id="restarts">
                 <option value="1">1 (fastest)</option>
@@ -94,16 +109,7 @@
                 <option value="1024">1024 (slowest)</option>
               </select>
             </label>
-            <label style="grid-column: 1 / -1">Cut strategy
-              <select id="cutStrategy">
-                <option value="free">Max yield (any cuts)</option>
-                <option value="guillotine" selected>Min cuts (track saw / panel saw)</option>
-                <option value="guillotine-exact">Min cuts+ (exhaustive search, slower)</option>
-                <option value="save-last">Max yield, save last sheet</option>
-                <option value="cnc">CNC nest (any angle · router / waterjet)</option>
-              </select>
-            </label>
-            <label style="grid-column: 1 / -1">Thickness override
+            <label>Thickness override
               <select id="thicknessOverride">
                 <option value="" selected>Off (use measured)</option>
                 <option value="snap">Snap to nearest standard</option>
@@ -113,6 +119,10 @@
                 <option value="25.4">1″ (4/4) · 25.4 mm</option>
               </select>
             </label>
+            <label class="check-row" style="grid-column: 1 / -1" title="Quote each cut as the flip-stop setting: from the registered edge to the near side of the kerf">
+              <input type="checkbox" id="parallelGuide" checked />
+              <span>Parallel guide dims (measure to cut edge)</span>
+            </label>
             <label id="splitOversizeRow" class="check-row" style="grid-column: 1 / -1" hidden>
               <input type="checkbox" id="splitOversize" />
               <span>Auto-split oversize parts (dovetail joints)</span>
@@ -120,9 +130,9 @@
           </div>
         </section>
 
-        <section class="panel">
+        <section class="panel panel--group" data-group="parts">
           <div class="row-between">
-            <h2><span class="panel-dot" aria-hidden="true"></span>Bodies <span id="bodyCount" class="count-pill">0</span></h2>
+            <h2><span class="panel-dot" aria-hidden="true"></span>Parts <span id="bodyCount" class="count-pill">0</span></h2>
             <div class="row-gap">
               <button id="selectAllBtn" class="ghost">All</button>
               <button id="selectNoneBtn" class="ghost">None</button>
@@ -143,8 +153,8 @@
           </div>
         </section>
 
-        <section class="panel">
-          <h2><span class="panel-dot" aria-hidden="true"></span>Job</h2>
+        <section class="panel panel--group" data-group="job">
+          <h2><span class="panel-dot" aria-hidden="true"></span>Job &amp; export</h2>
           <div class="grid2">
             <label style="grid-column: 1 / -1">Name <input id="jobName" type="text" placeholder="Kitchen — dishwasher base" /></label>
             <label>Currency
@@ -155,10 +165,6 @@
                 <option value="GBP">GBP</option>
                 <option value="AUD">AUD</option>
               </select>
-            </label>
-            <label class="check-row" style="grid-column: 1 / -1" title="Quote each cut as the flip-stop setting: from the registered edge to the near side of the kerf">
-              <input type="checkbox" id="parallelGuide" checked />
-              <span>Parallel guide dims (measure to cut edge)</span>
             </label>
             <label>PDF paper
               <select id="pdfPaper">
@@ -175,7 +181,7 @@
           </div>
         </section>
 
-        <section class="panel" id="shoppingPanel">
+        <section class="panel panel--group" id="shoppingPanel" data-group="shopping">
           <div class="row-between">
             <h2><span class="panel-dot" aria-hidden="true"></span>Shopping list <span id="shopCount" class="count-pill">0</span></h2>
             <div class="row-gap">
