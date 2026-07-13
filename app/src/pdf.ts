@@ -12,7 +12,7 @@
 import { jsPDF } from 'jspdf';
 import type { NestResult, NestSheet, PlacedPart } from './nest';
 import { fmtDim, fmtArea, type Units } from './units';
-import { assignPartLabels, allCutSteps, groupPanelsBySize, groupAllPanelsBySize, type PartLabel, type PanelSizeRow } from './instructions';
+import { assignPartLabels, allCutSteps, groupPanelsBySize, groupAllPanelsBySize, type PartLabel, type PanelSizeRow, type SheetOverrides, type KerfRef } from './instructions';
 
 export type PdfPaper =
   | 'widescreen-16-9'
@@ -30,10 +30,18 @@ export interface PdfOptions {
   margin: number;       // mm
   kerf: number;         // mm
   units: Units;
-  /** Parallel-guide mode: quote each cut as the KEEPER dimension — the
-   *  number dialed on the flip stops, measured from the registered edge to
-   *  the near side of the kerf (distance − kerf). Off = kerf-centre line. */
-  parallelGuide?: boolean;
+  /** Kerf-reference mode — how each layout cut's dimension is quoted:
+   *   - 'keeper'  (default): the KEEPER width = the flip-stop number =
+   *     finished part dim (distance − kerf, measured to the near side of the
+   *     kerf on the parallel guide's registered edge).
+   *   - 'center': the raw kerf-centre distance (no blade compensation).
+   *   - 'spacing': spacing only = distance − kerf/2, and the far reference
+   *     trim lands exactly at the last part's edge (see cutStepsForSheet). */
+  kerfRef?: KerfRef;
+  /** Manual cut-sequence overrides keyed by each sheet's `layoutSignature`.
+   *  Threaded into every allCutSteps call so the exported sequence, measured
+   *  edges and datum colors match what the user arranged in the editor. */
+  overridesBySig?: Record<string, SheetOverrides>;
   inventoryCheck?: InventoryCheck[];
   jobName?: string;
   paper?: PdfPaper;
@@ -729,7 +737,7 @@ function buildMobilePdf(result: NestResult, opt: PdfOptions): jsPDF {
       addPage(section);
       drawMobileSheetPage(doc, sheet, opt, dims);
       if (!opt.cnc) {
-        const sc = (allCutSteps({ groups: [{ thickness: sheet.thickness, sheets: [sheet], unplaced: [] }] } as any, opt.margin, opt.kerf))[0];
+        const sc = (allCutSteps({ groups: [{ thickness: sheet.thickness, sheets: [sheet], unplaced: [] }] } as any, opt.margin, opt.kerf, opt.overridesBySig, opt.kerfRef))[0];
         if (sc) {
           for (let i = 0; i < sc.steps.length; i++) {
             addPage(section);
@@ -1750,7 +1758,7 @@ function drawCutsForSingleSheet(
   const PAGE_H = dims.h;
   // Generate a SheetCuts wrapper (cutStepsForSheet handles guillotine vs
   // fallback). We need the same shape drawCutCard expects.
-  const sc = (allCutSteps({ groups: [{ thickness: sheet.thickness, sheets: [sheet], unplaced: [] }] } as any, opt.margin, opt.kerf))[0];
+  const sc = (allCutSteps({ groups: [{ thickness: sheet.thickness, sheets: [sheet], unplaced: [] }] } as any, opt.margin, opt.kerf, opt.overridesBySig, opt.kerfRef))[0];
   if (!sc || sc.steps.length === 0) return;
 
   // Start a new page for the cut cards — keeps the sheet layout page clean.
@@ -2377,12 +2385,16 @@ function drawCutCard(
   } else {
     label = cur.axis === 'rip' ? 'Rip' : 'Crosscut';
     // Distances run from the parent's datum corner (top-left): vertical
-    // lines measure from the LEFT edge, horizontal lines from the TOP.
+    // lines measure from the LEFT edge, horizontal lines from the TOP —
+    // unless flipped to the FAR edge (R for vertical, B for horizontal).
     const vertical = (sc.sheetL >= sc.sheetW) ? cur.axis === 'rip' : cur.axis === 'cross';
-    edgeRef = vertical ? 'from L edge' : 'from T edge';
+    edgeRef = vertical
+      ? (cur.fromFar ? 'from R edge' : 'from L edge')
+      : (cur.fromFar ? 'from B edge' : 'from T edge');
   }
+  const refChip = cur.isDatum && !cur.isTrim ? '  ·  REF' : '';
   const settingNote = cur.sameSetting ? '  ·  same setting' : '';
-  doc.text(`${label}  ${fmtDim(quotedDistance(cur, sc, opt), opt.units)}  ${edgeRef}${settingNote}`, x, y + 20);
+  doc.text(`${label}  ${fmtDim(quotedDistance(cur, sc, opt), opt.units)}  ${edgeRef}${refChip}${settingNote}`, x, y + 20);
   doc.setTextColor(0);
 
   drawCutDiagram(doc, sc, parts, cutIdx, x, y + 24, cardW, diagH, opt);
@@ -2393,12 +2405,15 @@ function drawCutCard(
  *   - Trim cuts: always the margin width (a far-long-edge trim's raw
  *     distance is nearly the whole span — the meaningful number is the
  *     sliver coming off).
- *   - Layout cuts in parallel-guide mode: the KEEPER dimension = what the
- *     flip stops are set to (raw distance minus the kerf allowance).
- *   - Otherwise: the raw kerf-centre distance.
+ *   - Layout cuts: the kerf allowance follows the kerf-reference mode
+ *       'keeper'  → distance − kerf  (keeper width / flip-stop number)
+ *       'center'  → distance          (kerf-centre, no blade comp)
+ *       'spacing' → distance − kerf/2 (spacing only)
+ *   - `fromFar`: the dimension is quoted from the FAR parallel edge, so the
+ *     value is parentSpan − distance − kerfAllowance.
  */
 function quotedDistance(
-  cur: { isTrim?: boolean; distance: number; axis: 'rip' | 'cross'; parentW: number; parentH: number },
+  cur: { isTrim?: boolean; distance: number; axis: 'rip' | 'cross'; parentW: number; parentH: number; fromFar?: boolean },
   sc: { sheetW: number; sheetL: number },
   opt: PdfOptions,
 ): number {
@@ -2406,7 +2421,10 @@ function quotedDistance(
   const vertical = lengthIsY ? cur.axis === 'rip' : cur.axis === 'cross';
   const span = vertical ? cur.parentW : cur.parentH;
   if (cur.isTrim) return Math.min(cur.distance, span - cur.distance);
-  return opt.parallelGuide ? Math.max(0, cur.distance - opt.kerf) : cur.distance;
+  const mode = opt.kerfRef ?? 'keeper';
+  const allowance = mode === 'keeper' ? opt.kerf : mode === 'spacing' ? opt.kerf / 2 : 0;
+  const base = cur.fromFar ? span - cur.distance : cur.distance;
+  return Math.max(0, base - allowance);
 }
 
 /**
@@ -2494,12 +2512,13 @@ function drawCutDiagram(
     }
   }
 
-  // Prior cuts as thin white lines (trim/reference cuts drawn separately in
-  // color after the fade overlay, so the datum edges stay visible).
+  // Prior cuts as thin white lines. Trim AND datum (reference) cuts are
+  // drawn separately in BLUE after the fade overlay, so the datum edges stay
+  // visible — skip them here.
   doc.setLineWidth(0.4);
   doc.setDrawColor(255, 255, 255);
   for (let i = 0; i < cutIdx; i++) {
-    if (sc.steps[i].isTrim) continue;
+    if (sc.steps[i].isTrim || sc.steps[i].isDatum) continue;
     drawCutLineInParent(doc, sc.steps[i], sc.sheetW, sc.sheetL, orient, ox, oy, scale);
   }
 
@@ -2523,12 +2542,12 @@ function drawCutDiagram(
   if (pX + pW < ox + dW - 0.5) doc.rect(pX + pW, pY, (ox + dW) - (pX + pW), pH, 'F');
   if (GS) (doc as any).setGState(new GS({ opacity: 1 }));
 
-  // Reference edges (made by the trim cuts) in BLUE, on top of the fade so
-  // the datum — top-left corner — is always identifiable at the saw.
+  // Reference edges — trim cuts AND user-marked datum cuts — in BLUE, on top
+  // of the fade so the datums are always identifiable at the saw.
   doc.setLineWidth(0.7);
   doc.setDrawColor(43, 108, 176);
   for (let i = 0; i < cutIdx; i++) {
-    if (!sc.steps[i].isTrim) continue;
+    if (!sc.steps[i].isTrim && !sc.steps[i].isDatum) continue;
     drawCutLineInParent(doc, sc.steps[i], sc.sheetW, sc.sheetL, orient, ox, oy, scale);
   }
 
@@ -2543,13 +2562,19 @@ function drawCutDiagram(
   drawCutLineInParent(doc, cur, sc.sheetW, sc.sheetL, orient, ox, oy, scale, true);
 
   // The edge the distance is MEASURED FROM, in green — mirrors the caption
-  // ("from the LEFT/TOP edge"): left edge for vertical cuts, top for
-  // horizontal. This is where the parallel-guide stops register.
+  // ("from L/T" near edge, or "from R/B" far edge when fromFar). Left/top for
+  // vertical/horizontal cuts by default; the opposite edge when flipped. This
+  // is where the parallel-guide stops register.
   const measVertical = (sc.sheetL >= sc.sheetW) ? cur.axis === 'rip' : cur.axis === 'cross';
   doc.setDrawColor(47, 133, 90);
   doc.setLineWidth(1.6);
-  if (measVertical) doc.line(pX, pY, pX, pY + pH);
-  else doc.line(pX, pY, pX + pW, pY);
+  if (measVertical) {
+    const gx = cur.fromFar ? pX + pW : pX;
+    doc.line(gx, pY, gx, pY + pH);
+  } else {
+    const gy = cur.fromFar ? pY + pH : pY;
+    doc.line(pX, gy, pX + pW, gy);
+  }
 }
 
 /**
