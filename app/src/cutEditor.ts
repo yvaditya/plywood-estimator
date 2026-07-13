@@ -1135,16 +1135,27 @@ function buildRegionSvg(region: Region, interactive: boolean): SVGSVGElement {
       'data-cand': candKey(c),
     });
     (line as SVGElement).style.cursor = 'pointer';
-    line.addEventListener('mouseenter', () => { hovered = c; renderStack(); });
+    // Only re-render when the hover actually CHANGES — an unconditional
+    // renderStack() here replaces the node under the cursor, which re-fires
+    // mouseenter in a loop and destroys the click target between mousedown
+    // and mouseup (real clicks never land; synthetic dispatch hid this).
+    const hoverTo = () => {
+      if (!hovered || !candEq(hovered, c)) { hovered = c; renderStack(); }
+    };
+    line.addEventListener('mouseenter', hoverTo);
     line.addEventListener('mouseleave', () => { if (hovered && candEq(hovered, c)) { hovered = null; renderStack(); } });
     line.addEventListener('click', (e) => { e.stopPropagation(); openCutPopup(e as MouseEvent, c); });
     const hit = el('line', {
       ...candLineCoords(c),
       stroke: 'transparent', 'stroke-width': 22,
+      // A transparent stroke is invisible to the default 'visiblePainted'
+      // hit-testing — events must be taken on the stroke geometry itself.
+      'pointer-events': 'stroke',
       class: 'cut-candidate-hit', 'data-cand': candKey(c),
     });
     (hit as SVGElement).style.cursor = 'pointer';
-    hit.addEventListener('mouseenter', () => { hovered = c; renderStack(); });
+    hit.addEventListener('mouseenter', hoverTo);
+    hit.addEventListener('mouseleave', () => { if (hovered && candEq(hovered, c)) { hovered = null; renderStack(); } });
     hit.addEventListener('click', (e) => { e.stopPropagation(); openCutPopup(e as MouseEvent, c); });
     svg.appendChild(hit);
     svg.appendChild(line);
