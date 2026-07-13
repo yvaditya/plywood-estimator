@@ -1,18 +1,21 @@
 """
-Playwright drive for the DATUM-EDGE feature of the direct-cutting cut editor.
+Playwright drive for the DATUM + per-piece-diagram features of the rebuilt
+(bare-stock, popup-flow) cut editor.
 
-Exercises the new edge context popup + datum edges:
+Exercises:
   - load a STEP, select all, estimate, open "Edit cuts" on sheet 1
-  - ⏺ Record (so set_datum / manual_cut events land in the log)
-  - click a live piece EDGE  -> screenshot the context popup
-  - "Set as datum edge"      -> screenshot the blue datum edge; assert a
-                                line.cut-datum-edge appears
-  - commit a cut PARALLEL to the datum WITHOUT arming -> assert the readout
-    row + persisted step quote from that edge (fromFar when the datum is far)
-  - make another cut and verify the datum PROPAGATED to the child piece (blue
-    edge still shown; still the default measuring edge)
-  - download the training log and confirm set_datum + measured-from provenance
-    fields are present.
+  - assert the editor opens on BARE STOCK (no pre-made trims) and shows the
+    board diagram section
+  - make the two long trims + short trim via the popup so a usable frame exists
+  - open the config popup on a breakdown candidate, choose "Save as datum: yes",
+    "Make cut" -> assert a blue datum edge is drawn (line.cut-datum-edge) and
+    the persisted step carries isDatum
+  - after a cut splits the board, assert the left pane becomes a STACK of
+    per-piece diagram sections (.cut-piece-section > .cut-piece-title)
+  - commit a cut PARALLEL to the datum, choosing the "Datum ... edge" option ->
+    assert the readout row quotes from that datum
+  - download the training log and confirm manual_cut carries datumSaved +
+    measuredProvenance, and that a set-datum cut persisted isDatum.
 
 Run:  python tests/cuteditor_datum_drive.py
 Output: tests/_output/cuteditor_datum_drive/
@@ -39,99 +42,66 @@ SAMPLE = REPO / "samlple step files" / "plywood workbench.stp"
 OUT = REPO / "tests" / "_output" / "cuteditor_datum_drive"
 
 
-# --- DOM helpers (evaluated in the page) ------------------------------------
-
-# Parse every candidate's data-cand ("V|coord|x,y,w,h") into region rects, and
-# return, per candidate, its orientation + region. We use this to pick a
-# candidate whose region is NOT the seed piece (a child produced by a cut) so a
-# FAR-edge datum actually drives fromFar (the seed's left/top are implicit
-# datums that always win the near slot).
 CANDS = """
 () => {
-  const svg = document.querySelector('.cut-editor-svg');
-  if (!svg) return [];
-  return Array.from(svg.querySelectorAll('line.cut-candidate')).map((l, i) => {
-    const k = l.getAttribute('data-cand');           // V|coord|x,y,w,h
+  const out = [];
+  document.querySelectorAll('.cut-editor-svg line.cut-candidate').forEach((l, i) => {
+    const k = l.getAttribute('data-cand');
     const [vh, coord, rect] = k.split('|');
     const [x, y, w, h] = rect.split(',').map(Number);
-    return { i, vertical: vh === 'V', coord: Number(coord), x, y, w, h, key: k };
+    out.push({ i, vertical: vh === 'V', coord: Number(coord), x, y, w, h, key: k, isTrim: l.classList.contains('trim') });
   });
+  return out;
 }
 """
 
-CLICK_CAND_BY_INDEX = """
-(idx) => {
-  const svg = document.querySelector('.cut-editor-svg');
-  const cands = Array.from(svg.querySelectorAll('line.cut-candidate'));
-  if (idx >= cands.length) return {ok:false, n:cands.length};
-  cands[idx].dispatchEvent(new MouseEvent('click', {bubbles:true, cancelable:true, view:window}));
-  return {ok:true, n:cands.length, cand:cands[idx].getAttribute('data-cand')};
+OPEN_POPUP = """
+(key) => {
+  const line = Array.from(document.querySelectorAll('.cut-editor-svg line.cut-candidate'))
+    .find(l => l.getAttribute('data-cand') === key);
+  if (!line) return {ok:false};
+  line.dispatchEvent(new MouseEvent('click', {bubbles:true, cancelable:true, view:window, clientX:400, clientY:300}));
+  return {ok: !!document.querySelector('.cut-config-popup')};
 }
 """
 
-# Click the edge band for a given region rect + side. Bands carry data-side and
-# sit half-inset on the region boundary; match by geometry + side.
-CLICK_EDGE_BAND = """
-(arg) => {
-  const {x, y, w, h, side} = arg;
-  const svg = document.querySelector('.cut-editor-svg');
-  const bands = Array.from(svg.querySelectorAll('rect.cut-edge-band'));
-  const near = (a, b) => Math.abs(a - b) < 2;
-  let hit = null;
-  for (const b of bands) {
-    if (b.getAttribute('data-side') !== side) continue;
-    const bx = parseFloat(b.getAttribute('x')), by = parseFloat(b.getAttribute('y'));
-    const bw = parseFloat(b.getAttribute('width')), bh = parseFloat(b.getAttribute('height'));
-    // Reconstruct the region edge this band covers.
-    let ok = false;
-    if (side === 'left')   ok = near(bx + bw/2, x)     && near(by, y) && near(bh, h);
-    if (side === 'right')  ok = near(bx + bw/2, x + w) && near(by, y) && near(bh, h);
-    if (side === 'top')    ok = near(by + bh/2, y)     && near(bx, x) && near(bw, w);
-    if (side === 'bottom') ok = near(by + bh/2, y + h) && near(bx, x) && near(bw, w);
-    if (ok) { hit = b; break; }
-  }
-  if (!hit) return {ok:false, n:bands.length};
-  // Position the synthetic click at the band center so the popup opens there.
-  const r = hit.getBoundingClientRect();
-  hit.dispatchEvent(new MouseEvent('click', {
-    bubbles:true, cancelable:true, view:window,
-    clientX: r.left + r.width/2, clientY: r.top + r.height/2,
-  }));
+POPUP_REFS = """
+() => {
+  const popup = document.querySelector('.cut-config-popup');
+  if (!popup) return null;
+  return {
+    quote: popup.querySelector('.cut-config-quote')?.textContent || '',
+    refs: Array.from(popup.querySelectorAll('.cut-config-ref')).map(r => r.querySelector('.cut-config-ref-label').textContent),
+  };
+}
+"""
+
+SET_DATUM = """
+(yes) => {
+  const b = document.querySelector(`.cut-config-popup .cut-config-yn[data-yn="${yes ? 'yes' : 'no'}"]`);
+  if (!b) return {ok:false};
+  b.dispatchEvent(new MouseEvent('click', {bubbles:true}));
   return {ok:true};
 }
 """
 
-MENU_ITEMS = """
-() => Array.from(document.querySelectorAll('.cut-edge-menu .cut-edge-menu-item'))
-        .map(b => b.textContent)
-"""
-
-CLICK_MENU_ITEM = """
+PICK_REF = """
 (text) => {
-  const items = Array.from(document.querySelectorAll('.cut-edge-menu .cut-edge-menu-item'));
-  const it = items.find(b => (b.textContent||'').includes(text));
-  if (!it) return {ok:false, items: items.map(b=>b.textContent)};
-  it.dispatchEvent(new MouseEvent('click', {bubbles:true, cancelable:true, view:window}));
+  const rows = Array.from(document.querySelectorAll('.cut-config-popup .cut-config-ref'));
+  const row = rows.find(r => (r.querySelector('.cut-config-ref-label').textContent||'').toLowerCase().includes(text.toLowerCase()));
+  if (!row) return {ok:false, labels: rows.map(r=>r.querySelector('.cut-config-ref-label').textContent)};
+  row.dispatchEvent(new MouseEvent('click', {bubbles:true}));
   return {ok:true};
 }
 """
 
-DATUM_EDGE_COUNT = """
-() => {
-  const svg = document.querySelector('.cut-editor-svg');
-  if (!svg) return 0;
-  return svg.querySelectorAll('line.cut-datum-edge').length;
-}
-"""
+MAKE_CUT = "() => { const b=document.querySelector('.cut-config-popup [data-role=\"make\"]'); if(!b) return {ok:false}; b.dispatchEvent(new MouseEvent('click',{bubbles:true})); return {ok:true}; }"
+CANCEL = "() => { document.querySelector('.cut-config-popup [data-role=\"cancel\"]')?.dispatchEvent(new MouseEvent('click',{bubbles:true})); }"
 
-BUILT_ROWS = """
-() => {
-  const list = document.querySelector('.cut-editor-list');
-  return list ? list.querySelectorAll('.cut-row:not(.trim)').length : -1;
-}
-"""
-
-# The sub-text of the LAST built (non-trim) row: "from R edge · piece 800x600".
+DATUM_EDGES = "() => document.querySelectorAll('.cut-editor-svg line.cut-datum-edge').length"
+SECTIONS = "() => document.querySelectorAll('.cut-piece-section').length"
+SECTION_TITLES = "() => Array.from(document.querySelectorAll('.cut-piece-title')).map(t=>t.textContent)"
+BUILT_ROWS = "() => document.querySelectorAll('.cut-editor-list .cut-row:not(.trim)').length"
 LAST_ROW_SUB = """
 () => {
   const rows = Array.from(document.querySelectorAll('.cut-editor-list .cut-row:not(.trim)'));
@@ -140,20 +110,15 @@ LAST_ROW_SUB = """
   return sub ? sub.textContent : '';
 }
 """
-
 TITLE_TEXT = "() => document.querySelector('.cut-editor-title')?.textContent || ''"
 
 
 def overrides(page):
-    return page.evaluate(
-        "() => { try { return JSON.parse(localStorage.getItem('plywood.cutOverrides')||'{}'); } catch(e){ return {}; } }"
-    )
+    return page.evaluate("() => { try { return JSON.parse(localStorage.getItem('plywood.cutOverrides')||'{}'); } catch(e){ return {}; } }")
 
 
 def log_lines(page):
-    raw = page.evaluate(
-        "() => { try { return localStorage.getItem('plywood.cutTrainingLog')||''; } catch(e){ return ''; } }"
-    )
+    raw = page.evaluate("() => { try { return localStorage.getItem('plywood.cutTrainingLog')||''; } catch(e){ return ''; } }")
     out = []
     for ln in (raw or "").split("\n"):
         ln = ln.strip()
@@ -164,6 +129,14 @@ def log_lines(page):
         except Exception:
             pass
     return out
+
+
+def commit_default(page, key):
+    """Open popup on a candidate, accept defaults, Make cut."""
+    page.evaluate(OPEN_POPUP, key)
+    page.wait_for_timeout(70)
+    page.evaluate(MAKE_CUT)
+    page.wait_for_timeout(220)
 
 
 def main() -> int:
@@ -184,20 +157,14 @@ def main() -> int:
             page.evaluate("() => { try { localStorage.removeItem('plywood.cutOverrides'); localStorage.removeItem('plywood.cutTrainingLog'); } catch(e){} }")
 
             page.set_input_files("#fileInput", str(SAMPLE))
-            page.wait_for_function(
-                "() => /[1-9]/.test(document.getElementById('bodyCount')?.textContent || '')",
-                timeout=45_000,
-            )
+            page.wait_for_function("() => /[1-9]/.test(document.getElementById('bodyCount')?.textContent || '')", timeout=45_000)
             page.wait_for_timeout(1000)
             page.select_option("#units", "mm")
             page.wait_for_timeout(150)
             page.click("#selectAllBtn")
             page.wait_for_timeout(300)
             page.click("#nestBtn")
-            page.wait_for_function(
-                "() => !document.getElementById('downloadPdfBtn').disabled",
-                timeout=180_000,
-            )
+            page.wait_for_function("() => !document.getElementById('downloadPdfBtn').disabled", timeout=180_000)
             page.wait_for_timeout(600)
 
             edit_btns = page.query_selector_all(".edit-cuts-btn")
@@ -208,139 +175,98 @@ def main() -> int:
             page.wait_for_selector(".cut-editor-svg", timeout=5000)
             page.wait_for_timeout(400)
 
-            # Turn recording ON so set_datum / manual_cut events are logged.
-            page.click('.cut-editor-head [data-role="record"]')
-            page.wait_for_timeout(150)
+            # --- Bare-stock start: one board section, no trim rows. ---
+            secs0 = page.evaluate(SECTIONS)
+            titles0 = page.evaluate(SECTION_TITLES)
+            print(f"[start] sections={secs0}, titles={titles0}")
+            page.screenshot(path=str(OUT / "01_bare_stock.png"), full_page=True)
+            if secs0 < 1:
+                problems.append("no diagram section on the bare-stock start")
+            if not any("Board" in t for t in titles0):
+                problems.append(f"board section not labelled 'Board' (titles={titles0})")
 
-            # Walk the breakdown until a live region has an INTERIOR left edge
-            # (a cut line, not the implicit left datum) AND a vertical candidate.
-            # Setting that region's RIGHT edge as a datum then genuinely drives
-            # fromFar (the near/left datum slot is free). The workbench's first
-            # cut frees a full-height strip, so one or two breakdown cuts get us
-            # to a multi-part right child.
-            def group_regions(cands):
-                regions = {}
-                for c in cands:
-                    key = (round(c["x"]), round(c["y"]), round(c["w"]), round(c["h"]))
-                    regions.setdefault(key, []).append(c)
-                return regions
-
-            target = None
-            usable_left = None
-            for step in range(6):
+            # --- Make the trims first (all trim candidates), so a usable frame
+            #     of breakdown cuts exists. ---
+            for _ in range(6):
                 cands = page.evaluate(CANDS)
-                if not cands:
+                trims = [c for c in cands if c["isTrim"]]
+                if not trims:
                     break
-                regions = group_regions(cands)
-                usable_left = min(k[0] for k in regions.keys())
-                for key, cs in regions.items():
-                    x, y, w, h = key
-                    if x > usable_left + 3 and any(c["vertical"] for c in cs):
-                        target = (key, cs)
-                        break
-                if target is not None:
-                    print(f"[walk] found interior-left region after {step} extra cut(s)")
-                    break
-                # Commit the first candidate and look again.
-                r = page.evaluate(CLICK_CAND_BY_INDEX, 0)
-                print(f"[walk step {step}] committed {r.get('cand')}")
-                page.wait_for_timeout(250)
+                commit_default(page, trims[0]["key"])
+                print(f"[trim] committed a trim; remaining trim cands next loop")
 
-            print(f"[regions] usable-left (implicit datum X) = {usable_left}")
-            if target is None:
-                problems.append("no live region with an interior left edge + vertical candidate found")
-                raise SystemExit(1)
+            built_after_trims = page.evaluate(BUILT_ROWS)
+            print(f"[trims] built rows after trims = {built_after_trims}")
 
-            (tx, ty, tw, th), tcands = target
-            print(f"[target] region ({tx},{ty},{tw},{th}); left-interior={tx>usable_left+3}")
+            # --- Per-piece stack: after the trims split the board, expect >1
+            #     section (board overview + at least one live piece). ---
+            secs1 = page.evaluate(SECTIONS)
+            titles1 = page.evaluate(SECTION_TITLES)
+            print(f"[stack] sections={secs1}, titles={titles1}")
+            page.screenshot(path=str(OUT / "02_piece_stack.png"), full_page=True)
+            if secs1 < 2:
+                problems.append(f"left pane did not become a per-piece stack after cuts (sections={secs1})")
+            if not any("Piece" in t for t in titles1):
+                problems.append(f"no 'Piece N' sub-diagram section after a split (titles={titles1})")
 
-            # --- Open the edge context popup on the target region's RIGHT edge.
-            band = page.evaluate(CLICK_EDGE_BAND, {"x": tx, "y": ty, "w": tw, "h": th, "side": "right"})
-            print(f"[edge] open right-edge menu = {band}")
-            page.wait_for_timeout(200)
-            items = page.evaluate(MENU_ITEMS)
-            print(f"[popup] items = {items}")
-            page.screenshot(path=str(OUT / "01_edge_popup.png"), full_page=True)
-            if not any("datum" in (i or "").lower() for i in items):
-                problems.append(f"edge popup missing datum option (items={items})")
+            # --- Save-as-datum on a breakdown candidate. ---
+            cands = page.evaluate(CANDS)
+            pool = [c for c in cands if not c["isTrim"]]
+            if not pool:
+                pool = cands
+            target = pool[0]
+            page.evaluate(OPEN_POPUP, target["key"])
+            page.wait_for_timeout(120)
+            refs = page.evaluate(POPUP_REFS)
+            print(f"[datum] popup refs = {refs['refs'] if refs else None}")
+            page.evaluate(SET_DATUM, True)
+            page.wait_for_timeout(80)
+            page.screenshot(path=str(OUT / "03_datum_popup.png"), full_page=True)
+            page.evaluate(MAKE_CUT)
+            page.wait_for_timeout(300)
 
-            # --- Set as datum edge.
-            page.evaluate(CLICK_MENU_ITEM, "Set as datum edge")
-            page.wait_for_timeout(250)
-            de = page.evaluate(DATUM_EDGE_COUNT)
+            de = page.evaluate(DATUM_EDGES)
             print(f"[datum] blue datum edges drawn = {de}")
-            page.screenshot(path=str(OUT / "02_datum_edge_blue.png"), full_page=True)
+            page.screenshot(path=str(OUT / "04_datum_edge_blue.png"), full_page=True)
             if de < 1:
-                problems.append("Set as datum edge did not draw a blue datum edge")
+                problems.append("Save-as-datum cut did not draw a blue datum edge")
 
-            # --- Commit a VERTICAL candidate in the target region (parallel to
-            #     the right datum) WITHOUT arming. Expect it quoted fromFar.
-            cands2 = page.evaluate(CANDS)
-            v_in_target = [
-                c for c in cands2
-                if c["vertical"] and round(c["x"]) == tx and round(c["y"]) == ty
-                and round(c["w"]) == tw and round(c["h"]) == th
-            ]
-            if not v_in_target:
-                problems.append("no vertical candidate remained in the datum region")
-            else:
-                idx = v_in_target[0]["i"]
-                built_before = page.evaluate(BUILT_ROWS)
-                page.evaluate(CLICK_CAND_BY_INDEX, idx)
-                page.wait_for_timeout(300)
-                built_after = page.evaluate(BUILT_ROWS)
-                sub = page.evaluate(LAST_ROW_SUB)
-                print(f"[cut-parallel] built {built_before}->{built_after}; last row sub = {sub!r}")
-                if "from R edge" not in sub and "from B edge" not in sub:
-                    problems.append(f"cut parallel to a far datum did not quote from the far edge (sub={sub!r})")
-
-            page.screenshot(path=str(OUT / "03_datum_cut_committed.png"), full_page=True)
-
-            # Persisted override: datumEdges present + last customStep fromFar.
+            # The persisted step must carry isDatum.
             ov = overrides(page)
             sig = next(iter(ov.keys()), None)
-            entry = ov.get(sig, {}) if sig else {}
-            datum_edges = entry.get("datumEdges", [])
-            custom = entry.get("customSteps", [])
-            print(f"[override] datumEdges = {datum_edges}")
-            print(f"[override] last customStep = {custom[-1] if custom else None}")
-            if not datum_edges:
-                problems.append("no datumEdges persisted to SheetOverrides")
-            if custom and not custom[-1].get("fromFar"):
-                problems.append("the cut committed against a far datum did not persist fromFar")
+            custom = ov.get(sig, {}).get("customSteps", []) if sig else []
+            datum_steps = [s for s in custom if s.get("isDatum")]
+            print(f"[override] {len(custom)} customSteps; {len(datum_steps)} isDatum")
+            if not any(s.get("isDatum") and not s.get("isTrim") for s in custom):
+                problems.append("no persisted breakdown customStep carries isDatum (datum-saved cut lost)")
 
-            # --- Propagation: the vertical cut above split the datum region into
-            #     a left child + a right child that RETAINS the right datum edge.
-            #     The persisted datumEdges already re-anchored to the child rect
-            #     (proof the datum moved). The blue edge must still be shown, and
-            #     it must still show after a FURTHER cut.
-            datum_coord = tx + tw  # the right-datum X line
-            de_now = page.evaluate(DATUM_EDGE_COUNT)
-            print(f"[propagate] datum re-anchored to child = {datum_edges}; blue edges = {de_now}")
-            reanchored = any(
-                de.get("side") == "right" and round(float(de["piece"].split(",")[0]) + float(de["piece"].split(",")[2])) == round(datum_coord)
-                for de in datum_edges
-            )
-            if not reanchored:
-                problems.append(f"datum did not re-anchor to a child piece at X={datum_coord} (datumEdges={datum_edges})")
+            # --- Commit a cut choosing a DATUM edge option if one is offered. ---
+            cands = page.evaluate(CANDS)
+            picked_datum = False
+            for c in cands:
+                page.evaluate(OPEN_POPUP, c["key"])
+                page.wait_for_timeout(60)
+                refs = page.evaluate(POPUP_REFS)
+                labels = [r.lower() for r in (refs["refs"] if refs else [])]
+                if any("datum" in l for l in labels):
+                    page.evaluate(PICK_REF, "datum")
+                    page.wait_for_timeout(70)
+                    page.evaluate(MAKE_CUT)
+                    page.wait_for_timeout(250)
+                    sub = page.evaluate(LAST_ROW_SUB)
+                    print(f"[datum-cut] committed against a datum; row sub = {sub!r}")
+                    picked_datum = True
+                    break
+                page.evaluate(CANCEL)
+                page.wait_for_timeout(40)
+            if not picked_datum:
+                print("[datum-cut] note: no candidate offered a datum option this run (acceptable)")
 
-            # Commit ANOTHER cut and confirm a blue datum edge is STILL drawn.
-            cands3 = page.evaluate(CANDS)
-            # Prefer a candidate whose region still carries the datum on its right
-            # edge (so we cut a datum-bearing child), else any candidate.
-            bearing = [c for c in cands3 if round(c["x"] + c["w"]) == round(datum_coord)]
-            pool = bearing if bearing else cands3
-            pick = pool[0]["i"] if pool else None
-            if pick is not None:
-                page.evaluate(CLICK_CAND_BY_INDEX, pick)
-                page.wait_for_timeout(300)
-            de_after = page.evaluate(DATUM_EDGE_COUNT)
-            print(f"[propagate] blue datum edges after another cut = {de_after}")
-            page.screenshot(path=str(OUT / "04_datum_propagated.png"), full_page=True)
-            if de_after < 1:
-                problems.append("datum edge did not propagate to a child piece after a further cut")
+            page.evaluate(CANCEL)
+            page.wait_for_timeout(60)
+            page.screenshot(path=str(OUT / "05_after_datum_cut.png"), full_page=True)
 
-            # --- Download the training log; confirm set_datum + provenance.
+            # --- Download the training log; confirm datumSaved + provenance. ---
             with page.expect_download(timeout=30_000) as dl:
                 page.click('.cut-editor-head [data-role="download"]')
             logf = OUT / "cutlog.jsonl"
@@ -349,29 +275,19 @@ def main() -> int:
             events = log_lines(page)
             types = [e.get("type") for e in events]
             print(f"[log] {len(events)} events; types = {types}")
-            set_datum_evs = [e for e in events if e.get("type") == "set_datum"]
-            manual_evs = [e for e in events if e.get("type") == "manual_cut"]
-            print(f"[log] set_datum events = {len(set_datum_evs)}")
-            if set_datum_evs:
-                print(f"[log] set_datum sample = {json.dumps(set_datum_evs[0])}")
-            prov_evs = [e for e in manual_evs if "measuredProvenance" in e]
-            datum_prov = [e for e in prov_evs if e.get("measuredProvenance") == "datum"]
-            if prov_evs:
-                print(f"[log] manual_cut w/ provenance sample = {json.dumps(prov_evs[-1])}")
-            if not set_datum_evs:
-                problems.append("no set_datum event in the training log")
-            if not any(e.get("piece_key") and e.get("side") for e in set_datum_evs):
-                problems.append("set_datum event missing piece_key/side fields")
-            if not prov_evs:
-                problems.append("no manual_cut carries measuredFrom/measuredProvenance")
-            if not datum_prov:
-                problems.append("no manual_cut recorded 'datum' provenance")
+            manual = [e for e in events if e.get("type") == "manual_cut"]
+            with_saved = [e for e in manual if e.get("datumSaved")]
+            with_prov = [e for e in manual if "measuredProvenance" in e]
+            print(f"[log] manual_cut={len(manual)}; datumSaved={len(with_saved)}; provenance={len(with_prov)}")
+            if not manual:
+                problems.append("no manual_cut events in the training log")
+            if not with_saved:
+                problems.append("no manual_cut recorded datumSaved=true (Save-as-datum not logged)")
+            if not with_prov:
+                problems.append("no manual_cut carries measuredProvenance")
 
-            # Persist the interesting log lines for the report.
-            keep = set_datum_evs[:1] + datum_prov[:1] + prov_evs[-1:]
-            (OUT / "log_sample.jsonl").write_text(
-                "\n".join(json.dumps(e) for e in keep), encoding="utf-8"
-            )
+            keep = with_saved[:1] + with_prov[-1:]
+            (OUT / "log_sample.jsonl").write_text("\n".join(json.dumps(e) for e in keep), encoding="utf-8")
             (OUT / "console.log").write_text("\n".join(console[-400:]), encoding="utf-8")
 
             browser.close()

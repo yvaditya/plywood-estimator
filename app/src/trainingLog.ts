@@ -69,6 +69,12 @@ export interface ActionEvent {
    *  an explicit arm, an inherited datum, or the built-in default. */
   measuredFrom?: 'L' | 'R' | 'T' | 'B';
   measuredProvenance?: 'armed' | 'datum' | 'default';
+  /** For manual_cut: when the cut was CHAIN-dimensioned off a previous cut,
+   *  the cutKey of that referenced cut ("Previous cut" reference). */
+  measuredFromCut?: string;
+  /** For manual_cut: whether the user saved this cut's fresh edge as a datum
+   *  (Field 1 of the config popup). */
+  datumSaved?: boolean;
   /** For auto_complete: how many cuts the engine order appended. */
   added?: number;
   /** Piece-breakdown state after the action (live pieces + finished count). */

@@ -56,6 +56,14 @@ export interface CutStep {
    *  like trims (drawn after the fade) and chipped "REF" in the editor.
    *  Trim cuts are datum by default. */
   isDatum?: boolean;
+  /** Manual override (chain dimensioning): quote this cut from the fresh-cut
+   *  edge of a PREVIOUS parallel cut rather than a piece edge. Value = the
+   *  cutKeyFor() of the referenced cut. The quote becomes |thisLine −
+   *  thatLine| adjusted by the kerf allowance; the PDF caption reads
+   *  "from cut N" (N = the referenced cut's index in the final sequence) and
+   *  the green measured-from highlight is drawn on that CUT LINE, not an edge.
+   *  When set it takes precedence over fromFar for the quote. */
+  measureFromCut?: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -337,14 +345,17 @@ export function cutStepsForSheet(
     return all;
   };
 
-  // Custom-sequence path: the user hand-drew a full layout sequence in the
-  // editor that the engine's auto tree can't express as a re-ordering. Emit
-  // the trims (engine order) then the saved custom steps verbatim. Each step
-  // already carries its parent rect + fromFar/isDatum, so nothing else here
-  // has to interpret them — just renumber + re-flag same-setting runs.
+  // Custom-sequence path: the user hand-built the WHOLE breakdown in the
+  // editor from bare stock — the trims are no longer pre-made, so a custom
+  // sequence may CONTAIN the trim cuts itself. Emit the saved steps ONLY (no
+  // synthetic trims — that would double-emit the trims the user already made).
+  // Steps flagged isTrim by the editor (a hand-made cut sitting on a trim
+  // line) keep that flag so they render blue and quote the strip width. Each
+  // step already carries its parent rect + fromFar/isDatum/measureFromCut, so
+  // nothing else here has to interpret them — just renumber + flag same-setting
+  // runs. Datum-saved cuts (isDatum) render blue like trims.
   if (overrides?.customSteps && overrides.customSteps.length > 0) {
-    const custom = overrides.customSteps.map((s) => ({ ...s, isTrim: false }));
-    const all = [...trimSteps, ...custom];
+    const all = overrides.customSteps.map((s) => ({ ...s }));
     for (const s of all) { if (s.isTrim) s.isDatum = true; }
     all.forEach((s, i) => { s.index = i + 1; });
     return {

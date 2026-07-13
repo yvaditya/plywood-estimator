@@ -1,52 +1,45 @@
 /**
- * Manual cut-sequence editor — a modal popup where the user builds a sheet's
- * cut sequence by DIRECTLY CUTTING on the diagram, rather than reordering a
- * list. The user's mental model: "I click on the edge and the reference edge
- * where it's measured, and that becomes the cut."
+ * Manual cut-sequence editor — a modal popup where the user hand-builds a
+ * sheet's ENTIRE breakdown from BARE STOCK by clicking cut lines on the
+ * diagram. The user's mental model: "I start with the raw full sheet, click
+ * a line, tell it what to measure from, and that becomes the cut."
  *
  * INTERACTION
- *   - The diagram shows the sheet mid-breakdown: the three reference trims are
- *     pre-made (blue), pieces produced so far are live, and finished (freed)
- *     pieces fade back.
- *   - Hovering a live piece shows the LEGAL full-span candidate cut lines
- *     within it (clean lines on part edges that cross the piece edge-to-edge
- *     without slicing any part — the same candidates the engine considers,
- *     enumerated via candidateLinesInRegion, a fan-out of pickLine's logic).
- *     The hovered candidate draws red-dashed.
- *   - Clicking a candidate commits it as the NEXT cut, measured from the
- *     piece's DATUM edge when one exists (fromFar if the datum is the far
- *     edge), else the built-in default (left for vertical, top for horizontal).
- *   - Clicking a piece's PARALLEL EDGE opens a small CONTEXT POPUP at the
- *     cursor: "Measure next cut from this edge" (arm — highlights green,
- *     overrides the datum for that one cut), "Set / Unset datum edge" (marks
- *     the edge BLUE as the piece's default measuring edge), "Cancel".
+ *   - The diagram opens as the RAW full sheet with the parts shown — NOTHING
+ *     is pre-made, not even the reference trims. The candidate set therefore
+ *     includes the TRIM lines (the four margin lines where applicable + the
+ *     far-long line at the last part's edge) as well as the part-edge lines,
+ *     so the user can hand-build the complete breakdown.
+ *   - Hovering a candidate line draws it red-dashed with a live quote (using
+ *     the default reference for that cut).
+ *   - Clicking a candidate opens a small CONFIG POPUP anchored near the click:
+ *       Field 1 "Save as datum" (yes/no, default no) — yes = the cut's fresh
+ *         edge becomes a DATUM (blue, reusing the datum-edge machinery).
+ *       Field 2 "Measure from" — a radio list of every valid reference for
+ *         this cut (near edge / far edge / any parallel datum edge / the most
+ *         recent parallel cut on this piece = "Previous cut", chain
+ *         dimensioning). The selected reference renders BLUE in the field and
+ *         highlighted on the diagram.
+ *       Confirm ("Make cut") / Cancel. On confirm the cut commits.
  *
  * DATUM EDGES: a datum is stored as a geometric line SEGMENT so it PROPAGATES
- * to any child piece that retains that same boundary edge after a cut. The
- * three trims' reference edges are implicit datums on the seed pieces (the
- * top-left datum corner). Persisted on SheetOverrides.datumEdges (piece key +
- * side) and replayed on reopen by matching regions.
+ * to any child piece that retains that same boundary edge after a cut. A
+ * datum-saved cut's fresh edge is registered as a datum line. Persisted on
+ * SheetOverrides.datumEdges (piece key + side).
  *
- * RIGHT PANE = a READOUT of the sequence built so far (trims first, then the
- * hand-built layout cuts). Per row: undo-to-here (↩), flip measured edge (⇄),
- * REF datum toggle. No drag / reorder.
+ * RIGHT PANE = a READOUT of the sequence built so far. Per row: the cut kind +
+ * quoted distance, the reference used ("from R edge" / "from datum" /
+ * "from cut 5"), undo-to-here (↩). No drag / reorder.
  *
- * ACTIONS: Undo (last cut), Reset (back to just trims), Auto-complete (fill the
- * remaining sequence with the engine's order for pieces not yet finished).
+ * ACTIONS: Undo (last cut), Reset (back to bare stock), Auto-complete (fills
+ * the remaining sequence with the engine's order — generating the trims first
+ * if the user hasn't made them). Completion summary when every part is freed.
  *
- * PERSISTENCE: a hand-built sequence is stored as `customSteps` on the sheet's
- * SheetOverrides (full layout replacement, trims excluded) keyed by
- * layoutSignature. When the built sequence exactly matches lines the engine's
- * own tree contains we could express it as an `order` override, but the direct
- * cutting model lets the user pick lines the tree never enumerated — so we
- * always persist `customSteps` and let instructions.cutStepsForSheet honour it.
- * cutStepsForSheet validates nothing extra: the steps carry parent rects, so
- * the PDF diagrams (and every other renderer) work as-is.
- *
- * LEGALITY: each committed cut's parent must be a LIVE region at its turn —
- * we replay the executed prefix (trims + earlier built cuts) over regions
- * (seedRegions / applyStepToRegions, mind the far-short-edge margin clip) and
- * only offer candidates within live regions.
+ * PERSISTENCE: the hand-built sequence is stored as `customSteps` on the
+ * sheet's SheetOverrides keyed by layoutSignature. Because the trims are no
+ * longer pre-made, customSteps may CONTAIN the trim cuts (each marked isTrim);
+ * cutStepsForSheet emits customSteps ONLY (no synthetic trims) so nothing is
+ * double-emitted.
  */
 
 import type { NestSheet } from './nest';
@@ -65,6 +58,7 @@ import {
   trainingRecorder,
   sequenceMetrics,
   type SequenceMetrics,
+  type SessionStartEvent,
 } from './trainingLog';
 
 const STORE_KEY = 'plywood.cutOverrides';
@@ -102,10 +96,11 @@ function setOverrides(sig: string, ov: SheetOverrides | null): void {
 }
 
 // ---------------------------------------------------------------------------
-// Region replay — the pieces produced so far. Layout-cut parents live in the
-// USABLE frame (both margins removed), but the trims never cut the FAR short
-// edge, so a region touching the raw far edge is one margin too wide until we
-// shave it (the cut-editor legality gotcha, see docs/CLAUDE.md).
+// Region replay — the pieces produced so far. We now START FROM BARE STOCK
+// (the raw full sheet) and replay EVERY hand-made cut, trims included. There
+// is no post-trim margin clip anymore: the user's own trim cuts shave the
+// margins, so replaying them over the raw sheet is exact (the legacy far-short
+// -edge gotcha only applied when the trims were synthetic + pre-made).
 // ---------------------------------------------------------------------------
 
 interface Region { x: number; y: number; w: number; h: number }
@@ -143,23 +138,15 @@ function applyStepToRegions(step: CutStep, sheetW: number, sheetL: number, regio
   return out;
 }
 
-/** Region state after the trims, in the LAYOUT frame (see the gotcha above). */
-function seedRegions(trims: CutStep[], sheetW: number, sheetL: number, margin: number): Region[] {
-  let regions: Region[] = [{ x: 0, y: 0, w: sheetW, h: sheetL }];
-  for (const s of trims) regions = applyStepToRegions(s, sheetW, sheetL, regions);
-  if (margin > 0) {
-    const lengthIsY = sheetL >= sheetW;
-    for (const r of regions) {
-      if (!lengthIsY && Math.abs(r.x + r.w - sheetW) < 0.5) r.w -= margin;
-      if (lengthIsY && Math.abs(r.y + r.h - sheetL) < 0.5) r.h -= margin;
-    }
-  }
-  return regions;
+/** The starting region: the RAW full sheet (bare stock — nothing pre-made). */
+function seedRegions(sheetW: number, sheetL: number): Region[] {
+  return [{ x: 0, y: 0, w: sheetW, h: sheetL }];
 }
 
-/** Replay trims + a built layout tail → the live pieces. */
-function liveRegions(trims: CutStep[], built: CutStep[], sheetW: number, sheetL: number, margin: number): Region[] {
-  let regions = seedRegions(trims, sheetW, sheetL, margin);
+/** Replay a built sequence (trims + layout cuts, in commit order) → the live
+ *  pieces, starting from bare stock. */
+function liveRegions(built: CutStep[], sheetW: number, sheetL: number): Region[] {
+  let regions = seedRegions(sheetW, sheetL);
   for (const s of built) regions = applyStepToRegions(s, sheetW, sheetL, regions);
   return regions;
 }
@@ -228,24 +215,25 @@ function edgeIsDatum(r: Region, side: DatumEdge['side'], datums: DatumLine[]): b
     d.lo - DATUM_EPS <= e.lo && e.hi <= d.hi + DATUM_EPS);
 }
 
-/** Which side (if any) of a region is a datum edge — used to pick the default
- *  measuring edge for a cut. Prefers the near datum (left/top) when both a
- *  near and far edge are datums, matching the built-in default corner. */
-function datumSideFor(r: Region, vertical: boolean, datums: DatumLine[]): DatumEdge['side'] | null {
-  // A vertical (constant-X) cut is measured from a left/right edge; a
-  // horizontal cut from a top/bottom edge.
+/** Which datum sides (if any) of a region are valid parallel references for a
+ *  cut of the given orientation. A vertical (constant-X) cut measures from a
+ *  left/right edge; a horizontal cut from a top/bottom edge. Returns the near
+ *  side first (matches the built-in default corner) then the far side. */
+function datumSidesFor(r: Region, vertical: boolean, datums: DatumLine[]): DatumEdge['side'][] {
   const near: DatumEdge['side'] = vertical ? 'left' : 'top';
   const far: DatumEdge['side'] = vertical ? 'right' : 'bottom';
-  if (edgeIsDatum(r, near, datums)) return near;
-  if (edgeIsDatum(r, far, datums)) return far;
-  return null;
+  const out: DatumEdge['side'][] = [];
+  if (edgeIsDatum(r, near, datums)) out.push(near);
+  if (edgeIsDatum(r, far, datums)) out.push(far);
+  return out;
 }
 
 // ---------------------------------------------------------------------------
-// Candidate cut lines — ALL clean full-span lines within a region (the engine
-// only keeps the single best; the editor enumerates every legal one). A line
-// is clean when every part lies wholly on one side of it (no straddlers).
-// This mirrors the pickLine candidate-generation pattern in packRect.ts.
+// Candidate cut lines — every clean full-span line within a region PLUS the
+// trim lines. Part-edge candidates are clean lines on part edges that cross a
+// piece edge-to-edge without slicing a part (mirrors pickLine in packRect).
+// Trim candidates come from the engine's own trim geometry (cutStepsForSheet)
+// so a hand-made cut on a trim line IS that trim.
 // ---------------------------------------------------------------------------
 
 export interface Candidate {
@@ -255,9 +243,13 @@ export interface Candidate {
   coord: number;
   /** The region (piece) this candidate cuts. */
   region: Region;
+  /** True when this candidate sits on a margin/far-long TRIM line — committing
+   *  it makes that trim (rendered blue, quotes the strip width). */
+  isTrim?: boolean;
 }
 
-function candidateLinesInRegion(r: Region, parts: NestSheet['parts']): Candidate[] {
+/** Part-edge candidates within a region — every clean full-span line. */
+function partEdgeCandidates(r: Region, parts: NestSheet['parts']): Candidate[] {
   const EPS = 0.5;
   const idx = partsInRegion(r, parts);
   const items = idx.map((i) => parts[i]);
@@ -273,7 +265,8 @@ function candidateLinesInRegion(r: Region, parts: NestSheet['parts']): Candidate
   // A candidate is legal when every part lies wholly on one side (no
   // straddler). We also drop lines that only peel a BARE sub-kerf sliver of
   // waste off an edge (one side has zero parts and spans < WASTE_MIN) — those
-  // are geometric noise from the margin/kerf, never a cut a human would make.
+  // are geometric noise, never a cut a human would make (the trim candidates
+  // handle the intended margin peels).
   const WASTE_MIN = 5; // mm
   const legal = (vertical: boolean, coord: number): boolean => {
     let loParts = 0, hiParts = 0;
@@ -295,9 +288,53 @@ function candidateLinesInRegion(r: Region, parts: NestSheet['parts']): Candidate
   return out;
 }
 
-/** Build the CutStep for a committed candidate. `armedFar` flips the quoted
- *  edge to the far parallel edge (fromFar). */
-function candidateToStep(c: Candidate, sheetW: number, sheetL: number, armedFar: boolean): CutStep {
+/** All candidates in a region = trim lines that cross it + part-edge lines.
+ *  `trimLines` are the engine's trim lines (constant-X/Y). A trim line is
+ *  offered on a region when it lies strictly inside the region and spans it
+ *  edge-to-edge — i.e. the region still touches that raw edge. */
+function candidatesInRegion(r: Region, parts: NestSheet['parts'], trimLines: TrimLine[]): Candidate[] {
+  const EPS = 0.5;
+  const out: Candidate[] = [];
+  for (const t of trimLines) {
+    const inside = t.vertical
+      ? t.coord > r.x + EPS && t.coord < r.x + r.w - EPS
+      : t.coord > r.y + EPS && t.coord < r.y + r.h - EPS;
+    if (inside) out.push({ vertical: t.vertical, coord: t.coord, region: r, isTrim: true });
+  }
+  for (const c of partEdgeCandidates(r, parts)) {
+    // Don't double-list a part-edge candidate that coincides with a trim line.
+    if (out.some((o) => o.vertical === c.vertical && Math.abs(o.coord - c.coord) < 0.75)) continue;
+    out.push(c);
+  }
+  return out;
+}
+
+// ---------------------------------------------------------------------------
+// Trim lines — reuse the engine's trim geometry from cutStepsForSheet so a
+// hand-made cut on a trim line IS that trim (same coordinate, same strip
+// quoting). We take the trim CutSteps the auto path produces and reduce them
+// to bare sheet-space lines (vertical + coord).
+// ---------------------------------------------------------------------------
+
+interface TrimLine { vertical: boolean; coord: number }
+
+function trimLinesFor(ctx: CutEditorContext): TrimLine[] {
+  const auto = deriveAuto(ctx);
+  const W = ctx.sheet.sheetW, L = ctx.sheet.sheetL;
+  return auto.trims.map((s) => {
+    const vertical = stepIsVertical(s, W, L);
+    return { vertical, coord: vertical ? s.parentX + s.distance : s.parentY + s.distance };
+  });
+}
+
+/** Build the CutStep for a committed candidate. `fromFar` flips the quoted
+ *  edge to the far parallel edge; `measureFromCut` (a cutKey) chain-dimensions
+ *  off a previous cut; `isTrim` marks a trim-line cut; `isDatum` a datum-saved
+ *  cut. */
+function candidateToStep(
+  c: Candidate, sheetW: number, sheetL: number,
+  opts: { fromFar?: boolean; measureFromCut?: string; isTrim?: boolean; isDatum?: boolean },
+): CutStep {
   const lengthIsY = sheetL >= sheetW;
   // A vertical (constant-X) line is a rip when the length axis is Y.
   const axis: 'rip' | 'cross' = c.vertical
@@ -310,19 +347,21 @@ function candidateToStep(c: Candidate, sheetW: number, sheetL: number, armedFar:
     distance,
     parentX: c.region.x, parentY: c.region.y, parentW: c.region.w, parentH: c.region.h,
     depth: 0,
-    fromFar: armedFar || undefined,
+    fromFar: opts.fromFar || undefined,
+    measureFromCut: opts.measureFromCut || undefined,
+    isTrim: opts.isTrim || undefined,
+    isDatum: opts.isDatum || undefined,
   };
 }
 
 // ---------------------------------------------------------------------------
 // Auto-complete — fill the remaining sequence with the engine's order for the
-// pieces the user hasn't finished. Rather than replay the fixed auto layout
-// (whose parent rects no longer match once the user cuts lines the auto tree
-// never used), we re-run the ENGINE'S OWN decomposition (deriveGuillotineCuts,
-// the human-style min-cuts search) on each LIVE, unfinished piece: translate
-// the piece + its parts to a local origin, derive a fresh cut tree, then shift
-// the resulting cuts back into the sheet frame. This gives the engine's order
-// for exactly the pieces the user hasn't finished, whatever the user cut first.
+// pieces the user hasn't finished. If the user hasn't made the trims yet, we
+// GENERATE THE TRIMS FIRST (over the raw sheet), then decompose each live,
+// unfinished piece with the engine's own min-cuts search. Rather than replay
+// the fixed auto layout (whose parent rects no longer match once the user cuts
+// lines the auto tree never used), we re-run deriveGuillotineCuts on each live
+// piece so the order matches exactly the pieces the user hasn't finished.
 // ---------------------------------------------------------------------------
 
 /** Convert a bin-frame Cut (from deriveGuillotineCuts, anchored at region
@@ -340,26 +379,45 @@ function cutToStep(c: Cut, ox: number, oy: number, sheetW: number, sheetL: numbe
   };
 }
 
+/** The engine trim CutSteps that the user has NOT yet made — offered as the
+ *  head of the auto-complete remainder. Matched by line coordinate. */
+function missingTrimSteps(ctx: CutEditorContext, built: CutStep[]): CutStep[] {
+  const auto = deriveAuto(ctx);
+  const W = ctx.sheet.sheetW, L = ctx.sheet.sheetL;
+  const builtLines = built.map((s) => {
+    const v = stepIsVertical(s, W, L);
+    return { vertical: v, coord: v ? s.parentX + s.distance : s.parentY + s.distance };
+  });
+  return auto.trims
+    .filter((t) => {
+      const v = stepIsVertical(t, W, L);
+      const coord = v ? t.parentX + t.distance : t.parentY + t.distance;
+      return !builtLines.some((b) => b.vertical === v && Math.abs(b.coord - coord) < 0.75);
+    })
+    .map((s) => ({ ...s }));
+}
+
 function autoRemainder(
-  trims: CutStep[],
+  ctx: CutEditorContext,
   built: CutStep[],
-  parts: NestSheet['parts'],
-  sheetW: number,
-  sheetL: number,
-  margin: number,
 ): CutStep[] {
-  const regions = liveRegions(trims, built, sheetW, sheetL, margin);
+  const W = ctx.sheet.sheetW, L = ctx.sheet.sheetL;
+  const parts = ctx.sheet.parts;
   const add: CutStep[] = [];
+  // 1. Generate any trims the user hasn't made, over the current stock.
+  const trims = missingTrimSteps(ctx, built);
+  add.push(...trims);
+  // 2. Decompose each live, unfinished piece (after the trims) with the engine.
+  const regions = liveRegions([...built, ...trims], W, L);
   for (const r of regions) {
     if (regionFinished(r, parts)) continue;
-    // Parts inside this piece, translated to the piece's local origin.
     const idx = partsInRegion(r, parts);
     if (idx.length < 1) continue;
     const localRects = idx.map((i) => ({
       x: parts[i].x - r.x, y: parts[i].y - r.y, w: parts[i].w, h: parts[i].h,
     }));
     const cuts = deriveGuillotineCuts(localRects, r.w, r.h);
-    for (const c of cuts) add.push(cutToStep(c, r.x, r.y, sheetW, sheetL));
+    for (const c of cuts) add.push(cutToStep(c, r.x, r.y, W, L));
   }
   return add;
 }
@@ -384,17 +442,20 @@ export interface CutEditorContext {
 interface EditorSession {
   ctx: CutEditorContext;
   sig: string;
-  /** Fixed reference trims (engine order). */
-  trims: CutStep[];
-  /** The hand-built layout cuts, in commit order. */
+  /** The hand-built cut sequence, in commit order — trims INCLUDED (they are
+   *  no longer pre-made). */
   built: CutStep[];
-  /** Armed measured-from edge for the NEXT cut: the region + which parallel
-   *  edge (near/far) + orientation. null = default datum edge. */
-  armed: { region: Region; vertical: boolean; far: boolean } | null;
+  /** Engine trim lines (bare sheet-space lines) offered as candidates. */
+  trimLines: TrimLine[];
   /** User-declared datum edges, geometric line segments so they propagate to
-   *  child pieces. Seeded with the implicit trim datums (left + top). */
+   *  child pieces. Starts EMPTY — the user creates datums by saving a cut's
+   *  fresh edge (or, retained, by a datum-saved trim). */
   datums: DatumLine[];
   changed: boolean;
+  /** The session_start event, buffered so it's only written to the log once
+   *  the user actually makes a change (no-change sessions leave no entry).
+   *  Recording is ALWAYS ON for the editor — there is no toggle. */
+  startEvent: SessionStartEvent | null;
 }
 
 let overlay: HTMLElement | null = null;
@@ -412,11 +473,12 @@ function deriveAuto(ctx: CutEditorContext): { trims: CutStep[]; layout: CutStep[
   return { trims, layout, steps: sc.steps };
 }
 
-/** The full working step list = trims + built, renumbered + same-setting run
- *  flags applied (matches how cutStepsForSheet finishes a sequence). */
+/** The full working step list = built, renumbered + same-setting run flags
+ *  applied (matches how cutStepsForSheet finishes a sequence). Datum-saved
+ *  and trim cuts are marked isDatum so they render blue. */
 function workingSteps(): CutStep[] {
   if (!session) return [];
-  const all = [...session.trims.map((s) => ({ ...s })), ...session.built.map((s) => ({ ...s }))];
+  const all = session.built.map((s) => ({ ...s }));
   all.forEach((s, i) => { s.index = i + 1; if (s.isTrim) s.isDatum = true; });
   for (let i = 1; i < all.length; i++) {
     const p = all[i - 1], c = all[i];
@@ -444,39 +506,21 @@ function metricsOf(steps: CutStep[]): SequenceMetrics {
   return sequenceMetrics(steps);
 }
 
-/** Reconstruct the built tail from a saved customSteps override (if any). */
+/** Reconstruct the built sequence from a saved customSteps override (if any). */
 function builtFromOverrides(ov: SheetOverrides | undefined): CutStep[] {
   if (ov?.customSteps && ov.customSteps.length > 0) return ov.customSteps.map((s) => ({ ...s }));
   return [];
 }
 
-/** Implicit trim datums: the reference edges established by the three trims —
- *  the datum corner is top-left, so the seed pieces' outer LEFT and TOP edges
- *  are the built-in default measuring edges (matching the current quoting).
- *  Rendered blue already; we add them as datum lines so the default-quote path
- *  and the datum machinery agree. */
-function implicitTrimDatums(seed: Region[]): DatumLine[] {
-  if (seed.length === 0) return [];
-  const minX = Math.min(...seed.map((r) => r.x));
-  const minY = Math.min(...seed.map((r) => r.y));
-  const maxX = Math.max(...seed.map((r) => r.x + r.w));
-  const maxY = Math.max(...seed.map((r) => r.y + r.h));
-  return [
-    { vertical: true,  coord: minX, lo: minY, hi: maxY }, // left datum edge
-    { vertical: false, coord: minY, lo: minX, hi: maxX }, // top datum edge
-  ];
-}
-
 /** Reconstruct user datum lines from a persisted DatumEdge[] by REPLAYING the
- *  trims + built cuts and matching each entry's piece key to a live region.
- *  A datum whose region no longer exists (layout changed) is dropped. */
+ *  built cuts and matching each entry's piece key to a live region. A datum
+ *  whose region no longer exists (layout changed) is dropped. */
 function userDatumsFromOverrides(
   ov: SheetOverrides | undefined,
-  trims: CutStep[], built: CutStep[],
-  sheetW: number, sheetL: number, margin: number,
+  built: CutStep[], sheetW: number, sheetL: number,
 ): DatumLine[] {
   if (!ov?.datumEdges || ov.datumEdges.length === 0) return [];
-  const regions = liveRegions(trims, built, sheetW, sheetL, margin);
+  const regions = liveRegions(built, sheetW, sheetL);
   const byKey = new Map<string, Region>();
   for (const r of regions) byKey.set(regionKey(r), r);
   const out: DatumLine[] = [];
@@ -487,20 +531,15 @@ function userDatumsFromOverrides(
   return out;
 }
 
-/** Serialise the session's USER datum lines (implicit trim datums excluded) as
- *  DatumEdge[] keyed by the live region they currently sit on. */
+/** Serialise the session's user datum lines as DatumEdge[] keyed by the live
+ *  region they currently sit on. */
 function userDatumEdges(): DatumEdge[] {
   if (!session) return [];
-  const { trims, built, ctx } = session;
-  const implicit = implicitTrimDatums(seedRegions(trims, ctx.sheet.sheetW, ctx.sheet.sheetL, ctx.margin));
-  const regions = liveRegions(trims, built, ctx.sheet.sheetW, ctx.sheet.sheetL, ctx.margin);
+  const { built, ctx } = session;
+  const regions = liveRegions(built, ctx.sheet.sheetW, ctx.sheet.sheetL);
   const out: DatumEdge[] = [];
   const seen = new Set<string>();
   for (const d of session.datums) {
-    // Skip the implicit trim datums — those are re-derived on reopen.
-    if (implicit.some((im) => im.vertical === d.vertical && Math.abs(im.coord - d.coord) < DATUM_EPS &&
-        Math.abs(im.lo - d.lo) < DATUM_EPS && Math.abs(im.hi - d.hi) < DATUM_EPS)) continue;
-    // Anchor the datum line to whatever live region currently owns that edge.
     for (const r of regions) {
       const side = (['left', 'right', 'top', 'bottom'] as DatumEdge['side'][])
         .find((s) => {
@@ -523,25 +562,10 @@ export function openCutEditor(ctx: CutEditorContext): void {
   const ov = getOverrides(sig);
   const auto = deriveAuto(ctx);
   const built = builtFromOverrides(ov);
-  const seed = seedRegions(auto.trims, ctx.sheet.sheetW, ctx.sheet.sheetL, ctx.margin);
-  const datums = [
-    ...implicitTrimDatums(seed),
-    ...userDatumsFromOverrides(ov, auto.trims, built, ctx.sheet.sheetW, ctx.sheet.sheetL, ctx.margin),
-  ];
-  session = {
-    ctx, sig,
-    trims: auto.trims,
-    built,
-    armed: null,
-    datums,
-    changed: false,
-  };
-  hovered = null;
-
-  buildOverlay();
-
-  // Training: session_start (only recorded while the recorder is on).
-  trainingRecorder.append({
+  // Recording is ALWAYS ON for editor sessions — there is no toggle. We buffer
+  // the session_start and flush it lazily on the first change so a session the
+  // user just looks at (no edits) leaves no log entry.
+  const startEvent: SessionStartEvent = {
     type: 'session_start',
     t: Date.now(),
     sheet: {
@@ -557,27 +581,47 @@ export function openCutEditor(ctx: CutEditorContext): void {
     autoMetrics: sequenceMetrics(auto.steps),
     signature: sig,
     jobName: ctx.jobName,
-  });
+  };
+  session = {
+    ctx, sig,
+    built,
+    trimLines: trimLinesFor(ctx),
+    datums: userDatumsFromOverrides(ov, built, ctx.sheet.sheetW, ctx.sheet.sheetL),
+    changed: false,
+    startEvent,
+  };
+  hovered = null;
+  trainingRecorder.recording = true;
 
+  buildOverlay();
   render();
+}
+
+/** Flush the buffered session_start once (on the first change of a session)
+ *  so no-change sessions leave no log entry. */
+function ensureSessionLogged(): void {
+  if (!session || !session.startEvent) return;
+  trainingRecorder.append(session.startEvent);
+  session.startEvent = null;
 }
 
 function closeEditor(): void {
   if (!session) return;
   const s = session;
-  let note = '';
+  // Only log a session_end when the session was actually changed (and thus
+  // its session_start was flushed) — a no-change session leaves no entry.
   if (s.changed) {
-    note = window.prompt('Optional: why this cut order? (one line)') ?? '';
+    const note = window.prompt('Optional: why this cut order? (one line)') ?? '';
+    const steps = workingSteps();
+    trainingRecorder.append({
+      type: 'session_end',
+      t: Date.now(),
+      finalSequence: steps,
+      finalMetrics: metricsOf(steps),
+      note,
+    });
   }
-  const steps = workingSteps();
-  trainingRecorder.append({
-    type: 'session_end',
-    t: Date.now(),
-    finalSequence: steps,
-    finalMetrics: metricsOf(steps),
-    note,
-  });
-  closeEdgeMenu();
+  closeCutPopup();
   overlay?.remove();
   overlay = null;
   session = null;
@@ -597,46 +641,80 @@ function humanSummary(s: CutStep, ctx: CutEditorContext): string {
 /** Piece-state snapshot for the training log: how many parts remain unfreed. */
 function pieceState(): { pieces: number; finished: number } {
   if (!session) return { pieces: 0, finished: 0 };
-  const { trims, built, ctx } = session;
-  const regions = liveRegions(trims, built, ctx.sheet.sheetW, ctx.sheet.sheetL, ctx.margin);
+  const { built, ctx } = session;
+  const regions = liveRegions(built, ctx.sheet.sheetW, ctx.sheet.sheetL);
   let finished = 0;
   for (const r of regions) if (regionFinished(r, ctx.sheet.parts)) finished++;
   return { pieces: regions.length, finished };
 }
 
-function commitCandidate(c: Candidate): void {
+/** The most recent PARALLEL cut whose fresh edge lies ON this candidate's
+ *  piece — the "Previous cut" chain-dimensioning reference. With a parallel
+ *  guide you register the stops off the FRESH-CUT edge, so a strip cut off the
+ *  same parent chains off the prior cut. After a cut splits a piece, its line
+ *  becomes the child's near/far BOUNDARY edge — that's where the previous cut
+ *  now lives — so we accept a prior parallel cut whose line coincides with the
+ *  candidate region's near or far parallel edge (or lies in its interior). We
+ *  ignore the candidate's own line. Walks built in reverse (most recent first). */
+function previousParallelCut(c: Candidate): { step: CutStep; builtIdx: number } | null {
+  if (!session) return null;
+  const { built, ctx } = session;
+  const W = ctx.sheet.sheetW, L = ctx.sheet.sheetL;
+  const EPS = 0.5;
+  const lo = c.vertical ? c.region.x : c.region.y;
+  const hi = c.vertical ? c.region.x + c.region.w : c.region.y + c.region.h;
+  for (let i = built.length - 1; i >= 0; i--) {
+    const s = built[i];
+    if (s.isTrim) continue; // a trim is a stock-edge datum, not a chain link
+    const v = stepIsVertical(s, W, L);
+    if (v !== c.vertical) continue; // must be parallel to this cut
+    const line = (v ? s.parentX : s.parentY) + s.distance;
+    // Must lie on this piece: within its span (interior OR on a parallel edge).
+    if (line < lo - EPS || line > hi + EPS) continue;
+    if (Math.abs(line - c.coord) < EPS) continue; // not the candidate itself
+    return { step: s, builtIdx: i };
+  }
+  return null;
+}
+
+/** Commit a candidate with an explicit reference resolution. */
+function commitCandidate(c: Candidate, ref: CutRef, saveDatum: boolean): void {
   if (!session) return;
   const { ctx } = session;
-  // Measured-from edge resolution, in priority order:
-  //   1. an explicit ARM for this piece (overrides the datum for this cut),
-  //   2. else the piece's DATUM edge (set fromFar when the datum is the far
-  //      parallel edge for this cut's orientation),
-  //   3. else the built-in DEFAULT (near datum corner: L for vertical, T for
-  //      horizontal → fromFar = false).
-  const armedHere = !!(session.armed && sameRegion(session.armed.region, c.region));
+  const W = ctx.sheet.sheetW, L = ctx.sheet.sheetL;
+
   let fromFar = false;
+  let measureFromCut: string | undefined;
   let provenance: 'armed' | 'datum' | 'default' = 'default';
-  if (armedHere) {
-    fromFar = !!session.armed!.far;
-    provenance = 'armed';
-  } else {
-    const ds = datumSideFor(c.region, c.vertical, session.datums);
-    if (ds) {
-      fromFar = ds === 'right' || ds === 'bottom';
-      // The implicit near-datum corner IS the default; only call it 'datum'
-      // when a user datum drives it (far edge, or a non-corner near edge).
-      provenance = 'datum';
-    }
+  if (ref.kind === 'far') { fromFar = true; provenance = 'default'; }
+  else if (ref.kind === 'datum') {
+    fromFar = ref.side === 'right' || ref.side === 'bottom';
+    provenance = 'datum';
+  } else if (ref.kind === 'prevCut') {
+    measureFromCut = cutKeyFor(ref.step);
+    provenance = 'armed'; // chained off a fresh-cut edge — an explicit choice
   }
-  const step = candidateToStep(c, ctx.sheet.sheetW, ctx.sheet.sheetL, fromFar);
+  // 'near' → defaults (fromFar false, no chain).
+
+  ensureSessionLogged();
+  const step = candidateToStep(c, W, L, {
+    fromFar, measureFromCut, isTrim: c.isTrim, isDatum: saveDatum,
+  });
   session.built.push(step);
-  session.armed = null;
   session.changed = true;
   hovered = null;
+
+  // A datum-saved cut registers its FRESH edge as a datum line so later cuts
+  // can measure from it (and it propagates to children retaining that edge).
+  if (saveDatum) {
+    const v = c.vertical;
+    const line: DatumLine = v
+      ? { vertical: true, coord: c.coord, lo: c.region.y, hi: c.region.y + c.region.h }
+      : { vertical: false, coord: c.coord, lo: c.region.x, hi: c.region.x + c.region.w };
+    session.datums.push(line);
+  }
   persistSession();
 
-  // Provenance for the log: which edge (near/far in this cut's orientation)
-  // and where the choice came from.
   const measuredFrom: 'L' | 'R' | 'T' | 'B' = c.vertical
     ? (fromFar ? 'R' : 'L')
     : (fromFar ? 'B' : 'T');
@@ -649,6 +727,8 @@ function commitCandidate(c: Candidate): void {
     armedFar: provenance === 'armed' && fromFar,
     measuredFrom,
     measuredProvenance: provenance,
+    measuredFromCut: measureFromCut,
+    datumSaved: saveDatum,
     piece: pieceState(),
     sequenceAfter: session.built.map((s) => cutKeyFor(s)),
     metricsAfter: metricsOf(workingSteps()),
@@ -662,24 +742,14 @@ function sameRegion(a: Region, b: Region): boolean {
          Math.abs(a.w - b.w) < 1 && Math.abs(a.h - b.h) < 1;
 }
 
-/** Arm (or disarm) a piece's parallel edge as the measured-from reference. */
-function armEdge(region: Region, vertical: boolean, far: boolean): void {
-  if (!session) return;
-  const a = session.armed;
-  if (a && sameRegion(a.region, region) && a.vertical === vertical && a.far === far) {
-    session.armed = null; // toggle off
-  } else {
-    session.armed = { region, vertical, far };
-  }
-  render();
-}
-
 function undoLast(): void {
   if (!session || session.built.length === 0) return;
+  ensureSessionLogged();
   const removed = session.built.pop()!;
-  session.armed = null;
   session.changed = true;
   hovered = null;
+  // Drop any datum line whose fresh edge belonged to the removed cut.
+  pruneOrphanDatums();
   persistSession();
   trainingRecorder.append({
     type: 'undo',
@@ -694,20 +764,21 @@ function undoLast(): void {
   render();
 }
 
-/** Truncate the built tail back to `keepLayoutCount` cuts (undo-to-here). */
-function undoToHere(keepLayoutCount: number): void {
+/** Truncate the built sequence back to `keep` cuts (undo-to-here). */
+function undoToHere(keep: number): void {
   if (!session) return;
-  if (keepLayoutCount >= session.built.length) return;
-  session.built = session.built.slice(0, keepLayoutCount);
-  session.armed = null;
+  if (keep >= session.built.length) return;
+  ensureSessionLogged();
+  session.built = session.built.slice(0, keep);
   session.changed = true;
   hovered = null;
+  pruneOrphanDatums();
   persistSession();
   trainingRecorder.append({
     type: 'undo',
     t: Date.now(),
-    cut: `truncate:${keepLayoutCount}`,
-    summary: `Undo to ${keepLayoutCount} built cut(s)`,
+    cut: `truncate:${keep}`,
+    summary: `Undo to ${keep} built cut(s)`,
     piece: pieceState(),
     sequenceAfter: session.built.map((s) => cutKeyFor(s)),
     metricsAfter: metricsOf(workingSteps()),
@@ -716,14 +787,26 @@ function undoToHere(keepLayoutCount: number): void {
   render();
 }
 
-function resetToTrims(): void {
+/** Drop datum lines that no longer coincide with any live piece edge (their
+ *  originating cut was undone). */
+function pruneOrphanDatums(): void {
+  if (!session) return;
+  const { built, ctx } = session;
+  const regions = liveRegions(built, ctx.sheet.sheetW, ctx.sheet.sheetL);
+  session.datums = session.datums.filter((d) =>
+    regions.some((r) =>
+      (['left', 'right', 'top', 'bottom'] as DatumEdge['side'][]).some((s) => {
+        const e = edgeLine(r, s);
+        return e.vertical === d.vertical && Math.abs(e.coord - d.coord) < DATUM_EPS;
+      })));
+}
+
+function resetToBareStock(): void {
   if (!session) return;
   const { ctx } = session;
+  if (session.built.length > 0 || session.datums.length > 0) ensureSessionLogged();
   session.built = [];
-  session.armed = null;
-  // Drop user datums; keep only the implicit trim datums.
-  session.datums = implicitTrimDatums(
-    seedRegions(session.trims, ctx.sheet.sheetW, ctx.sheet.sheetL, ctx.margin));
+  session.datums = [];
   session.changed = true;
   hovered = null;
   setOverrides(session.sig, null);
@@ -731,80 +814,13 @@ function resetToTrims(): void {
   render();
 }
 
-/** Is this region's `side` currently a USER-declared datum edge (i.e. present
- *  as a datum line that is NOT one of the implicit trim datums)? */
-function isUserDatumSide(r: Region, side: DatumEdge['side']): boolean {
-  if (!session) return false;
-  const { ctx } = session;
-  const implicit = implicitTrimDatums(
-    seedRegions(session.trims, ctx.sheet.sheetW, ctx.sheet.sheetL, ctx.margin));
-  const e = edgeLine(r, side);
-  const onImplicit = implicit.some((im) => im.vertical === e.vertical &&
-    Math.abs(im.coord - e.coord) < DATUM_EPS);
-  if (onImplicit) return false;
-  return edgeIsDatum(r, side, session.datums);
-}
-
-/** Toggle a datum edge on a live piece. Sets the edge as the DEFAULT measuring
- *  edge for cuts on that piece (and any child that retains it). */
-function setDatumEdge(r: Region, side: DatumEdge['side']): void {
-  if (!session) return;
-  const e = edgeLine(r, side);
-  const already = session.datums.some((d) => d.vertical === e.vertical &&
-    Math.abs(d.coord - e.coord) < DATUM_EPS &&
-    d.lo - DATUM_EPS <= e.lo && e.hi <= d.hi + DATUM_EPS);
-  if (already) return;
-  session.datums.push(e);
-  session.changed = true;
-  persistSession();
-  trainingRecorder.append({
-    type: 'set_datum',
-    t: Date.now(),
-    piece_key: regionKey(r),
-    side,
-    summary: `Datum ${side} on piece ${regionKey(r)}`,
-    sequenceAfter: session.built.map((s) => cutKeyFor(s)),
-    metricsAfter: metricsOf(workingSteps()),
-  });
-  session.ctx.onChange?.();
-  render();
-}
-
-/** Remove a datum edge from a live piece (only user datums; implicit trim
- *  datums can't be unset). Drops any datum line collinear with this edge. */
-function unsetDatumEdge(r: Region, side: DatumEdge['side']): void {
-  if (!session) return;
-  const e = edgeLine(r, side);
-  const before = session.datums.length;
-  session.datums = session.datums.filter((d) => !(d.vertical === e.vertical &&
-    Math.abs(d.coord - e.coord) < DATUM_EPS &&
-    d.lo - DATUM_EPS <= e.lo && e.hi <= d.hi + DATUM_EPS));
-  if (session.datums.length === before) return;
-  session.changed = true;
-  persistSession();
-  trainingRecorder.append({
-    type: 'unset_datum',
-    t: Date.now(),
-    piece_key: regionKey(r),
-    side,
-    summary: `Unset datum ${side} on piece ${regionKey(r)}`,
-    sequenceAfter: session.built.map((s) => cutKeyFor(s)),
-    metricsAfter: metricsOf(workingSteps()),
-  });
-  session.ctx.onChange?.();
-  render();
-}
-
 function autoComplete(): void {
   if (!session) return;
   const { ctx } = session;
-  const remainder = autoRemainder(
-    session.trims, session.built, ctx.sheet.parts,
-    ctx.sheet.sheetW, ctx.sheet.sheetL, ctx.margin,
-  );
+  const remainder = autoRemainder(ctx, session.built);
   if (remainder.length === 0) { render(); return; }
+  ensureSessionLogged();
   session.built.push(...remainder);
-  session.armed = null;
   session.changed = true;
   hovered = null;
   persistSession();
@@ -820,12 +836,15 @@ function autoComplete(): void {
   render();
 }
 
-/** Flip the measured-from edge (fromFar) of a built layout cut by index. */
+/** Flip the measured-from edge (fromFar) of a built cut by index. Clears any
+ *  chain reference. */
 function toggleFlip(builtIdx: number): void {
   if (!session) return;
   const s = session.built[builtIdx];
   if (!s) return;
+  ensureSessionLogged();
   s.fromFar = !s.fromFar;
+  s.measureFromCut = undefined;
   session.changed = true;
   persistSession();
   trainingRecorder.append({
@@ -841,11 +860,12 @@ function toggleFlip(builtIdx: number): void {
   render();
 }
 
-/** Toggle the datum (REF) flag of a built layout cut by index. */
+/** Toggle the datum (REF) flag of a built cut by index. */
 function toggleDatum(builtIdx: number): void {
   if (!session) return;
   const s = session.built[builtIdx];
   if (!s) return;
+  ensureSessionLogged();
   s.isDatum = !s.isDatum;
   session.changed = true;
   persistSession();
@@ -875,7 +895,6 @@ function buildOverlay(): void {
       <header class="cut-editor-head">
         <div class="cut-editor-title"></div>
         <div class="cut-editor-head-actions">
-          <button type="button" class="ghost cut-editor-record" data-role="record">⏺ Record</button>
           <button type="button" class="ghost cut-editor-download" data-role="download">Download log</button>
           <button type="button" class="ghost" data-role="undo">↶ Undo</button>
           <button type="button" class="ghost" data-role="auto">Auto-complete</button>
@@ -893,36 +912,18 @@ function buildOverlay(): void {
     if (e.target === overlay) closeEditor();
   });
   overlay.querySelector('[data-role="close"]')?.addEventListener('click', closeEditor);
-  overlay.querySelector('[data-role="reset"]')?.addEventListener('click', resetToTrims);
+  overlay.querySelector('[data-role="reset"]')?.addEventListener('click', resetToBareStock);
   overlay.querySelector('[data-role="undo"]')?.addEventListener('click', undoLast);
   overlay.querySelector('[data-role="auto"]')?.addEventListener('click', autoComplete);
-  overlay.querySelector('[data-role="record"]')?.addEventListener('click', () => {
-    const on = trainingRecorder.setRecording(!trainingRecorder.recording);
-    if (on && session) {
-      const auto = deriveAuto(session.ctx);
-      trainingRecorder.append({
-        type: 'session_start', t: Date.now(),
-        sheet: {
-          w: session.ctx.sheet.sheetW, l: session.ctx.sheet.sheetL,
-          margin: session.ctx.margin, kerf: session.ctx.kerf,
-          strategy: session.ctx.strategy, thickness: session.ctx.sheet.thickness,
-        },
-        parts: session.ctx.sheet.parts.map((p) => ({
-          code: `${session!.ctx.sheet.globalIndex || ''}${p.panelLabel}`,
-          x: Math.round(p.x), y: Math.round(p.y), w: Math.round(p.w), h: Math.round(p.h),
-        })),
-        autoSequence: auto.steps, autoMetrics: sequenceMetrics(auto.steps),
-        signature: session.sig, jobName: session.ctx.jobName,
-      });
-    }
-    render();
-  });
   overlay.querySelector('[data-role="download"]')?.addEventListener('click', () => {
     if (session) trainingRecorder.download(session.ctx.jobName);
   });
 
   const onKey = (e: KeyboardEvent) => {
-    if (e.key === 'Escape') { closeEditor(); document.removeEventListener('keydown', onKey); }
+    if (e.key === 'Escape') {
+      if (cutPopup) { closeCutPopup(); return; }
+      closeEditor(); document.removeEventListener('keydown', onKey);
+    }
     else if ((e.key === 'z' && (e.ctrlKey || e.metaKey)) && session) { e.preventDefault(); undoLast(); }
   };
   document.addEventListener('keydown', onKey);
@@ -941,27 +942,20 @@ function render(): void {
     titleEl.textContent =
       `Sheet ${session.ctx.sheet.globalIndex || ''} · ${steps.length} cuts · ${freedParts}/${total} parts freed`;
   }
-  const recBtn = overlay.querySelector('[data-role="record"]') as HTMLButtonElement | null;
-  if (recBtn) {
-    recBtn.classList.toggle('recording', trainingRecorder.recording);
-    recBtn.textContent = trainingRecorder.recording
-      ? `⏺ Recording (${trainingRecorder.count})`
-      : '⏺ Record';
-  }
   const undoBtn = overlay.querySelector('[data-role="undo"]') as HTMLButtonElement | null;
   if (undoBtn) undoBtn.disabled = session.built.length === 0;
   const autoBtn = overlay.querySelector('[data-role="auto"]') as HTMLButtonElement | null;
   if (autoBtn) autoBtn.disabled = countFreedParts() >= session.ctx.sheet.parts.length;
 
-  renderDiagram();
+  renderStack();
   renderList();
 }
 
 /** How many parts are alone in a live region (fully freed). */
 function countFreedParts(): number {
   if (!session) return 0;
-  const { trims, built, ctx } = session;
-  const regions = liveRegions(trims, built, ctx.sheet.sheetW, ctx.sheet.sheetL, ctx.margin);
+  const { built, ctx } = session;
+  const regions = liveRegions(built, ctx.sheet.sheetW, ctx.sheet.sheetL);
   let freed = 0;
   for (const r of regions) {
     const idx = partsInRegion(r, ctx.sheet.parts);
@@ -972,7 +966,7 @@ function countFreedParts(): number {
 
 // ---------------------------------------------------------------------------
 // Diagram (left) — SVG matching the PDF cut-diagram colors, plus interactive
-// candidate lines + arm-able parallel edges.
+// candidate lines. Clicking a candidate opens the config popup.
 // ---------------------------------------------------------------------------
 
 function el(name: string, attrs: Record<string, string | number>): SVGElement {
@@ -981,30 +975,96 @@ function el(name: string, attrs: Record<string, string | number>): SVGElement {
   return e;
 }
 
-const SNAP_BAND = 14; // mm — click within this of a parallel edge arms it
-
-function renderDiagram(): void {
+/** Rebuild the whole LEFT pane — a vertically-scrollable STACK of diagram
+ *  sections. First section is the original BOARD (full sheet + all committed
+ *  cuts + parts + fades). When a cut splits the board, each LIVE, UNFINISHED
+ *  split-off piece becomes its OWN section below, cuttable independently. The
+ *  board section is itself interactive while nothing has been split off yet
+ *  (so the very first cuts are made on it); once split, interaction moves to
+ *  the per-piece sections and the board stays as the overview. */
+function renderStack(): void {
   if (!overlay || !session) return;
   const host = overlay.querySelector('[data-role="diagram"]') as HTMLElement;
   if (!host) return;
   const { sheet } = session.ctx;
   const W = sheet.sheetW, L = sheet.sheetL;
-  const trims = session.trims;
-  const built = session.built;
-  const regions = liveRegions(trims, built, W, L, session.ctx.margin);
+  const regions = liveRegions(session.built, W, L);
+  const unfinished = regions.filter((r) => !regionFinished(r, sheet.parts));
+  const board: Region = { x: 0, y: 0, w: W, h: L };
+
+  // The board section is interactive only when nothing has been split off yet
+  // (a single live region covering the whole sheet) — otherwise the per-piece
+  // sections own the interaction.
+  const boardInteractive = unfinished.length <= 1 &&
+    (unfinished.length === 0 || sameRegion(unfinished[0], board));
+
+  host.innerHTML = '';
+
+  // Section 1 — the original board (overview + committed cuts).
+  const boardSec = buildSection(board, `Board — ${dimLabel(W, L)}`, boardInteractive, 0);
+  host.appendChild(boardSec);
+
+  // A per-piece section for every live, unfinished split-off piece — but not
+  // the whole-sheet region (that IS the board section above). Numbered in the
+  // reading order top-to-bottom, left-to-right.
+  if (!boardInteractive) {
+    const pieces = unfinished
+      .filter((r) => !sameRegion(r, board))
+      .sort((a, b) => (a.y - b.y) || (a.x - b.x));
+    pieces.forEach((r, i) => {
+      host.appendChild(buildSection(r, `Piece ${i + 2} — ${dimLabel(r.w, r.h)}`, true, i + 1));
+    });
+  }
+}
+
+function dimLabel(w: number, h: number): string {
+  const lo = Math.round(Math.min(w, h)), hi = Math.round(Math.max(w, h));
+  return `${hi}×${lo}`;
+}
+
+/** Build one diagram SECTION: a titled SVG scoped to `region`. When `region`
+ *  is the whole sheet it's the board overview; otherwise it's a cropped
+ *  sub-diagram of one split-off piece. `interactive` gates candidate hit
+ *  targets so only the active piece(s) accept clicks. */
+function buildSection(region: Region, title: string, interactive: boolean, _idx: number): HTMLElement {
+  const sec = document.createElement('section');
+  sec.className = 'cut-piece-section' + (interactive ? '' : ' overview');
+
+  const head = document.createElement('div');
+  head.className = 'cut-piece-title';
+  head.textContent = title;
+  sec.appendChild(head);
+
+  const svg = buildRegionSvg(region, interactive);
+  sec.appendChild(svg);
+  return sec;
+}
+
+/** Build the SVG for a region — draws only the parts/cuts/candidates within
+ *  the region's bounds. The board region draws the whole sheet. */
+function buildRegionSvg(region: Region, interactive: boolean): SVGSVGElement {
+  const { sheet } = session!.ctx;
+  const W = sheet.sheetW, L = sheet.sheetL;
+  const built = session!.built;
+  const isBoard = region.x === 0 && region.y === 0 &&
+    Math.abs(region.w - W) < 1 && Math.abs(region.h - L) < 1;
+  const regions = liveRegions(built, W, L);
 
   const pad = 12;
   const svg = el('svg', {
-    viewBox: `${-pad} ${-pad} ${W + pad * 2} ${L + pad * 2}`,
+    viewBox: `${region.x - pad} ${region.y - pad} ${region.w + pad * 2} ${region.h + pad * 2}`,
     preserveAspectRatio: 'xMidYMid meet',
     class: 'cut-editor-svg',
+    'data-region': regionKey(region),
   }) as SVGSVGElement;
 
-  // Cream sheet.
-  svg.appendChild(el('rect', { x: 0, y: 0, width: W, height: L, fill: '#F5EFD9', stroke: '#B4A270', 'stroke-width': 1 }));
+  // Cream stock for this region.
+  svg.appendChild(el('rect', { x: region.x, y: region.y, width: region.w, height: region.h, fill: '#F5EFD9', stroke: '#B4A270', 'stroke-width': 1 }));
 
-  // Parts at 50% opacity + labels.
+  // Parts within (or overlapping) this region at 50% opacity + labels.
   for (const p of sheet.parts) {
+    if (p.x + p.w <= region.x + 0.5 || p.x >= region.x + region.w - 0.5 ||
+        p.y + p.h <= region.y + 0.5 || p.y >= region.y + region.h - 0.5) continue;
     svg.appendChild(el('rect', { x: p.x, y: p.y, width: p.w, height: p.h, fill: p.color, 'fill-opacity': 0.5 }));
     const minPx = Math.min(p.w, p.h);
     if (minPx > 60) {
@@ -1019,31 +1079,31 @@ function renderDiagram(): void {
     }
   }
 
-  // Fade FINISHED pieces (freed part / bare waste) back so the live pieces
-  // stand out as the ones still to break down.
-  for (const r of regions) {
-    if (regionFinished(r, sheet.parts)) {
-      svg.appendChild(el('rect', { x: r.x, y: r.y, width: r.w, height: r.h, fill: '#FFFFFF', 'fill-opacity': 0.6 }));
+  // On the BOARD overview, fade finished pieces so the live ones stand out.
+  if (isBoard) {
+    for (const r of regions) {
+      if (regionFinished(r, sheet.parts)) {
+        svg.appendChild(el('rect', { x: r.x, y: r.y, width: r.w, height: r.h, fill: '#FFFFFF', 'fill-opacity': 0.6 }));
+      }
     }
   }
 
-  // Committed layout cuts: solid white lines (prior cuts), datum ones blue.
+  // Committed cuts whose line crosses this region: white for plain cuts, BLUE
+  // for trim + datum cuts (drawn after, on top).
   for (const s of built) {
-    if (s.isDatum) continue;
-    appendCutLine(svg, s, W, L, '#FFFFFF', 2.4);
+    if (s.isTrim || s.isDatum) continue;
+    if (cutTouchesRegion(s, region, W, L)) appendCutLine(svg, s, W, L, '#FFFFFF', 2.4);
+  }
+  for (const s of built) {
+    if (!(s.isTrim || s.isDatum)) continue;
+    if (cutTouchesRegion(s, region, W, L)) appendCutLine(svg, s, W, L, '#2B6CB0', 3);
   }
 
-  // Reference edges — trims + user datum cuts — BLUE, above the fade.
-  for (const s of trims) appendCutLine(svg, s, W, L, '#2B6CB0', 3);
-  for (const s of built) { if (s.isDatum) appendCutLine(svg, s, W, L, '#2B6CB0', 3); }
-
-  // Datum EDGES on pieces — BLUE, same as trim/reference cuts. Only draw USER
-  // datum edges here (implicit trim datums already render via the trims).
-  // Drawn on FINISHED pieces too so the datum stays visible after it has
-  // propagated onto a child that a later cut fully freed.
-  for (const r of regions) {
+  // Datum EDGES on this region (and, on the board, all live pieces) — BLUE.
+  const datumRegions = isBoard ? regions : [region];
+  for (const r of datumRegions) {
     for (const side of ['left', 'right', 'top', 'bottom'] as DatumEdge['side'][]) {
-      if (!isUserDatumSide(r, side)) continue;
+      if (!edgeIsDatum(r, side, session!.datums)) continue;
       const e = edgeLine(r, side);
       if (e.vertical) {
         svg.appendChild(el('line', { x1: e.coord, y1: e.lo, x2: e.coord, y2: e.hi, stroke: '#2B6CB0', 'stroke-width': 4, class: 'cut-datum-edge' }));
@@ -1053,168 +1113,303 @@ function renderDiagram(): void {
     }
   }
 
-  // Armed measured-from edge — GREEN.
-  if (session.armed) {
-    const a = session.armed;
-    if (a.vertical) {
-      const gx = a.far ? a.region.x + a.region.w : a.region.x;
-      svg.appendChild(el('line', { x1: gx, y1: a.region.y, x2: gx, y2: a.region.y + a.region.h, stroke: '#2F855A', 'stroke-width': 5 }));
-    } else {
-      const gy = a.far ? a.region.y + a.region.h : a.region.y;
-      svg.appendChild(el('line', { x1: a.region.x, y1: gy, x2: a.region.x + a.region.w, y2: gy, stroke: '#2F855A', 'stroke-width': 5 }));
-    }
+  // Green reference highlight while the config popup is open, if its candidate
+  // belongs to THIS region.
+  if (cutPopup && cutPopupState && sameRegion(cutPopupState.candidate.region, region)) {
+    drawPopupReference(svg);
   }
 
-  // Candidate lines for every LIVE (unfinished) region — faint gray, each an
-  // interactive hit target. The hovered one draws red-dashed with a live quote.
-  const liveCandidates: Candidate[] = [];
-  for (const r of regions) {
-    if (regionFinished(r, sheet.parts)) continue;
-    for (const c of candidateLinesInRegion(r, sheet.parts)) liveCandidates.push(c);
-  }
-  for (const c of liveCandidates) {
+  if (!interactive) return svg;
+
+  // Candidate lines for THIS region — faint gray (trim = faint blue-gray).
+  const cands = candidatesInRegion(region, sheet.parts, session!.trimLines);
+  for (const c of cands) {
     const isHover = hovered != null && candEq(hovered, c);
-    const color = isHover ? '#E03E3E' : '#9A8F73';
+    const color = isHover ? '#E03E3E' : (c.isTrim ? '#7B93B8' : '#9A8F73');
     const wid = isHover ? 4 : 1.4;
     const line = el('line', {
-      ...candLineCoords(c, W, L),
+      ...candLineCoords(c),
       stroke: color, 'stroke-width': wid,
       'stroke-dasharray': isHover ? '10 7' : '4 6',
-      class: 'cut-candidate',
+      class: 'cut-candidate' + (c.isTrim ? ' trim' : ''),
       'data-cand': candKey(c),
     });
     (line as SVGElement).style.cursor = 'pointer';
-    line.addEventListener('mouseenter', () => { hovered = c; renderDiagram(); });
-    line.addEventListener('mouseleave', () => { if (hovered && candEq(hovered, c)) { hovered = null; renderDiagram(); } });
-    line.addEventListener('click', (e) => { e.stopPropagation(); commitCandidate(c); });
-    // Fat transparent hit line under the visible one for easier clicking.
+    line.addEventListener('mouseenter', () => { hovered = c; renderStack(); });
+    line.addEventListener('mouseleave', () => { if (hovered && candEq(hovered, c)) { hovered = null; renderStack(); } });
+    line.addEventListener('click', (e) => { e.stopPropagation(); openCutPopup(e as MouseEvent, c); });
     const hit = el('line', {
-      ...candLineCoords(c, W, L),
+      ...candLineCoords(c),
       stroke: 'transparent', 'stroke-width': 22,
       class: 'cut-candidate-hit', 'data-cand': candKey(c),
     });
     (hit as SVGElement).style.cursor = 'pointer';
-    hit.addEventListener('mouseenter', () => { hovered = c; renderDiagram(); });
-    hit.addEventListener('click', (e) => { e.stopPropagation(); commitCandidate(c); });
+    hit.addEventListener('mouseenter', () => { hovered = c; renderStack(); });
+    hit.addEventListener('click', (e) => { e.stopPropagation(); openCutPopup(e as MouseEvent, c); });
     svg.appendChild(hit);
     svg.appendChild(line);
+    // The hovered candidate's live quote (default reference).
+    if (isHover) {
+      const q = quoteForCandidate(c, defaultRefFor(c));
+      const { x1, y1, x2, y2 } = candLineCoords(c) as any;
+      const mx = (Number(x1) + Number(x2)) / 2, my = (Number(y1) + Number(y2)) / 2;
+      const t = el('text', {
+        x: mx + 8, y: my - 8,
+        'font-size': Math.max(16, Math.min(34, Math.max(region.w, region.h) * 0.02)),
+        fill: '#E03E3E', 'font-weight': 700, 'paint-order': 'stroke',
+        stroke: '#fff', 'stroke-width': 3,
+      });
+      t.textContent = fmtDim(q, session!.ctx.units);
+      svg.appendChild(t);
+    }
   }
 
-  // The hovered candidate's live quote (respecting kerfRef + armed edge).
-  if (hovered) {
-    const q = quoteForCandidate(hovered);
-    const { x1, y1, x2, y2 } = candLineCoords(hovered, W, L) as any;
-    const mx = (Number(x1) + Number(x2)) / 2, my = (Number(y1) + Number(y2)) / 2;
-    const t = el('text', {
-      x: mx + 8, y: my - 8,
-      'font-size': Math.max(16, Math.min(34, Math.max(W, L) * 0.02)),
-      fill: '#E03E3E', 'font-weight': 700, 'paint-order': 'stroke',
-      stroke: '#fff', 'stroke-width': 3,
-    });
-    t.textContent = fmtDim(q, session.ctx.units);
-    svg.appendChild(t);
-  }
-
-  // Arm-able parallel edges: clicking near a live piece's edge (within the
-  // snap band) arms it as the measured-from reference. We add invisible band
-  // rects along each piece's four inner edges; a click that isn't on a
-  // candidate line lands here.
-  for (const r of regions) {
-    if (regionFinished(r, sheet.parts)) continue;
-    addEdgeBand(svg, r, true, false);  // left
-    addEdgeBand(svg, r, true, true);   // right
-    addEdgeBand(svg, r, false, false); // top
-    addEdgeBand(svg, r, false, true);  // bottom
-  }
-
-  host.innerHTML = '';
-  host.appendChild(svg);
+  return svg;
 }
 
-/** An invisible clickable band along one edge of a live piece → opens the edge
- *  context popup (arm / set-or-unset datum / cancel) at the cursor. */
-function addEdgeBand(svg: SVGSVGElement, r: Region, vertical: boolean, far: boolean): void {
-  const band = SNAP_BAND;
-  let rect: Record<string, number>;
-  if (vertical) {
-    const x = far ? r.x + r.w - band / 2 : r.x - band / 2;
-    rect = { x, y: r.y, width: band, height: r.h };
-  } else {
-    const y = far ? r.y + r.h - band / 2 : r.y - band / 2;
-    rect = { x: r.x, y, width: r.w, height: band };
+/** Does a committed cut's line lie within (touch the interior of) a region? */
+function cutTouchesRegion(s: CutStep, region: Region, W: number, L: number): boolean {
+  const v = stepIsVertical(s, W, L);
+  const line = (v ? s.parentX : s.parentY) + s.distance;
+  const EPS = 0.5;
+  if (v) return line > region.x - EPS && line < region.x + region.w + EPS &&
+                 s.parentY < region.y + region.h + EPS && s.parentY + s.parentH > region.y - EPS;
+  return line > region.y - EPS && line < region.y + region.h + EPS &&
+             s.parentX < region.x + region.w + EPS && s.parentX + s.parentW > region.x - EPS;
+}
+
+/** Draw the green highlight for the reference currently selected in the popup. */
+function drawPopupReference(svg: SVGSVGElement): void {
+  if (!session || !cutPopupState) return;
+  const { candidate: c, ref } = cutPopupState;
+  const green = '#2F855A';
+  if (ref.kind === 'near' || ref.kind === 'far') {
+    if (c.vertical) {
+      const gx = ref.kind === 'far' ? c.region.x + c.region.w : c.region.x;
+      svg.appendChild(el('line', { x1: gx, y1: c.region.y, x2: gx, y2: c.region.y + c.region.h, stroke: green, 'stroke-width': 5 }));
+    } else {
+      const gy = ref.kind === 'far' ? c.region.y + c.region.h : c.region.y;
+      svg.appendChild(el('line', { x1: c.region.x, y1: gy, x2: c.region.x + c.region.w, y2: gy, stroke: green, 'stroke-width': 5 }));
+    }
+  } else if (ref.kind === 'datum') {
+    const e = edgeLine(c.region, ref.side);
+    if (e.vertical) svg.appendChild(el('line', { x1: e.coord, y1: e.lo, x2: e.coord, y2: e.hi, stroke: green, 'stroke-width': 5 }));
+    else svg.appendChild(el('line', { x1: e.lo, y1: e.coord, x2: e.hi, y2: e.coord, stroke: green, 'stroke-width': 5 }));
+  } else if (ref.kind === 'prevCut') {
+    const s = ref.step;
+    const v = stepIsVertical(s, session.ctx.sheet.sheetW, session.ctx.sheet.sheetL);
+    if (v) {
+      const gx = s.parentX + s.distance;
+      svg.appendChild(el('line', { x1: gx, y1: s.parentY, x2: gx, y2: s.parentY + s.parentH, stroke: green, 'stroke-width': 5 }));
+    } else {
+      const gy = s.parentY + s.distance;
+      svg.appendChild(el('line', { x1: s.parentX, y1: gy, x2: s.parentX + s.parentW, y2: gy, stroke: green, 'stroke-width': 5 }));
+    }
   }
-  const side: DatumEdge['side'] = vertical ? (far ? 'right' : 'left') : (far ? 'bottom' : 'top');
-  const el2 = el('rect', { ...rect, fill: 'transparent', class: 'cut-edge-band', 'data-side': side });
-  (el2 as SVGElement).style.cursor = 'pointer';
-  el2.addEventListener('click', (e) => { e.stopPropagation(); openEdgeMenu(e as MouseEvent, r, vertical, far, side); });
-  svg.appendChild(el2);
 }
 
 // ---------------------------------------------------------------------------
-// Edge context popup — clicking a live piece's edge opens a small menu at the
-// cursor: measure-next-cut-from-here (arm), set/unset datum, cancel.
+// Cut config popup — opens when a candidate line is clicked. Fields: save as
+// datum (yes/no) + measure-from (radio list). Confirm commits; cancel closes.
 // ---------------------------------------------------------------------------
 
-let edgeMenu: HTMLElement | null = null;
+/** A resolved measure-from reference for a cut. */
+type CutRef =
+  | { kind: 'near' }                                   // near parallel edge (default)
+  | { kind: 'far' }                                    // far parallel edge (fromFar)
+  | { kind: 'datum'; side: DatumEdge['side'] }         // a parallel datum edge on the piece
+  | { kind: 'prevCut'; step: CutStep; builtIdx: number }; // chain off a previous cut
 
-function closeEdgeMenu(): void {
-  edgeMenu?.remove();
-  edgeMenu = null;
-  document.removeEventListener('mousedown', onEdgeMenuOutside, true);
+interface CutPopupState {
+  candidate: Candidate;
+  ref: CutRef;
+  saveDatum: boolean;
+  refs: { ref: CutRef; label: string }[];
 }
 
-function onEdgeMenuOutside(e: MouseEvent): void {
-  if (edgeMenu && !edgeMenu.contains(e.target as Node)) closeEdgeMenu();
+let cutPopup: HTMLElement | null = null;
+let cutPopupState: CutPopupState | null = null;
+
+function closeCutPopup(): void {
+  cutPopup?.remove();
+  cutPopup = null;
+  cutPopupState = null;
+  document.removeEventListener('mousedown', onCutPopupOutside, true);
+  if (session && overlay) renderStack(); // clear any green reference
 }
 
-function openEdgeMenu(
-  ev: MouseEvent, r: Region, vertical: boolean, far: boolean, side: DatumEdge['side'],
-): void {
-  closeEdgeMenu();
+function onCutPopupOutside(e: MouseEvent): void {
+  if (cutPopup && !cutPopup.contains(e.target as Node)) closeCutPopup();
+}
+
+/** The DEFAULT reference for a candidate: a near/far parallel datum if one
+ *  exists (near preferred), else the built-in near edge. */
+function defaultRefFor(c: Candidate): CutRef {
+  if (!session) return { kind: 'near' };
+  const sides = datumSidesFor(c.region, c.vertical, session.datums);
+  if (sides.length > 0) return { kind: 'datum', side: sides[0] };
+  return { kind: 'near' };
+}
+
+/** Enumerate every valid measure-from reference for a candidate, in the order
+ *  the popup lists them: near edge, far edge, each parallel datum edge, and
+ *  the most recent parallel cut on this piece ("Previous cut"). */
+function refsForCandidate(c: Candidate): { ref: CutRef; label: string }[] {
+  if (!session) return [];
+  // A TRIM candidate sits on a stock edge — its quote is always the strip
+  // width coming off; a "measure from" choice is meaningless, so offer none.
+  if (c.isTrim) return [];
+  const list: { ref: CutRef; label: string }[] = [];
+  const nearLbl = c.vertical ? 'Left edge' : 'Top edge';
+  const farLbl = c.vertical ? 'Right edge' : 'Bottom edge';
+  list.push({ ref: { kind: 'near' }, label: nearLbl });
+  list.push({ ref: { kind: 'far' }, label: farLbl });
+  for (const side of datumSidesFor(c.region, c.vertical, session.datums)) {
+    // Don't duplicate the near/far plain-edge entries — a datum edge that sits
+    // on the near/far side is listed as a distinct "datum" option.
+    list.push({ ref: { kind: 'datum', side }, label: `Datum ${side} edge` });
+  }
+  const prev = previousParallelCut(c);
+  if (prev) list.push({ ref: { kind: 'prevCut', step: prev.step, builtIdx: prev.builtIdx }, label: 'Previous cut' });
+  return list;
+}
+
+function refEq(a: CutRef, b: CutRef): boolean {
+  if (a.kind !== b.kind) return false;
+  if (a.kind === 'datum' && b.kind === 'datum') return a.side === b.side;
+  if (a.kind === 'prevCut' && b.kind === 'prevCut') return a.builtIdx === b.builtIdx;
+  return true;
+}
+
+function openCutPopup(ev: MouseEvent, c: Candidate): void {
+  closeCutPopup();
   if (!session) return;
-  const isDatum = isUserDatumSide(r, side);
+  hovered = c;
+  const refs = refsForCandidate(c);
+  cutPopupState = {
+    candidate: c,
+    ref: defaultRefFor(c),
+    saveDatum: false,
+    refs,
+  };
+  buildCutPopup(ev);
+  renderStack(); // draw the green reference for the default selection
+}
+
+function buildCutPopup(ev: MouseEvent): void {
+  if (!session || !cutPopupState) return;
+  const units = session.ctx.units;
+  const st = cutPopupState;
+  const c = st.candidate;
 
   const menu = document.createElement('div');
-  menu.className = 'cut-edge-menu';
-  const armItem = document.createElement('button');
-  armItem.type = 'button';
-  armItem.className = 'cut-edge-menu-item';
-  armItem.textContent = 'Measure next cut from this edge';
+  menu.className = 'cut-config-popup';
 
-  const datumItem = document.createElement('button');
-  datumItem.type = 'button';
-  datumItem.className = 'cut-edge-menu-item';
-  datumItem.textContent = isDatum ? 'Unset datum edge' : 'Set as datum edge';
+  const kind = c.isTrim ? 'Trim' : c.vertical
+    ? (session.ctx.sheet.sheetL >= session.ctx.sheet.sheetW ? 'Rip' : 'Crosscut')
+    : (session.ctx.sheet.sheetL >= session.ctx.sheet.sheetW ? 'Crosscut' : 'Rip');
+  const q = quoteForCandidate(c, st.ref);
+  // Trims quote the strip width and have no measure-from choice.
+  const measureField = st.refs.length > 0 ? `
+    <div class="cut-config-field measure">
+      <span class="cut-config-label">Measure from</span>
+      <div class="cut-config-refs" data-role="refs"></div>
+    </div>` : '';
+  menu.innerHTML = `
+    <div class="cut-config-head">
+      <span class="cut-config-kind">${kind}</span>
+      <span class="cut-config-quote" data-role="quote">${fmtDim(q, session.ctx.units)}</span>
+    </div>
+    <label class="cut-config-field">
+      <span class="cut-config-label">Save as datum</span>
+      <span class="cut-config-toggle">
+        <button type="button" class="cut-config-yn" data-yn="no">No</button>
+        <button type="button" class="cut-config-yn" data-yn="yes">Yes</button>
+      </span>
+    </label>
+    ${measureField}
+    <div class="cut-config-actions">
+      <button type="button" class="cut-config-btn cancel" data-role="cancel">Cancel</button>
+      <button type="button" class="cut-config-btn make" data-role="make">Make cut</button>
+    </div>`;
 
-  const cancelItem = document.createElement('button');
-  cancelItem.type = 'button';
-  cancelItem.className = 'cut-edge-menu-item cut-edge-menu-cancel';
-  cancelItem.textContent = 'Cancel';
+  // Save-as-datum yes/no.
+  const ynNo = menu.querySelector('[data-yn="no"]') as HTMLButtonElement;
+  const ynYes = menu.querySelector('[data-yn="yes"]') as HTMLButtonElement;
+  const paintYn = () => {
+    ynNo.classList.toggle('on', !st.saveDatum);
+    ynYes.classList.toggle('on', st.saveDatum);
+  };
+  ynNo.addEventListener('click', (e) => { e.stopPropagation(); st.saveDatum = false; paintYn(); });
+  ynYes.addEventListener('click', (e) => { e.stopPropagation(); st.saveDatum = true; paintYn(); });
+  paintYn();
 
-  armItem.addEventListener('click', (e) => { e.stopPropagation(); closeEdgeMenu(); armEdge(r, vertical, far); });
-  datumItem.addEventListener('click', (e) => {
-    e.stopPropagation(); closeEdgeMenu();
-    if (isDatum) unsetDatumEdge(r, side); else setDatumEdge(r, side);
+  // Measure-from radio list. Each row highlights the reference on the diagram
+  // when hovered/selected; the selected reference row + quote render blue.
+  // Absent for trims (they quote the strip width, no measure-from choice).
+  const refsHost = menu.querySelector('[data-role="refs"]') as HTMLElement | null;
+  const quoteEl = menu.querySelector('[data-role="quote"]') as HTMLElement;
+  const paintRefs = () => {
+    if (refsHost) {
+      for (const row of Array.from(refsHost.children) as HTMLElement[]) {
+        const idx = Number(row.dataset.idx);
+        row.classList.toggle('sel', refEq(st.refs[idx].ref, st.ref));
+      }
+    }
+    quoteEl.textContent = fmtDim(quoteForCandidate(c, st.ref), units);
+  };
+  if (refsHost) {
+    st.refs.forEach((r, i) => {
+      const row = document.createElement('button');
+      row.type = 'button';
+      row.className = 'cut-config-ref';
+      row.dataset.idx = String(i);
+      row.innerHTML = `<span class="cut-config-radio"></span><span class="cut-config-ref-label">${r.label}</span>`;
+      row.addEventListener('mouseenter', () => {
+        // Preview this reference on the diagram without committing the selection.
+        const prev = st.ref;
+        st.ref = r.ref;
+        renderStack();
+        st.ref = prev;
+      });
+      row.addEventListener('mouseleave', () => { renderStack(); });
+      row.addEventListener('click', (e) => {
+        e.stopPropagation();
+        st.ref = r.ref;
+        paintRefs();
+        renderStack();
+      });
+      refsHost.appendChild(row);
+    });
+  }
+  paintRefs();
+
+  menu.querySelector('[data-role="cancel"]')?.addEventListener('click', (e) => {
+    e.stopPropagation(); closeCutPopup();
   });
-  cancelItem.addEventListener('click', (e) => { e.stopPropagation(); closeEdgeMenu(); });
+  menu.querySelector('[data-role="make"]')?.addEventListener('click', (e) => {
+    e.stopPropagation();
+    const st2 = cutPopupState!;
+    const cand = st2.candidate, ref = st2.ref, save = st2.saveDatum;
+    closeCutPopup();
+    commitCandidate(cand, ref, save);
+  });
 
-  menu.append(armItem, datumItem, cancelItem);
   document.body.appendChild(menu);
 
-  // Position at the cursor, clamped to the viewport.
+  // Position near the click, clamped to the viewport.
   const mw = menu.offsetWidth, mh = menu.offsetHeight;
-  let x = ev.clientX + 2, y = ev.clientY + 2;
-  if (x + mw > window.innerWidth - 8) x = window.innerWidth - mw - 8;
+  let x = ev.clientX + 8, y = ev.clientY + 8;
+  if (x + mw > window.innerWidth - 8) x = ev.clientX - mw - 8;
   if (y + mh > window.innerHeight - 8) y = window.innerHeight - mh - 8;
   menu.style.left = `${Math.max(8, x)}px`;
   menu.style.top = `${Math.max(8, y)}px`;
 
-  edgeMenu = menu;
-  // Defer the outside-click listener so THIS click doesn't immediately close it.
-  setTimeout(() => document.addEventListener('mousedown', onEdgeMenuOutside, true), 0);
+  cutPopup = menu;
+  setTimeout(() => document.addEventListener('mousedown', onCutPopupOutside, true), 0);
 }
 
-function candLineCoords(c: Candidate, _W: number, _L: number): { x1: number; y1: number; x2: number; y2: number } {
+function candLineCoords(c: Candidate): { x1: number; y1: number; x2: number; y2: number } {
   if (c.vertical) {
     return { x1: c.coord, y1: c.region.y, x2: c.coord, y2: c.region.y + c.region.h };
   }
@@ -1226,23 +1421,24 @@ function candKey(c: Candidate): string {
 }
 function candEq(a: Candidate, b: Candidate): boolean { return candKey(a) === candKey(b); }
 
-/** Quote a hovered candidate the way the PDF would (kerfRef + measured-from
- *  edge). Resolution matches commitCandidate: armed edge → datum edge →
- *  built-in default. */
-function quoteForCandidate(c: Candidate): number {
+/** Quote a candidate for a given reference, the way the PDF would (kerfRef +
+ *  reference edge / chained line). */
+function quoteForCandidate(c: Candidate, ref: CutRef): number {
   if (!session) return 0;
-  const armedHere = !!(session.armed && sameRegion(session.armed.region, c.region));
-  let fromFar = false;
-  if (armedHere) {
-    fromFar = !!session.armed!.far;
-  } else {
-    const ds = datumSideFor(c.region, c.vertical, session.datums);
-    if (ds) fromFar = ds === 'right' || ds === 'bottom';
-  }
   const span = c.vertical ? c.region.w : c.region.h;
   const distance = c.vertical ? c.coord - c.region.x : c.coord - c.region.y;
   const mode = session.ctx.kerfRef;
   const allowance = mode === 'keeper' ? session.ctx.kerf : mode === 'spacing' ? session.ctx.kerf / 2 : 0;
+  if (c.isTrim) return Math.min(distance, span - distance);
+  if (ref.kind === 'prevCut') {
+    const s = ref.step;
+    const v = stepIsVertical(s, session.ctx.sheet.sheetW, session.ctx.sheet.sheetL);
+    const refLine = (v ? s.parentX : s.parentY) + s.distance;
+    return Math.max(0, Math.abs(c.coord - refLine) - allowance);
+  }
+  let fromFar = false;
+  if (ref.kind === 'far') fromFar = true;
+  else if (ref.kind === 'datum') fromFar = ref.side === 'right' || ref.side === 'bottom';
   const base = fromFar ? span - distance : distance;
   return Math.max(0, base - allowance);
 }
@@ -1261,6 +1457,7 @@ function appendCutLine(svg: SVGSVGElement, step: CutStep, W: number, L: number, 
 // ---------------------------------------------------------------------------
 // Cut list (right) — READOUT of the sequence built so far. Per built row:
 // undo-to-here (↩), flip measured edge (⇄), REF datum toggle. No reorder.
+// Trim rows are shown but not editable.
 // ---------------------------------------------------------------------------
 
 function quotedForRow(s: CutStep): number {
@@ -1269,16 +1466,32 @@ function quotedForRow(s: CutStep): number {
   if (s.isTrim) return Math.min(s.distance, span - s.distance);
   const mode = session.ctx.kerfRef;
   const allowance = mode === 'keeper' ? session.ctx.kerf : mode === 'spacing' ? session.ctx.kerf / 2 : 0;
+  // Chain dimensioning: quote against the referenced cut's line.
+  if (s.measureFromCut) {
+    const ref = session.built.find((x) => cutKeyFor(x) === s.measureFromCut);
+    if (ref) {
+      const v = stepIsVertical(s, session.ctx.sheet.sheetW, session.ctx.sheet.sheetL);
+      const thisLine = (v ? s.parentX : s.parentY) + s.distance;
+      const rv = stepIsVertical(ref, session.ctx.sheet.sheetW, session.ctx.sheet.sheetL);
+      const refLine = (rv ? ref.parentX : ref.parentY) + ref.distance;
+      return Math.max(0, Math.abs(thisLine - refLine) - allowance);
+    }
+  }
   const base = s.fromFar ? span - s.distance : s.distance;
   return Math.max(0, base - allowance);
 }
 
-function edgeLabel(s: CutStep): string {
+/** The reference caption for a built row: "from cut N" when chained,
+ *  "from datum" when measured from a datum edge, else "from L/R/T/B edge". */
+function refLabel(s: CutStep, allSteps: CutStep[]): string {
   if (!session) return '';
+  if (s.measureFromCut) {
+    const ref = allSteps.find((x) => cutKeyFor(x) === s.measureFromCut);
+    if (ref) return `from cut ${ref.index}`;
+  }
   const vertical = stepIsVertical(s, session.ctx.sheet.sheetW, session.ctx.sheet.sheetL);
-  return vertical
-    ? (s.fromFar ? 'R' : 'L')
-    : (s.fromFar ? 'B' : 'T');
+  const edge = vertical ? (s.fromFar ? 'R' : 'L') : (s.fromFar ? 'B' : 'T');
+  return `from ${edge} edge`;
 }
 
 function renderList(): void {
@@ -1287,19 +1500,18 @@ function renderList(): void {
   if (!host) return;
   const { ctx } = session;
   const steps = workingSteps();
-  const trimCount = session.trims.length;
   host.innerHTML = '';
 
   if (session.built.length === 0) {
     const hint = document.createElement('div');
     hint.className = 'cut-hint';
-    hint.textContent = 'Click a dashed line on the diagram to make the next cut. Click a piece edge to arm it as the measured-from edge or set it as a datum.';
+    hint.textContent = 'You start with the bare full sheet. Click a dashed line to make a cut — blue-gray lines are the edge trims, tan lines are part edges. A popup lets you save the cut as a datum and choose what to measure from.';
     host.appendChild(hint);
   }
 
   steps.forEach((s, i) => {
     const isTrim = !!s.isTrim;
-    const builtIdx = isTrim ? -1 : i - trimCount;
+    const builtIdx = i; // built and steps are 1:1 now (no pre-made trims)
 
     const row = document.createElement('div');
     row.className = 'cut-row' + (isTrim ? ' trim' : '');
@@ -1309,11 +1521,15 @@ function renderList(): void {
     const parent = `${Math.round(Math.max(s.parentW, s.parentH))}×${Math.round(Math.min(s.parentW, s.parentH))}`;
     const dimText = fmtDim(quotedForRow(s), ctx.units);
     const chips: string[] = [];
-    if (s.isDatum && !isTrim) chips.push('<span class="cut-chip ref">REF</span>');
-    if (isTrim) chips.push('<span class="cut-chip ref">datum</span>');
+    if (s.isDatum && !isTrim) chips.push('<span class="cut-chip ref">datum</span>');
+    if (isTrim) chips.push('<span class="cut-chip ref">trim</span>');
     if (s.sameSetting) chips.push('<span class="cut-chip same">same</span>');
 
-    const actions = isTrim ? '' : `
+    const sub = isTrim ? `strip · piece ${parent}` : `${refLabel(s, steps)} · piece ${parent}`;
+
+    const actions = isTrim
+      ? `<button type="button" class="cut-btn" data-act="truncate" title="Undo back to here">↩</button>`
+      : `
         <button type="button" class="cut-btn" data-act="truncate" title="Undo back to here">↩</button>
         <button type="button" class="cut-btn" data-act="flip" title="Flip measured-from edge">⇄</button>
         <button type="button" class="cut-btn${s.isDatum ? ' on' : ''}" data-act="datum" title="Mark reference (datum) cut">REF</button>`;
@@ -1322,16 +1538,16 @@ function renderList(): void {
       <span class="cut-num">${s.index}</span>
       <span class="cut-main">
         <span class="cut-kind">${kind} ${dimText}</span>
-        <span class="cut-sub">from ${edgeLabel(s)} edge · piece ${parent}</span>
+        <span class="cut-sub">${sub}</span>
       </span>
       <span class="cut-chips">${chips.join('')}</span>
       <span class="cut-actions">${actions}</span>`;
 
+    row.querySelector('[data-act="truncate"]')?.addEventListener('click', (e) => {
+      e.stopPropagation();
+      undoToHere(builtIdx); // keep [0..builtIdx) → truncates this row + all after
+    });
     if (!isTrim) {
-      row.querySelector('[data-act="truncate"]')?.addEventListener('click', (e) => {
-        e.stopPropagation();
-        undoToHere(builtIdx); // keep [0..builtIdx) → truncates this row + all after
-      });
       row.querySelector('[data-act="flip"]')?.addEventListener('click', (e) => {
         e.stopPropagation();
         toggleFlip(builtIdx);
