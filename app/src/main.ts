@@ -9,6 +9,7 @@
 
 import './style.css';
 
+import * as THREE from 'three';
 import { parseStep, type OcctResult } from './stepLoader';
 import { Viewer, bodyColor } from './viewer';
 import { analyzeBody, type BodyAnalysis } from './geometry';
@@ -43,7 +44,18 @@ import { openCutEditor, loadAllOverrides } from './cutEditor';
 import { splitOversizeParts, type SegmentGeo } from './splitParts';
 import { toRoman } from './nest';
 import type { SplitJoinGroup } from './pdf';
-import { fmtDim, fmtArea, fmtLinear, fmtMoney, toMm, fromMm, type Units } from './units';
+import { fmtDim, fmtArea, fmtLinear, fmtMoney, fmtSag, toMm, fromMm, type Units } from './units';
+import {
+  MATERIALS,
+  DEFAULT_MATERIAL_ID,
+  materialById,
+  panelWeightKg,
+  screenPanel,
+  solvePlate,
+  type EdgeSupport,
+  type EdgeSupports,
+  type Verdict,
+} from './cae';
 
 // --------------------------------------------------------------------------
 // State
@@ -60,6 +72,20 @@ interface BodyState {
   rotation: RotationMode;
   selected: boolean;
   color: string;
+  /** Per-body material override id, or null → use the job-default material. */
+  material: string | null;
+  /** Whether the inline "Analyze bending" CAE block is expanded. */
+  caeOpen?: boolean;
+  /** Force placement point in outline (2D mm) coords for the plate solve.
+   *  null → default to the panel centre. */
+  caeLoadPt?: { x: number; y: number } | null;
+  /** Per-edge support overrides (outline frame). null → auto-prefill. */
+  caeSupports?: EdgeSupports | null;
+  /** Force magnitude + unit as last entered in the CAE block. */
+  caeForceVal?: number;
+  caeForceUnit?: 'N' | 'kg' | 'lbf';
+  /** Last solve result summary line, shown in the CAE block. */
+  caeSolveMsg?: string;
 }
 
 const state: {
@@ -95,6 +121,8 @@ const state: {
   splitSegmentGeo: Map<string, SegmentGeo>;
   /** "Name → pieces" rows for parts the last estimate auto-split. */
   splitInfo: { name: string; pieces: number }[];
+  /** Job-default material card id (per-body overrides fall back to this). */
+  jobMaterial: string;
 } = {
   result: null,
   bodies: [],
@@ -114,6 +142,7 @@ const state: {
   lastTrialMetrics: [],
   splitSegmentGeo: new Map(),
   splitInfo: [],
+  jobMaterial: DEFAULT_MATERIAL_ID,
 };
 
 // --------------------------------------------------------------------------
@@ -149,6 +178,7 @@ const deletePresetBtn = $<HTMLButtonElement>('deletePresetBtn');
 const restartsSelect = $<HTMLSelectElement>('restarts');
 const cutStrategySelect = $<HTMLSelectElement>('cutStrategy');
 const thicknessOverrideSelect = $<HTMLSelectElement>('thicknessOverride');
+const materialSelect = $<HTMLSelectElement>('material');
 const splitOversizeRow = $('splitOversizeRow');
 const splitOversizeCheck = $<HTMLInputElement>('splitOversize');
 const viewerEl = $('viewer');
@@ -171,6 +201,39 @@ function syncSplitOversizeVisibility() {
 }
 cutStrategySelect.addEventListener('change', syncSplitOversizeVisibility);
 syncSplitOversizeVisibility();
+
+// --------------------------------------------------------------------------
+// Material — job default (persisted) + per-body override resolution.
+// --------------------------------------------------------------------------
+const MATERIAL_KEY = 'ply.material';
+for (const m of MATERIALS) {
+  const opt = document.createElement('option');
+  opt.value = m.id;
+  opt.textContent = m.name;
+  materialSelect.appendChild(opt);
+}
+{
+  const saved = localStorage.getItem(MATERIAL_KEY);
+  if (saved && MATERIALS.some((m) => m.id === saved)) state.jobMaterial = saved;
+}
+materialSelect.value = state.jobMaterial;
+materialSelect.addEventListener('change', () => {
+  state.jobMaterial = materialSelect.value;
+  try { localStorage.setItem(MATERIAL_KEY, state.jobMaterial); } catch {}
+  renderBodyList();
+  refreshWeakBodies();
+});
+
+/** Resolve a body's effective material card (override → job default). */
+function bodyMaterial(b: BodyState) {
+  return materialById(b.material ?? state.jobMaterial);
+}
+
+/** Weight in the user's current unit system, formatted. */
+function fmtWeight(kg: number): string {
+  if (state.units === 'in') return `${(kg * 2.2046226).toFixed(1)} lb`;
+  return `${kg.toFixed(2)} kg`;
+}
 
 const resultsEmpty = $('resultsEmpty');
 const resultsDetail = $('resultsDetail');
@@ -210,6 +273,7 @@ viewer.setSelectionListener(() => {
     b.selected = viewer.selection.has(b.id);
   }
   pushAllGrainToViewer();
+  refreshWeakBodies();
   renderBodyList();
   updateNestBtn();
 });
@@ -238,6 +302,23 @@ function pushGrainToViewer(b: BodyState) {
 }
 function pushAllGrainToViewer() {
   for (const b of state.bodies) pushGrainToViewer(b);
+}
+
+/** Screening verdict for a body under the default uniform load. */
+function bodyScreen(b: BodyState) {
+  return screenPanel(
+    b.analysis.length, b.analysis.width, b.analysis.thickness,
+    bodyMaterial(b), { grain: b.grain },
+  );
+}
+
+/** Recompute which bodies screen as 'weak' and tint them subtly in 3D. */
+function refreshWeakBodies() {
+  const weak: number[] = [];
+  for (const b of state.bodies) {
+    if (bodyScreen(b).verdict === 'weak') weak.push(b.id);
+  }
+  viewer.setWeakBodies(weak);
 }
 
 // --------------------------------------------------------------------------
@@ -482,6 +563,7 @@ async function handleFiles(files: FileList | File[]) {
             rotation: 'lock',
             selected: false,
             color: hex,
+            material: null,
           });
           viewer.addOcctMesh(m, id, hex, displayName);
           perFileValid++;
@@ -498,6 +580,7 @@ async function handleFiles(files: FileList | File[]) {
     for (const b of state.bodies) b.selected = true;
     syncViewerSelectionFromState();
     pushAllGrainToViewer();
+    refreshWeakBodies();
     renderBodyList();
     updateNestBtn();
     const dropped = totalRaw - totalAdded - totalSkippedNotSheet;
@@ -681,6 +764,9 @@ function buildBodyRow(b: BodyState): HTMLDivElement {
   if (b.selected) {
     const extra = document.createElement('div');
     extra.className = 'body-extra';
+    const matOptions = MATERIALS.map((m) =>
+      `<option value="${m.id}" ${b.material === m.id ? 'selected' : ''}>${escapeHtml(m.name)}</option>`,
+    ).join('');
     extra.innerHTML = `
       <label>Qty
         <input type="number" min="1" step="1" value="${b.qty}" data-field="qty" />
@@ -697,6 +783,12 @@ function buildBodyRow(b: BodyState): HTMLDivElement {
           <option value="lock" ${b.rotation === 'lock' ? 'selected' : ''}>No rotation</option>
           <option value="flip90" ${b.rotation === 'flip90' ? 'selected' : ''}>Allow 90° flip</option>
         </select>
+      </label>
+      <label style="grid-column: 1 / -1">Material
+        <select data-field="material">
+          <option value="" ${b.material == null ? 'selected' : ''}>Job default</option>
+          ${matOptions}
+        </select>
       </label>`;
     extra.querySelectorAll<HTMLInputElement | HTMLSelectElement>('[data-field]').forEach((el) => {
       el.addEventListener('change', () => {
@@ -705,13 +797,364 @@ function buildBodyRow(b: BodyState): HTMLDivElement {
         if (field === 'grain') {
           b.grain = (el as HTMLSelectElement).value as GrainLock;
           pushGrainToViewer(b);
+          refreshWeakBodies();
+          renderBodyList();
         }
         if (field === 'rotation') b.rotation = (el as HTMLSelectElement).value as RotationMode;
+        if (field === 'material') {
+          const v = (el as HTMLSelectElement).value;
+          b.material = v === '' ? null : v;
+          refreshWeakBodies();
+          renderBodyList();
+        }
       });
     });
     row.appendChild(extra);
+
+    // --- Screening / weight line + Analyze bending block ---
+    row.appendChild(buildCaeBlock(b));
   }
   return row;
+}
+
+/** Build the per-body structure line (weight + screening verdict) plus the
+ *  collapsible "Analyze bending" CAE panel. */
+function buildCaeBlock(b: BodyState): HTMLDivElement {
+  const wrap = document.createElement('div');
+  wrap.className = 'body-cae';
+
+  const scr = bodyScreen(b);
+  const kg = panelWeightKg(b.analysis.outline, b.analysis.thickness, bodyMaterial(b));
+  const verdictLabel: Record<Verdict, string> = { ok: 'OK', borderline: 'borderline', weak: 'weak' };
+  const line = document.createElement('div');
+  line.className = 'cae-line';
+  line.innerHTML = `
+    <span class="cae-weight">${escapeHtml(fmtWeight(kg))}</span>
+    <span class="cae-sep">·</span>
+    <span class="cae-verdict cae-${scr.verdict}">sag ~${fmtSag(scr.sagMm, state.units)} over ${fmtDim(scr.span, state.units)} — ${verdictLabel[scr.verdict]}</span>`;
+  wrap.appendChild(line);
+
+  const toggle = document.createElement('button');
+  toggle.type = 'button';
+  toggle.className = 'cae-toggle ghost';
+  toggle.textContent = b.caeOpen ? 'Hide bending analysis' : 'Analyze bending';
+  toggle.addEventListener('click', () => {
+    b.caeOpen = !b.caeOpen;
+    if (!b.caeOpen) viewer.cancelForcePlacement();
+    renderBodyList();
+  });
+  wrap.appendChild(toggle);
+
+  if (b.caeOpen) wrap.appendChild(buildCaePanel(b));
+  return wrap;
+}
+
+// --------------------------------------------------------------------------
+// Quick CAE — interactive bending analysis panel
+// --------------------------------------------------------------------------
+type Vec3 = [number, number, number];
+const v3add = (a: Vec3, b: Vec3): Vec3 => [a[0] + b[0], a[1] + b[1], a[2] + b[2]];
+const v3scale = (a: Vec3, s: number): Vec3 => [a[0] * s, a[1] * s, a[2] * s];
+
+/** The world corner where the part outline's (0,0) sits, plus the world axes
+ *  that outline X (length) and outline Y (width) run along. Rectangular parts
+ *  map exactly; skew parts are approximated by centring the bbox on the face
+ *  centroid. */
+function outlineFrame(b: BodyState): { origin: Vec3; uAxis: Vec3; vAxis: Vec3; normal: Vec3 } {
+  const a = b.analysis;
+  const uAxis = a.lengthDir as Vec3;
+  const vAxis = a.widthDir as Vec3;
+  const normal = a.faceNormal as Vec3;
+  const w = a.outline.bbox.w;
+  const h = a.outline.bbox.h;
+  // faceCenter is the +face centroid; step back to the (0,0) corner.
+  const origin = v3add(
+    v3add(a.faceCenter as Vec3, v3scale(uAxis, -w / 2)),
+    v3scale(vAxis, -h / 2),
+  );
+  return { origin, uAxis, vAxis, normal };
+}
+
+/** World AABB of a body (from its analysis outline extruded by thickness). */
+function bodyWorldAabb(b: BodyState): { min: Vec3; max: Vec3 } {
+  const f = outlineFrame(b);
+  const w = b.analysis.outline.bbox.w;
+  const h = b.analysis.outline.bbox.h;
+  const t = b.analysis.thickness;
+  const corners: Vec3[] = [];
+  for (const su of [0, w]) for (const sv of [0, h]) for (const sn of [-t / 2, t / 2]) {
+    corners.push(v3add(v3add(v3add(f.origin, v3scale(f.uAxis, su)), v3scale(f.vAxis, sv)), v3scale(f.normal, sn)));
+  }
+  const min: Vec3 = [Infinity, Infinity, Infinity];
+  const max: Vec3 = [-Infinity, -Infinity, -Infinity];
+  for (const c of corners) for (let k = 0; k < 3; k++) {
+    if (c[k] < min[k]) min[k] = c[k];
+    if (c[k] > max[k]) max[k] = c[k];
+  }
+  return { min, max };
+}
+
+/** True if two world AABBs are within `tol` mm of touching (overlap or gap ≤ tol). */
+function aabbAdjacent(a: { min: Vec3; max: Vec3 }, b: { min: Vec3; max: Vec3 }, tol: number): boolean {
+  for (let k = 0; k < 3; k++) {
+    if (a.min[k] - b.max[k] > tol) return false;
+    if (b.min[k] - a.max[k] > tol) return false;
+  }
+  return true;
+}
+
+/** Auto-prefill the four edge supports: an edge defaults to 'simple' when the
+ *  midpoint of that outline edge is near (≤2 mm) another SELECTED body's world
+ *  AABB, else 'free'. */
+function autoSupports(b: BodyState): EdgeSupports {
+  const f = outlineFrame(b);
+  const w = b.analysis.outline.bbox.w;
+  const h = b.analysis.outline.bbox.h;
+  const others = state.bodies.filter((o) => o !== b && o.selected).map((o) => bodyWorldAabb(o));
+  const edgeMid = (edge: 'top' | 'bottom' | 'left' | 'right'): Vec3 => {
+    const mid = { top: [w / 2, h], bottom: [w / 2, 0], left: [0, h / 2], right: [w, h / 2] }[edge];
+    return v3add(v3add(f.origin, v3scale(f.uAxis, mid[0])), v3scale(f.vAxis, mid[1]));
+  };
+  const near = (edge: 'top' | 'bottom' | 'left' | 'right'): boolean => {
+    const p = edgeMid(edge);
+    const pAabb = { min: p, max: p };
+    return others.some((o) => aabbAdjacent(pAabb, o, 2));
+  };
+  const pick = (edge: 'top' | 'bottom' | 'left' | 'right'): EdgeSupport => (near(edge) ? 'simple' : 'free');
+  return { top: pick('top'), bottom: pick('bottom'), left: pick('left'), right: pick('right') };
+}
+
+function forceToN(val: number, unit: 'N' | 'kg' | 'lbf'): number {
+  if (unit === 'kg') return val * 9.80665;
+  if (unit === 'lbf') return val * 4.4482216;
+  return val;
+}
+
+/** Blue→green→yellow→red heat color for t ∈ [0,1]. */
+function heatColor(t: number): [number, number, number] {
+  t = Math.max(0, Math.min(1, t));
+  // 4-stop ramp
+  const stops: [number, [number, number, number]][] = [
+    [0.0, [40, 90, 220]],
+    [0.34, [40, 190, 120]],
+    [0.67, [235, 205, 50]],
+    [1.0, [220, 55, 45]],
+  ];
+  for (let i = 0; i < stops.length - 1; i++) {
+    const [t0, c0] = stops[i];
+    const [t1, c1] = stops[i + 1];
+    if (t <= t1) {
+      const f = (t - t0) / (t1 - t0 || 1);
+      return [
+        Math.round(c0[0] + (c1[0] - c0[0]) * f),
+        Math.round(c0[1] + (c1[1] - c0[1]) * f),
+        Math.round(c0[2] + (c1[2] - c0[2]) * f),
+      ];
+    }
+  }
+  return stops[stops.length - 1][1];
+}
+
+/** Build a CanvasTexture of the deflection field for the overlay. */
+function buildHeatTexture(res: import('./cae').SolveResult): THREE.CanvasTexture {
+  const { nx, ny, w, active, maxAbsW } = res;
+  const canvas = document.createElement('canvas');
+  canvas.width = nx;
+  canvas.height = ny;
+  const ctx = canvas.getContext('2d')!;
+  const img = ctx.createImageData(nx, ny);
+  const denom = maxAbsW || 1;
+  for (let iy = 0; iy < ny; iy++) {
+    for (let ix = 0; ix < nx; ix++) {
+      const n = iy * nx + ix;
+      // Flip Y so texture V matches outline +Y (canvas is top-down).
+      const dst = ((ny - 1 - iy) * nx + ix) * 4;
+      if (!active[n] || Number.isNaN(w[n])) {
+        img.data[dst + 3] = 0; // transparent outside the part
+        continue;
+      }
+      const [r, g, bl] = heatColor(Math.abs(w[n]) / denom);
+      img.data[dst] = r;
+      img.data[dst + 1] = g;
+      img.data[dst + 2] = bl;
+      img.data[dst + 3] = 255;
+    }
+  }
+  ctx.putImageData(img, 0, 0);
+  const tex = new THREE.CanvasTexture(canvas);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  tex.magFilter = THREE.LinearFilter;
+  tex.minFilter = THREE.LinearFilter;
+  return tex;
+}
+
+function buildCaePanel(b: BodyState): HTMLDivElement {
+  const panel = document.createElement('div');
+  panel.className = 'cae-panel';
+
+  const mat = bodyMaterial(b);
+  if (!b.caeSupports) b.caeSupports = autoSupports(b);
+  if (b.caeForceVal == null) { b.caeForceVal = 25; b.caeForceUnit = 'kg'; }
+  const supports = b.caeSupports;
+
+  const edgeCycle: Record<EdgeSupport, EdgeSupport> = { free: 'simple', simple: 'fixed', fixed: 'free' };
+  const edgeLabel: Record<EdgeSupport, string> = { free: 'free', simple: 'supported', fixed: 'fixed' };
+
+  panel.innerHTML = `
+    <div class="cae-row cae-mat">Material: <strong>${escapeHtml(mat.name)}</strong></div>
+    <div class="cae-row cae-force">
+      <label>Load
+        <span class="cae-force-input">
+          <input type="number" min="0" step="1" value="${b.caeForceVal}" data-cae="forceVal" />
+          <select data-cae="forceUnit">
+            <option value="N" ${b.caeForceUnit === 'N' ? 'selected' : ''}>N</option>
+            <option value="kg" ${b.caeForceUnit === 'kg' ? 'selected' : ''}>kg</option>
+            <option value="lbf" ${b.caeForceUnit === 'lbf' ? 'selected' : ''}>lbf</option>
+          </select>
+        </span>
+      </label>
+    </div>
+    <div class="cae-row cae-edges">
+      <span class="cae-edges-title">Edge supports</span>
+      <div class="cae-edge-grid">
+        <button type="button" class="cae-edge" data-edge="top">Top: <strong>${edgeLabel[supports.top]}</strong></button>
+        <button type="button" class="cae-edge" data-edge="bottom">Bottom: <strong>${edgeLabel[supports.bottom]}</strong></button>
+        <button type="button" class="cae-edge" data-edge="left">Left: <strong>${edgeLabel[supports.left]}</strong></button>
+        <button type="button" class="cae-edge" data-edge="right">Right: <strong>${edgeLabel[supports.right]}</strong></button>
+      </div>
+    </div>
+    <div class="cae-row cae-actions">
+      <button type="button" class="ghost" data-cae="place">Place force</button>
+      <button type="button" class="ghost" data-cae="solve">Solve</button>
+      <button type="button" class="ghost" data-cae="clear">Clear</button>
+    </div>
+    <div class="cae-row cae-result">${b.caeSolveMsg ? escapeHtml(b.caeSolveMsg) : '<span class="cae-hint">Point load defaults to panel centre.</span>'}</div>
+  `;
+
+  // Force inputs
+  panel.querySelector<HTMLInputElement>('[data-cae="forceVal"]')!.addEventListener('change', (e) => {
+    b.caeForceVal = Math.max(0, parseFloat((e.target as HTMLInputElement).value) || 0);
+  });
+  panel.querySelector<HTMLSelectElement>('[data-cae="forceUnit"]')!.addEventListener('change', (e) => {
+    b.caeForceUnit = (e.target as HTMLSelectElement).value as 'N' | 'kg' | 'lbf';
+  });
+
+  // Edge toggle buttons — cycle free→simple→fixed.
+  panel.querySelectorAll<HTMLButtonElement>('.cae-edge').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      const edge = btn.dataset.edge as keyof EdgeSupports;
+      b.caeSupports![edge] = edgeCycle[b.caeSupports![edge]];
+      renderBodyList();
+    });
+  });
+
+  // Place force — arm the viewer to capture the next click on this body.
+  panel.querySelector<HTMLButtonElement>('[data-cae="place"]')!.addEventListener('click', (e) => {
+    const btn = e.target as HTMLButtonElement;
+    btn.classList.add('armed');
+    btn.textContent = 'Click the panel…';
+    viewer.beginForcePlacement(b.id, (point, normal) => {
+      // Project the world click point onto the outline frame → (ox, oy).
+      const f = outlineFrame(b);
+      const rel: Vec3 = [point[0] - f.origin[0], point[1] - f.origin[1], point[2] - f.origin[2]];
+      const ox = rel[0] * f.uAxis[0] + rel[1] * f.uAxis[1] + rel[2] * f.uAxis[2];
+      const oy = rel[0] * f.vAxis[0] + rel[1] * f.vAxis[1] + rel[2] * f.vAxis[2];
+      b.caeLoadPt = {
+        x: Math.max(0, Math.min(b.analysis.outline.bbox.w, ox)),
+        y: Math.max(0, Math.min(b.analysis.outline.bbox.h, oy)),
+      };
+      const arrowLen = Math.max(30, Math.min(b.analysis.length, b.analysis.width) * 0.35);
+      viewer.showForceArrow(b.id, point, normal, arrowLen);
+      b.caeSolveMsg = `Force placed at (${fmtDim(b.caeLoadPt.x, state.units)}, ${fmtDim(b.caeLoadPt.y, state.units)}). Click Solve.`;
+      renderBodyList();
+    });
+  });
+
+  // Solve — run the plate solver (yield first so the button can show busy).
+  panel.querySelector<HTMLButtonElement>('[data-cae="solve"]')!.addEventListener('click', async (e) => {
+    const btn = e.target as HTMLButtonElement;
+    btn.disabled = true;
+    btn.textContent = 'Solving…';
+    await new Promise((r) => setTimeout(r, 0));
+    try {
+      runCaeSolve(b);
+    } catch (err) {
+      console.error('CAE solve failed', err);
+      b.caeSolveMsg = 'Solve failed — see console.';
+    }
+    renderBodyList();
+  });
+
+  // Clear — remove overlay + arrow.
+  panel.querySelector<HTMLButtonElement>('[data-cae="clear"]')!.addEventListener('click', () => {
+    viewer.clearCae(b.id);
+    b.caeLoadPt = null;
+    b.caeSolveMsg = undefined;
+    renderBodyList();
+  });
+
+  return panel;
+}
+
+/** Run the plate solve for a body, paint the heatmap + report the result. */
+function runCaeSolve(b: BodyState) {
+  const mat = bodyMaterial(b);
+  const forceN = forceToN(b.caeForceVal ?? 25, b.caeForceUnit ?? 'kg');
+  const bbox = b.analysis.outline.bbox;
+  const loadPt = b.caeLoadPt ?? { x: bbox.w / 2, y: bbox.h / 2 };
+  const supports = b.caeSupports ?? autoSupports(b);
+  const grainAlongLength = b.grain !== 'width'; // 'free'/'length' → grain along length
+
+  // Count constrained edges — a plate needs enough supports to prevent
+  // rigid-body motion. One simply-supported edge alone leaves the panel a
+  // mechanism (it can still tilt about the in-plane axis), so the solve
+  // diverges. Require either ≥1 fixed edge or ≥2 supported/fixed edges.
+  const edgeKinds = [supports.top, supports.bottom, supports.left, supports.right];
+  const nFixed = edgeKinds.filter((k) => k === 'fixed').length;
+  const nSupported = edgeKinds.filter((k) => k !== 'free').length;
+  if (nFixed === 0 && nSupported < 2) {
+    viewer.clearDeflectionOverlay(b.id);
+    b.caeSolveMsg = 'Under-constrained: support at least two edges (or fix one) so the panel can\'t tip. Click an edge to add a support.';
+    return;
+  }
+
+  const res = solvePlate({
+    outline: b.analysis.outline,
+    thicknessMm: b.analysis.thickness,
+    material: mat,
+    grainAlongLength,
+    supports,
+    forceN,
+    loadX: loadPt.x,
+    loadY: loadPt.y,
+  });
+
+  if (!res.converged || !Number.isFinite(res.maxAbsW) || res.maxAbsW > b.analysis.length) {
+    // Divergent / non-physical (usually still under-constrained). Don't paint.
+    viewer.clearDeflectionOverlay(b.id);
+    b.caeSolveMsg = 'Solve did not converge — the supports leave the panel free to move. Add more edge supports.';
+    return;
+  }
+
+  // Paint the heatmap on the face.
+  const tex = buildHeatTexture(res);
+  const f = outlineFrame(b);
+  viewer.showDeflectionOverlay(b.id, tex, {
+    origin: f.origin,
+    uAxis: f.uAxis,
+    vAxis: f.vAxis,
+    normal: f.normal,
+    w: bbox.w,
+    h: bbox.h,
+  });
+
+  const span = Math.max(b.analysis.length, b.analysis.width);
+  const limit = span / 200;
+  const verdict = res.maxAbsW < span / 300 ? 'OK' : res.maxAbsW < limit ? 'borderline' : 'weak';
+  b.caeSolveMsg =
+    `Max sag ${fmtSag(res.maxAbsW, state.units)} at ` +
+    `(${fmtDim(res.maxAt[0], state.units)}, ${fmtDim(res.maxAt[1], state.units)}) — ` +
+    `${verdict} vs span/200 (${fmtSag(limit, state.units)})`;
 }
 
 function syncViewerSelectionFromState() {
@@ -1565,6 +2008,32 @@ function unplacedStepParts(): StepPart[] {
  * group per auto-split parent, segments in join order with the sheet panel
  * label ('1a-i') each one was nested under.
  */
+/** Build the PDF Structure rows: one per selected body that placed at least
+ *  one panel, screened under the default 20 kg uniform load. `idByBodyPartId`
+ *  maps a body's partId → the panel codes it placed (e.g. ["1a", "3b"]). */
+function buildStructureRows(idByBodyPartId: Map<string, string[]>): import('./pdf').StructureRow[] {
+  const rows: import('./pdf').StructureRow[] = [];
+  for (const b of state.bodies) {
+    const codes = idByBodyPartId.get(String(b.id));
+    if (!codes || codes.length === 0) continue;
+    const mat = bodyMaterial(b);
+    const scr = screenPanel(b.analysis.length, b.analysis.width, b.analysis.thickness, mat, { grain: b.grain, loadKg: 20 });
+    rows.push({
+      code: codes.join(', '),
+      name: b.name,
+      span: scr.span,
+      material: mat.name,
+      loadKg: 20,
+      sagMm: scr.sagMm,
+      verdict: scr.verdict,
+    });
+  }
+  // Weakest first so the risky panels lead the table.
+  const rank: Record<string, number> = { weak: 0, borderline: 1, ok: 2 };
+  rows.sort((a, b) => (rank[a.verdict] - rank[b.verdict]) || (b.sagMm - a.sagMm));
+  return rows;
+}
+
 function buildSplitJoins(): SplitJoinGroup[] {
   if (!state.lastNest || state.splitSegmentGeo.size === 0) return [];
   // First placement of each segment id → its sheet + label.
@@ -2004,6 +2473,10 @@ async function exportPdf(btn: HTMLButtonElement, paper: string) {
     }
   }
 
+  // Structure rows — one per body, with the screening sag verdict under the
+  // default 20 kg uniform load. Codes list every placed instance of the body.
+  const structure = buildStructureRows(idByBodyPartId);
+
   // Use a clean WHITE scene background + faint shadow floor for all PDF
   // snapshots — the dark studio backdrop the live viewer uses prints
   // poorly. exitPdfBg restores the live look at the end.
@@ -2111,6 +2584,7 @@ async function exportPdf(btn: HTMLButtonElement, paper: string) {
     cabinets,
     cnc: isCncStrategy(state.lastStrategy),
     splitJoins: buildSplitJoins(),
+    structure,
   });
   setProgress('Saving…', 98);
   await yieldFrame();

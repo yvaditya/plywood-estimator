@@ -11,7 +11,7 @@
 
 import { jsPDF } from 'jspdf';
 import type { NestResult, NestSheet, PlacedPart } from './nest';
-import { fmtDim, fmtArea, type Units } from './units';
+import { fmtDim, fmtArea, fmtSag, type Units } from './units';
 import { assignPartLabels, allCutSteps, groupPanelsBySize, groupAllPanelsBySize, type PartLabel, type PanelSizeRow, type SheetOverrides, type KerfRef } from './instructions';
 
 export type PdfPaper =
@@ -61,6 +61,27 @@ export interface PdfOptions {
   /** Dovetail auto-split join guide — one group per original part that was
    *  split. Renders a section showing how the segments reassemble. */
   splitJoins?: SplitJoinGroup[];
+  /** Quick-CAE structural screening rows for the Structure section. One row
+   *  per panel size; sag is the formula-screening estimate under the default
+   *  uniform load. */
+  structure?: StructureRow[];
+}
+
+export interface StructureRow {
+  /** Panel code(s), e.g. "1a, 3b". */
+  code: string;
+  /** Panel display name. */
+  name: string;
+  /** Free span used for the estimate (mm). */
+  span: number;
+  /** Material name. */
+  material: string;
+  /** Uniform load assumption (kg). */
+  loadKg: number;
+  /** Predicted mid-span sag (mm). */
+  sagMm: number;
+  /** 'ok' | 'borderline' | 'weak'. */
+  verdict: 'ok' | 'borderline' | 'weak';
 }
 
 export interface SplitJoinSegment {
@@ -260,6 +281,14 @@ export function buildPdf(result: NestResult, opt: PdfOptions): jsPDF {
     addPage('Panels');
     nav.toc.push({ title: 'Panels', desc: 'Every panel size in the job — codes point to the sheet layouts.', target: 'Panels' });
     drawPanelTable(doc, 'Panels', groupAllPanelsBySize(result), opt, dims, () => addPage('Panels'));
+  }
+
+  // 5b. STRUCTURE — quick bending screen per panel. Applies to every job
+  //     (saw and CNC) since it's about the finished panel, not the cut.
+  if (opt.structure && opt.structure.length > 0) {
+    addPage('Structure');
+    nav.toc.push({ title: 'Structure', desc: 'Predicted sag per panel under a loaded-shelf assumption.', target: 'Structure' });
+    drawStructureTable(doc, opt.structure, opt, dims, () => addPage('Structure'));
   }
 
   // 6. CUT SHEETS grouped by thickness — divider page per group when the job
@@ -1740,6 +1769,123 @@ function drawPanelRow(
   doc.text(fmtDim(r.width, opt.units), g.cWid, textY, { align: 'right' });
   doc.text(fmtDim(r.thickness, opt.units), g.cThick, textY, { align: 'right' });
   doc.setTextColor(0);
+}
+
+// ---------------------------------------------------------------------------
+// Structure section — quick bending screen per panel size. One compact table
+// mirroring the panel-table hairline style: code · span · material · load ·
+// predicted sag · verdict. Sag comes from the beam-strip screen in cae.ts.
+// ---------------------------------------------------------------------------
+function drawStructureTable(
+  doc: jsPDF,
+  rows: StructureRow[],
+  opt: PdfOptions,
+  dims: { w: number; h: number },
+  openNewPage: () => void,
+) {
+  const PAGE_W = dims.w;
+  const PAGE_H = dims.h;
+  if (rows.length === 0) return;
+
+  // Header — title + subtitle explaining the load assumption.
+  doc.setFont('helvetica', 'bold');
+  doc.setFontSize(13);
+  doc.setTextColor(20);
+  doc.text('Structure', PAGE_PAD, PAGE_PAD + 10);
+  doc.setFont('helvetica', 'normal');
+  doc.setFontSize(9);
+  doc.setTextColor(120);
+  doc.text(
+    'Predicted mid-span sag under a uniform load (a loaded shelf). OK if sag < span/300.',
+    PAGE_W - PAGE_PAD, PAGE_PAD + 10, { align: 'right' },
+  );
+  doc.setTextColor(0);
+
+  const left = PAGE_PAD;
+  const tableW = Math.min(PAGE_W - 2 * PAGE_PAD, 700);
+  const right = left + tableW;
+  const rowH = 22;
+  const cCode = left;
+  const cName = left + 70;
+  // right-aligned numeric columns
+  const cVerdict = right;
+  const cSag = right - 90;
+  const cLoad = right - 175;
+  const cMat = right - 250;   // left-aligned material, but anchor here
+  const cSpan = right - 370;
+
+  const drawHeader = (y: number): number => {
+    doc.setFont('helvetica', 'bold');
+    doc.setFontSize(8.5);
+    doc.setTextColor(110);
+    doc.text('CODE', cCode, y);
+    doc.text('PANEL', cName, y);
+    doc.text('SPAN', cSpan, y, { align: 'right' });
+    doc.text('MATERIAL', cMat - 30, y);
+    doc.text('LOAD', cLoad, y, { align: 'right' });
+    doc.text('SAG', cSag, y, { align: 'right' });
+    doc.text('VERDICT', cVerdict, y, { align: 'right' });
+    doc.setDrawColor(215);
+    doc.setLineWidth(0.5);
+    doc.line(left, y + 5, right, y + 5);
+    doc.setTextColor(0);
+    return y + 5 + 15;
+  };
+
+  const TOP = PAGE_PAD + 24;
+  const BOTTOM = PAGE_H - PAGE_PAD;
+  let y = drawHeader(TOP);
+
+  const verdictColor: Record<StructureRow['verdict'], [number, number, number]> = {
+    ok: [15, 123, 108],
+    borderline: [217, 115, 13],
+    weak: [192, 57, 43],
+  };
+
+  for (const r of rows) {
+    if (y + rowH > BOTTOM) {
+      openNewPage();
+      doc.setFont('helvetica', 'bold');
+      doc.setFontSize(13);
+      doc.setTextColor(20);
+      doc.text('Structure (cont.)', PAGE_PAD, PAGE_PAD + 10);
+      doc.setTextColor(0);
+      y = drawHeader(TOP);
+    }
+    const textY = y + 2;
+    doc.setFont('helvetica', 'bold');
+    doc.setFontSize(9.5);
+    doc.setTextColor(30);
+    doc.text(r.code, cCode, textY, { maxWidth: cName - cCode - 6 });
+    doc.setFont('helvetica', 'normal');
+    doc.setFontSize(9.5);
+    doc.setTextColor(60);
+    doc.text(clip(doc, r.name, cSpan - cName - 30), cName, textY);
+    doc.setTextColor(40);
+    doc.text(fmtDim(r.span, opt.units), cSpan, textY, { align: 'right' });
+    doc.text(clip(doc, r.material, cLoad - (cMat - 30) - 6), cMat - 30, textY);
+    doc.text(`${r.loadKg.toFixed(0)} kg`, cLoad, textY, { align: 'right' });
+    doc.text(fmtSag(r.sagMm, opt.units), cSag, textY, { align: 'right' });
+    const [vr, vg, vb] = verdictColor[r.verdict];
+    doc.setFont('helvetica', 'bold');
+    doc.setTextColor(vr, vg, vb);
+    doc.text(r.verdict.toUpperCase(), cVerdict, textY, { align: 'right' });
+    doc.setTextColor(0);
+
+    doc.setDrawColor(235);
+    doc.setLineWidth(0.4);
+    doc.line(left, y + rowH - 12, right, y + rowH - 12);
+    y += rowH;
+  }
+  doc.setTextColor(0);
+}
+
+/** Truncate `text` to fit `maxW` pt, appending an ellipsis if clipped. */
+function clip(doc: jsPDF, text: string, maxW: number): string {
+  if (doc.getTextWidth(text) <= maxW) return text;
+  let s = text;
+  while (s.length > 1 && doc.getTextWidth(s + '…') > maxW) s = s.slice(0, -1);
+  return s + '…';
 }
 
 // ---------------------------------------------------------------------------
