@@ -36,7 +36,10 @@ Quick orientation for a fresh session working on this repo.
 | `shoppingList.ts` | Buy/have rollup + CSV export, localStorage persistence |
 | `dxf.ts` | DXF R12 writer (layers SHEET / MARGIN / PARTS / LABELS / DIMS) |
 | `pdf.ts` | jsPDF report (cover → contents → quick ref → shopping → job-wide Panels TABLE → per-sheet (overview + panels table + cut sequence) → per-cabinet assembly + IKEA-style step pages) |
-| `units.ts` | mm/inch conversion, fractional-inch formatting, money fmt |
+| `cae.ts` | Quick CAE: material cards, panel weight, beam-strip sag screening, orthotropic Mindlin plate FEM (validated by tests/cae_check.ts — keep it passing) |
+| `cutEditor.ts` | "Edit cuts" popup: dependency-constrained manual reorder (sequenceLegal replays the WHOLE candidate order), per-cut measured-from-edge flip (fromFar), datum/REF marking; overrides keyed by layoutSignature + cutKeyFor in localStorage |
+| `trainingLog.ts` | Opt-in JSONL recorder of manual sequence edits (full layout + auto sequence context per session) — source data for future learned ordering modes |
+| `units.ts` | mm/inch conversion, fractional-inch formatting, money fmt, fmtSag (decimal, sub-mm safe) |
 | `style.css` | Notion-style light theme |
 
 ## Cut strategies (`packRect.CutStrategy`)
@@ -276,6 +279,19 @@ the expand state across renders.
   generations evaluated in parallel via 'cnc-orders' worker jobs. Saw
   strategies get doubled restarts + a fresh shuffle stream (seedOffset in
   buildTrialSchedule). Every click mines a different seed.
+
+## Cut-editor legality gotcha
+Layout-cut parents live in the USABLE frame (both margins removed), but the
+trims never cut the FAR short edge — replaying trims over the raw sheet
+leaves regions one margin too wide. `seedRegions` in cutEditor.ts shaves
+that margin after the trims; without it every reorder reads illegal.
+
+## Sidebar
+Workflow-ordered tinted groups (Import → Stock → Cutting → Parts → Job &
+export → Shopping), full-bleed ~97%-lightness tints per group, flat chrome.
+Kerf is a select (1.8 mm default / 2.5 mm / custom); margin default 0.5";
+`#kerfRef` (keeper / center / spacing) drives quotedDistance + far-trim
+placement; `#material` (CAE material cards) sits in Stock.
 
 ## UI rules from the user (don't violate without asking)
 - Notion-style **light theme** for the chrome; 3D viewer is intentionally
