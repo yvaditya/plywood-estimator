@@ -99,3 +99,82 @@ export function getDirectSolver(): Promise<DirectSolver | null> {
   if (!loadPromise) loadPromise = loadBackend();
   return loadPromise;
 }
+
+// ===========================================================================
+// PyNite SIDECAR backend — a LOCAL Python structural-FE service (server/,
+// FastAPI + PyNite) on http://localhost:8642. When reachable it is the PRIMARY
+// assembly solver: we serialize the SAME preprocessed model cae.ts builds, POST
+// it, and map the returned nodal displacements back into our DOF vector for the
+// EXISTING stress recovery. Detection is once per session with a short timeout;
+// any failure (not running, not installed, solve error) falls back to the WASM
+// Eigen LDLT / PCG chain so the app always produces a result.
+// ===========================================================================
+import type { SidecarModel, AsyncAssemblySolver } from './cae';
+
+/** Sidecar base URL. The launcher starts uvicorn on 8642; override via a global
+ *  for tests if ever needed. */
+const PYNITE_BASE = (globalThis as { __pyniteBase?: string }).__pyniteBase || 'http://localhost:8642';
+
+let pyniteProbe: Promise<AsyncAssemblySolver | null> | undefined;
+
+/** Fetch with a hard timeout (AbortController) — detection must never hang the
+ *  UI when nothing is listening on the port. */
+async function fetchTimeout(url: string, init: RequestInit, ms: number): Promise<Response> {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), ms);
+  try {
+    return await fetch(url, { ...init, signal: ctrl.signal });
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function probePynite(): Promise<AsyncAssemblySolver | null> {
+  // A test escape hatch to force-disable the sidecar (parallels __caeForcePcg).
+  if ((globalThis as { __caeNoPynite?: boolean }).__caeNoPynite) return null;
+  try {
+    const res = await fetchTimeout(`${PYNITE_BASE}/health`, { method: 'GET' }, 800);
+    if (!res.ok) return null;
+    const info = await res.json().catch(() => null);
+    if (!info || info.name !== 'pynite') return null;
+    const version = String(info.version ?? '?');
+
+    return {
+      name: `PyNite ${version} (local sidecar)`,
+      async solve(model: SidecarModel) {
+        try {
+          const t0 = (typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now();
+          const r = await fetchTimeout(`${PYNITE_BASE}/solve`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(model),
+          }, 120_000);
+          if (!r.ok) return null;
+          const out = await r.json().catch(() => null);
+          if (!out || !out.ok || !Array.isArray(out.disp)) return null;
+          const disp = Float64Array.from(out.disp as number[]);
+          const now = (typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now();
+          const solveMs = out.stats?.solveMs ?? 0;
+          const buildMs = out.stats?.buildMs ?? 0;
+          const label = out.stats?.label ?? 'PyNite (isotropic E_eff)';
+          void (now - t0);
+          return { disp, solveMs, buildMs, label };
+        } catch {
+          return null;
+        }
+      },
+    };
+  } catch {
+    // Not running / unreachable / CORS — no sidecar this session.
+    return null;
+  }
+}
+
+/**
+ * Resolve the PyNite sidecar backend, or null if it isn't reachable. Memoized —
+ * the /health probe runs at most once per session.
+ */
+export function getPyniteBackend(): Promise<AsyncAssemblySolver | null> {
+  if (!pyniteProbe) pyniteProbe = probePynite();
+  return pyniteProbe;
+}

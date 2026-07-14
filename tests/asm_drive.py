@@ -225,12 +225,14 @@ def main() -> int:
                 problems.append(f"assembly result line did not report a utilization %: {result_text!r}")
 
             # BACKEND: the result line must NAME the linear backend that ran —
-            # either the Eigen LDLT (wasm) direct solver or the PCG fallback.
-            if not ("eigen ldlt" in result_text.lower() or "pcg" in result_text.lower()):
+            # the PyNite local sidecar (primary), the Eigen LDLT (wasm) direct
+            # solver, or the PCG fallback.
+            backend_names = ("pynite", "eigen ldlt", "pcg")
+            if not any(b in result_text.lower() for b in backend_names):
                 problems.append(f"assembly result line did not name the solve backend: {result_text!r}")
             # The console log line must also name the backend (for the drive).
             backend_logged = any(
-                ("eigen ldlt" in c.lower() or "pcg" in c.lower()) and "[assembly]" in c.lower()
+                any(b in c.lower() for b in backend_names) and "[assembly]" in c.lower()
                 for c in console
             )
             print(f"[solve] backend named in console log = {backend_logged}")

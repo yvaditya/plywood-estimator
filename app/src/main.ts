@@ -53,6 +53,8 @@ import {
   screenPanel,
   detectJoints,
   solveAssembly,
+  serializeAssembly,
+  recoverAssembly,
   type Verdict,
   type AsmPanel,
   type AsmJoint,
@@ -61,7 +63,7 @@ import {
   type JointStiffness,
   type SolveProgress,
 } from './cae';
-import { getDirectSolver } from './solverBackend';
+import { getDirectSolver, getPyniteBackend } from './solverBackend';
 
 // --------------------------------------------------------------------------
 // State
@@ -1396,10 +1398,12 @@ async function solveAssemblyForCabinet(
     return;
   }
 
-  // Load the sparse-direct WASM backend (Eigen LDLT) once. null → PCG fallback.
+  // Detect the PRIMARY assembly backend: the local PyNite sidecar (once per
+  // session, short timeout). When present it solves the SAME serialized model
+  // and we recover on OUR B-matrices. Fall back to Eigen LDLT (wasm) → PCG.
   await stage('Loading solver…', 3);
   await yieldFrame();
-  const backend = await getDirectSolver();
+  const [pynite, backend] = await Promise.all([getPyniteBackend(), getDirectSolver()]);
 
   // Buffer the latest progress stage from the (synchronous) solve so the button
   // bar can be painted around it. Because solveAssembly runs synchronously, we
@@ -1417,16 +1421,46 @@ async function solveAssemblyForCabinet(
   await yieldFrame();
   await stage(SOLVE_STAGE_LABEL.assembling, 25);
   await yieldFrame();
-  await stage(
-    backend ? SOLVE_STAGE_LABEL.factorizing : SOLVE_STAGE_LABEL.solving,
-    backend ? 55 : 60,
-  );
-  await yieldFrame();
 
-  const res = solveAssembly({
-    panels: asmPanels, joints, loads, tolMm: state.asm.tolMm,
-    backend, onProgress,
-  });
+  const solveOpts = { panels: asmPanels, joints, loads, tolMm: state.asm.tolMm };
+  let res: ReturnType<typeof solveAssembly> | null = null;
+
+  // --- PRIMARY: PyNite local sidecar. Serialize → POST → map displacements
+  //     back → run the existing recovery/verdicts. Any failure falls through
+  //     to the WASM/PCG path so a result is always produced. ---
+  if (pynite) {
+    await stage('Solving (PyNite local)…', 55);
+    await yieldFrame();
+    // PyNite's pure-Python sparse assembly is O(nodes) and slow for dense
+    // cabinet meshes, so serialize it at a COARSER density (it's the isotropic-
+    // E_eff approximation backend — a coarser grid is consistent with its
+    // looser fidelity and keeps the local solve interactive). The recovery runs
+    // on this SAME coarse mesh, so displacement→stress stays self-consistent.
+    const ser = serializeAssembly({ ...solveOpts, targetNodesPerPanel: 140, maxDof: 18000 });
+    if (ser.ok) {
+      const sol = await pynite.solve(ser.model);
+      if (sol && sol.disp.length === ser.pre.nDof) {
+        const pyRes = recoverAssembly(ser.pre, sol.disp, asmPanels, 'PyNite (isotropic E_eff)', sol.buildMs, sol.solveMs);
+        if (pyRes.ok) {
+          sawSolving = true;
+          res = pyRes;
+        } else {
+          console.warn('[assembly] PyNite recovery rejected the result — falling back to WASM/PCG.', pyRes.message);
+        }
+      } else {
+        console.warn('[assembly] PyNite sidecar solve failed or size mismatch — falling back to WASM/PCG.');
+      }
+    } else {
+      console.warn('[assembly] PyNite serialize refused:', ser.message, '— falling back.');
+    }
+  }
+
+  // --- FALLBACK: the in-process Eigen LDLT (wasm) → PCG solve. ---
+  if (!res || !res.ok) {
+    await stage(backend ? SOLVE_STAGE_LABEL.factorizing : SOLVE_STAGE_LABEL.solving, backend ? 55 : 60);
+    await yieldFrame();
+    res = solveAssembly({ ...solveOpts, backend, onProgress });
+  }
   void sawSolving;
   console.log(
     '[assembly]', res.resolutionLog, '→',
@@ -1475,9 +1509,11 @@ function assemblyResultLine(
   const rank: Record<string, number> = { ok: 0, borderline: 1, weak: 2 };
   const worst = rank[res.verdict] >= rank[res.stressVerdict] ? res.verdict : res.stressVerdict;
   const limit = res.spanMm / 200;
-  const timing = res.backend === 'Eigen LDLT (wasm)'
-    ? `${res.backend}: factor ${res.factorMs.toFixed(0)} ms + solve ${res.solveMs.toFixed(0)} ms`
-    : `${res.backend}: ${res.iterations} iters, ${res.solveMs.toFixed(0)} ms`;
+  const timing = res.backend === 'PyNite (isotropic E_eff)'
+    ? `${res.backend}: build ${res.factorMs.toFixed(0)} ms + solve ${res.solveMs.toFixed(0)} ms`
+    : res.backend === 'Eigen LDLT (wasm)'
+      ? `${res.backend}: factor ${res.factorMs.toFixed(0)} ms + solve ${res.solveMs.toFixed(0)} ms`
+      : `${res.backend}: ${res.iterations} iters, ${res.solveMs.toFixed(0)} ms`;
   return (
     `Max deflection ${fmtSag(res.maxDisp, state.units)} on ${maxLabel} ` +
     `(vs span/200 ${fmtSag(limit, state.units)}). ` +
