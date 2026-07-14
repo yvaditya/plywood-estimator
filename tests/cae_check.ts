@@ -23,12 +23,67 @@ import {
   bendingDForTest,
   detectJoints,
   solveAssembly,
+  serializeAssembly,
+  recoverAssembly,
   type MaterialCard,
   type AsmPanel,
+  type AsmResult,
+  type AsmSolveOptions,
   type JointStiffness,
   type DirectLinearSolver,
 } from '../app/src/cae';
 import { getDirectSolver } from '../app/src/solverBackend';
+
+// A pluggable assembly solver: the in-process backends wrap solveAssembly; the
+// PyNite path serializes → POSTs → recovers. All three cases run against each.
+type AsmSolveFn = (opts: AsmSolveOptions) => Promise<AsmResult>;
+
+const PYNITE_BASE = process.env.PYNITE_BASE || 'http://localhost:8642';
+
+/** Is the PyNite sidecar reachable? (node's global fetch, short timeout.) */
+async function pyniteReachable(): Promise<{ ok: boolean; version?: string }> {
+  try {
+    const ctrl = new AbortController();
+    const t = setTimeout(() => ctrl.abort(), 1000);
+    const r = await fetch(`${PYNITE_BASE}/health`, { signal: ctrl.signal });
+    clearTimeout(t);
+    if (!r.ok) return { ok: false };
+    const j = await r.json();
+    return j && j.name === 'pynite' ? { ok: true, version: String(j.version) } : { ok: false };
+  } catch {
+    return { ok: false };
+  }
+}
+
+/** Solve one assembly through the PyNite sidecar: serialize the SAME model,
+ *  POST, map displacements back, recover on OUR B-matrices. */
+async function solveViaPynite(opts: AsmSolveOptions): Promise<AsmResult> {
+  const ser = serializeAssembly(opts);
+  const empty = (msg: string): AsmResult => ({
+    ok: false, message: msg, panels: [], maxDisp: 0, maxPanelId: -1, maxAt: [0, 0],
+    spanMm: 0, verdict: 'ok', maxVm: 0, maxVmPanelId: -1, maxVmAt: [0, 0],
+    utilPct: 0, stressVerdict: 'ok', totalDof: 0, totalNodes: 0, iterations: 0,
+    converged: false, backend: 'PyNite (isotropic E_eff)', factorMs: 0, solveMs: 0,
+    groundedNodes: 0, resolutionLog: '', groundPoints: [],
+  });
+  if (!ser.ok) return empty(ser.message);
+  const r = await fetch(`${PYNITE_BASE}/solve`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(ser.model),
+  });
+  if (!r.ok) return empty(`sidecar HTTP ${r.status}`);
+  const out = await r.json();
+  if (!out || !out.ok || !Array.isArray(out.disp)) return empty(out?.message ?? 'sidecar solve failed');
+  const disp = Float64Array.from(out.disp as number[]);
+  if (disp.length !== ser.pre.nDof) return empty(`disp size ${disp.length} ≠ nDof ${ser.pre.nDof}`);
+  return recoverAssembly(ser.pre, disp, opts.panels, 'PyNite (isotropic E_eff)',
+    out.stats?.buildMs ?? 0, out.stats?.solveMs ?? 0);
+}
+
+/** Wrap the in-process solveAssembly as an AsmSolveFn (backend baked in). */
+function inProcess(backend: DirectLinearSolver | null): AsmSolveFn {
+  return async (opts) => solveAssembly({ ...opts, backend });
+}
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -175,7 +230,7 @@ function mkPanel(
 //   its middle and rigidly re-joined. Rigid coupling ⇒ within 12%.
 //   Returns rTwo.maxDisp (for the cross-backend agreement check on (e)).
 // ---------------------------------------------------------------------------
-function caseE(backend: DirectLinearSolver | null, label: string): number {
+async function caseE(solve: AsmSolveFn, label: string, tolPct: number): Promise<number> {
   const L = 800;    // total length (runs along world X)
   const W = 200;    // width (runs along world Y)
   const t = 12;
@@ -186,8 +241,8 @@ function caseE(backend: DirectLinearSolver | null, label: string): number {
 
   const one = [mkPanel(1, '1', L, W, t, mat, [0, 0, 0], uAxis, upV, upN)];
   const jOne = detectJoints(one, 2);
-  const rOne = solveAssembly({
-    panels: one, joints: jOne, tolMm: 2, backend,
+  const rOne = await solve({
+    panels: one, joints: jOne, tolMm: 2,
     loads: [{ panelId: 1, x: L / 2, y: W, N: 200, shape: 'round', size: 0 }],
   });
 
@@ -197,8 +252,8 @@ function caseE(backend: DirectLinearSolver | null, label: string): number {
     mkPanel(2, '2', half, W, t, mat, [half, 0, 0], uAxis, upV, upN),
   ];
   const jTwo = detectJoints(two, 2).map((j) => ({ ...j, stiffness: 'rigid' as JointStiffness }));
-  const rTwo = solveAssembly({
-    panels: two, joints: jTwo, tolMm: 2, backend,
+  const rTwo = await solve({
+    panels: two, joints: jTwo, tolMm: 2,
     loads: [{ panelId: 1, x: half, y: W, N: 200, shape: 'round', size: 0 }],
   });
 
@@ -211,7 +266,7 @@ function caseE(backend: DirectLinearSolver | null, label: string): number {
   }
   report(
     `(e)[${label}] rigid seam ≈ continuous  [${rTwo.totalNodes} nodes, ${rTwo.backend}, ${seamJoints} seam joint(s)]`,
-    rTwo.maxDisp, rOne.maxDisp, 12,
+    rTwo.maxDisp, rOne.maxDisp, tolPct,
   );
   return rTwo.maxDisp;
 }
@@ -220,7 +275,7 @@ function caseE(backend: DirectLinearSolver | null, label: string): number {
 // Case (f): MONOTONICITY — L-config, tip load. Must satisfy
 //   hinged > semi-rigid > rigid, all finite.
 // ---------------------------------------------------------------------------
-function caseF(backend: DirectLinearSolver | null, label: string) {
+async function caseF(solve: AsmSolveFn, label: string) {
   const t = 12;
   const mat = iso(8000, 0.3);
   const H = 500;   // vertical panel height (Z)
@@ -230,19 +285,19 @@ function caseF(backend: DirectLinearSolver | null, label: string) {
   const vert = mkPanel(1, 'V', Wv, H, t, mat, [0, 0, 0], [1, 0, 0], [0, 0, 1], [0, 1, 0]);
   const shelf = mkPanel(2, 'S', Wv, D, t, mat, [0, 0, H], [1, 0, 0], [0, 1, 0], [0, 0, 1]);
 
-  const run = (stiff: JointStiffness) => {
+  const run = async (stiff: JointStiffness) => {
     const panels = [vert, shelf];
     const joints = detectJoints(panels, 3).map((j) => ({ ...j, stiffness: stiff }));
-    const res = solveAssembly({
-      panels, joints, tolMm: 3, backend,
+    const res = await solve({
+      panels, joints, tolMm: 3,
       loads: [{ panelId: 2, x: Wv / 2, y: D, N: 300, shape: 'round', size: 0 }],
     });
     return { res, joints: joints.length };
   };
 
-  const rig = run('rigid');
-  const semi = run('semi-rigid');
-  const hin = run('hinged');
+  const rig = await run('rigid');
+  const semi = await run('semi-rigid');
+  const hin = await run('hinged');
 
   const jc = rig.joints;
   const all = [rig.res, semi.res, hin.res];
@@ -268,7 +323,7 @@ function caseF(backend: DirectLinearSolver | null, label: string) {
 // Case (g): STRESS RECOVERY — SS strip, centre point load. Recovered surface
 //   von Mises at the strip centre ≈ 1.5·P·L/(w·t²).
 // ---------------------------------------------------------------------------
-function caseG(backend: DirectLinearSolver | null, label: string) {
+async function caseG(solve: AsmSolveFn, label: string, tolPct: number) {
   const L = 240;    // support spacing = SS span (world X); L/t ≈ 12
   const w = 120;    // strip width (world Y)
   const t = 20;     // thickness
@@ -286,8 +341,8 @@ function caseG(backend: DirectLinearSolver | null, label: string) {
 
   const panels = [strip, legL, legR];
   const joints = detectJoints(panels, 3).map((j) => ({ ...j, stiffness: 'hinged' as JointStiffness }));
-  const res = solveAssembly({
-    panels, joints, tolMm: 3, backend,
+  const res = await solve({
+    panels, joints, tolMm: 3,
     loads: [{ panelId: 1, x: L / 2 + ov, y: w / 2, N: P, shape: 'round', size: 0 }],
   });
 
@@ -299,7 +354,7 @@ function caseG(backend: DirectLinearSolver | null, label: string) {
   }
   report(
     `(g)[${label}] SS strip, centre P — surface stress  [${res.totalNodes} nodes, ${res.backend}, ${joints.length} joint(s)]`,
-    res.maxVm, theory, 15,
+    res.maxVm, theory, tolPct,
     `util=${res.utilPct.toFixed(0)}%`,
   );
 }
@@ -316,23 +371,36 @@ async function main() {
 
   // Try to load the sparse-direct WASM backend. null → only the PCG pass runs.
   const wasm = await getDirectSolver();
-  const backends: { backend: DirectLinearSolver | null; label: string }[] = [
-    { backend: null, label: 'PCG' },
+
+  // In-process backends (Eigen/PCG): case (e) 12%, case (g) 15% (tight).
+  const backends: { solve: AsmSolveFn; label: string; eTol: number; gTol: number }[] = [
+    { solve: inProcess(null), label: 'PCG', eTol: 12, gTol: 15 },
   ];
   if (wasm) {
-    backends.push({ backend: wasm, label: 'LDLT' });
+    backends.push({ solve: inProcess(wasm), label: 'LDLT', eTol: 12, gTol: 15 });
     console.log(`\n--- Eigen LDLT (wasm) backend loaded: running assembly cases on BOTH backends ---`);
   } else {
     console.log(`\n--- Eigen LDLT (wasm) backend NOT available under node: PCG only ---`);
   }
 
+  // The PyNite sidecar, when reachable, is the PRIMARY assembly solver. Its
+  // isotropic-E_eff quad + different element → looser tolerances per the design:
+  //   case (e) 15% (vs Eigen 12%), case (g) 20% (vs Eigen 15%), (f) monotonic.
+  const py = await pyniteReachable();
+  if (py.ok) {
+    backends.push({ solve: solveViaPynite, label: 'PyNite', eTol: 15, gTol: 20 });
+    console.log(`--- PyNite sidecar reachable (v${py.version}): running assembly cases through it too ---`);
+  } else {
+    console.log(`--- PyNite sidecar NOT reachable at ${PYNITE_BASE}: skipping PyNite assembly cases ---`);
+  }
+
   // Assembly cases (e, f, g) on every available backend.
   const caseE_disp: Record<string, number> = {};
-  for (const { backend, label } of backends) {
+  for (const { solve, label, eTol, gTol } of backends) {
     console.log(`\n[backend: ${label}]`);
-    caseE_disp[label] = caseE(backend, label);
-    caseF(backend, label);
-    caseG(backend, label);
+    caseE_disp[label] = await caseE(solve, label, eTol);
+    await caseF(solve, label);
+    await caseG(solve, label, gTol);
   }
 
   // Cross-backend numerical agreement on case (e): the direct LDLT solve and
@@ -349,8 +417,62 @@ async function main() {
     );
   }
 
+  // PyNite-vs-Eigen agreement on case (e) (REPORT ONLY — different element +
+  // isotropic approximation, so we don't gate on it).
+  if (py.ok && Number.isFinite(caseE_disp['PyNite']) && Number.isFinite(caseE_disp['PCG'])) {
+    const rel = Math.abs(caseE_disp['PyNite'] - caseE_disp['PCG']) / Math.abs(caseE_disp['PCG']);
+    console.log(
+      `\n[report] (e) PyNite vs Eigen/PCG (informational)\n` +
+      `        w_PCG    = ${caseE_disp['PCG'].toExponential(6)} mm\n` +
+      `        w_PyNite = ${caseE_disp['PyNite'].toExponential(6)} mm\n` +
+      `        rel diff = ${(rel * 100).toFixed(2)}%`,
+    );
+  }
+
+  // Workbench-style box model — max-deflection delta PyNite vs Eigen + solve
+  // times (REPORT ONLY, never gates). A 5-panel loaded cabinet is representative
+  // of the real workbench assembly the app solves.
+  if (py.ok && wasm) {
+    await workbenchDelta(inProcess(wasm), solveViaPynite);
+  }
+
   console.log(anyFail ? '\nRESULT: FAIL' : '\nRESULT: all cases PASS');
   process.exit(anyFail ? 1 : 0);
+}
+
+// ---------------------------------------------------------------------------
+// Workbench-style cabinet — a floor-grounded box (2 sides, back, bottom, top)
+// with a load on the top. Reports the PyNite-vs-Eigen max-deflection delta and
+// each backend's solve time. Informational only.
+// ---------------------------------------------------------------------------
+async function workbenchDelta(eigen: AsmSolveFn, pynite: AsmSolveFn) {
+  const t = 18;
+  const mat = iso(9000, 0.3);
+  const Wd = 800, Dp = 600, Ht = 900; // width, depth, height (mm)
+  // Two sides (X-const planes), a back (Y-const), bottom + top (Z-const).
+  const left = mkPanel(1, 'L', Dp, Ht, t, mat, [0, 0, 0], [0, 1, 0], [0, 0, 1], [1, 0, 0]);
+  const right = mkPanel(2, 'R', Dp, Ht, t, mat, [Wd, 0, 0], [0, 1, 0], [0, 0, 1], [1, 0, 0]);
+  const back = mkPanel(3, 'B', Wd, Ht, t, mat, [0, Dp, 0], [1, 0, 0], [0, 0, 1], [0, 1, 0]);
+  const bottom = mkPanel(4, 'Bo', Wd, Dp, t, mat, [0, 0, 0], [1, 0, 0], [0, 1, 0], [0, 0, 1]);
+  const top = mkPanel(5, 'T', Wd, Dp, t, mat, [0, 0, Ht], [1, 0, 0], [0, 1, 0], [0, 0, 1]);
+  const panels = [left, right, back, bottom, top];
+  const joints = detectJoints(panels, 4).map((j) => ({ ...j, stiffness: 'rigid' as JointStiffness }));
+  const loads = [{ panelId: 5, x: Wd / 2, y: Dp / 2, N: 500, shape: 'square' as const, size: 300 }];
+
+  const optsBase: AsmSolveOptions = { panels, joints, loads, tolMm: 4 };
+  const rE = await eigen(optsBase);
+  const rP = await pynite(optsBase);
+  if (!rE.ok || !rP.ok) {
+    console.log(`\n[report] workbench box delta — setup failed (eigen.ok=${rE.ok} pynite.ok=${rP.ok})`);
+    return;
+  }
+  const rel = Math.abs(rP.maxDisp - rE.maxDisp) / Math.abs(rE.maxDisp || 1) * 100;
+  console.log(
+    `\n[report] workbench box (5 panels, ${rE.totalNodes} nodes) — max-deflection PyNite vs Eigen\n` +
+    `        Eigen  maxDisp = ${rE.maxDisp.toExponential(4)} mm  (factor ${rE.factorMs.toFixed(0)} + solve ${rE.solveMs.toFixed(0)} ms)\n` +
+    `        PyNite maxDisp = ${rP.maxDisp.toExponential(4)} mm  (build ${rP.factorMs.toFixed(0)} + solve ${rP.solveMs.toFixed(0)} ms)\n` +
+    `        delta = ${rel.toFixed(2)}%  (informational — isotropic E_eff + different element)`,
+  );
 }
 
 void main();

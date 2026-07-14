@@ -927,7 +927,7 @@ export interface AsmSolveOptions {
 }
 
 /** Which linear backend actually solved the system (for the result/log line). */
-export type SolveBackend = 'Eigen LDLT (wasm)' | 'PCG';
+export type SolveBackend = 'PyNite (isotropic E_eff)' | 'Eigen LDLT (wasm)' | 'PCG';
 
 /** Per-panel deflection field, in that panel's local grid (like SolveResult). */
 export interface AsmPanelResult {
@@ -984,6 +984,50 @@ export interface AsmResult {
   resolutionLog: string;
   /** Grounded node world positions (for glyphs). */
   groundPoints: Vec3World[];
+}
+
+// ---------------------------------------------------------------------------
+// SIDECAR SERIALIZATION — the SAME preprocessed model (mesh nodes, quads,
+// joint node-pair links, floor grounding, nodal loads) that solveAssembly
+// builds, in a JSON-able shape a local structural-FE sidecar (server/main.py,
+// PyNite) can solve. The sidecar returns a 6-DOF-per-node displacement vector
+// in THIS node ordering, which recoverAssembly() feeds into the EXISTING stress
+// recovery + verdicts — so the sidecar only replaces the linear solve.
+// ---------------------------------------------------------------------------
+
+/** One quad element: node indices (i,j,m,n CCW), thickness, material name. */
+export interface SidecarQuad { n: [number, number, number, number]; t: number; mat: string; }
+/** A joint node-pair link with its stiffness class. */
+export interface SidecarLink { a: number; b: number; stiffness: JointStiffness; }
+/** A world nodal force (N). */
+export interface SidecarLoad { node: number; fx: number; fy: number; fz: number; }
+/** An isotropic material card for the sidecar. E is the EFFECTIVE modulus
+ *  (sqrt(eAlong·eAcross) for orthotropic ply) — PyNite plates are isotropic. */
+export interface SidecarMaterial { name: string; E: number; G: number; nu: number; rho: number; }
+
+/** The full JSON model handed to the sidecar's POST /solve. */
+export interface SidecarModel {
+  nodes: [number, number, number][];
+  materials: SidecarMaterial[];
+  quads: SidecarQuad[];
+  links: SidecarLink[];
+  supports: number[];
+  loads: SidecarLoad[];
+  /** The per-DOF soft grounding-spring stiffness the app's OWN solver uses
+   *  (repStiff·1e-4). Passing it lets the sidecar regularize residual
+   *  rigid-body / weakly-coupled-sub-assembly modes identically to cae.ts —
+   *  strong enough to pin an orphan panel, negligible for a constrained DOF. */
+  kSoft: number;
+}
+
+/** An external async linear solver (e.g. the PyNite sidecar). Given the
+ *  serialized model it returns the 6-DOF-per-node displacement vector (mm/rad)
+ *  in node order, or null on any failure (caller falls back). `name`/`label`
+ *  name the backend for the result line; `backendTag` is the AsmResult.backend
+ *  enum value. */
+export interface AsyncAssemblySolver {
+  readonly name: string;
+  solve(model: SidecarModel): Promise<{ disp: Float64Array; solveMs: number; buildMs: number; label: string } | null>;
 }
 
 /** Monotonic-ish millisecond clock, usable in both browser and node/tsx. */
@@ -1313,27 +1357,43 @@ function vonMises(sx: number, sy: number, txy: number): number {
   return Math.sqrt(sx * sx - sx * sy + sy * sy + 3 * txy * txy);
 }
 
-/**
- * Solve the whole assembly. Returns a refusal (ok:false) when the system is
- * under-constrained (nothing grounded / not enough grounding to prevent rigid
- * body motion) — reusing the guard+backstop pattern from the per-panel path.
- */
-export function solveAssembly(opts: AsmSolveOptions): AsmResult {
+// ---------------------------------------------------------------------------
+// PREPROCESSING — the deterministic front half shared by the internal solve,
+// the sidecar serializer, and the sidecar-displacement recovery. Meshing, the
+// global node table, per-panel D-matrices, joint node-pairing, floor grounding
+// and the (pre-BC) world load vector are all a pure function of `opts`, so
+// building them ONCE and reusing guarantees the sidecar's returned displacement
+// vector maps back into exactly the same node/DOF ordering the internal solve
+// and the stress recovery expect.
+// ---------------------------------------------------------------------------
+interface AsmPreprocess {
+  meshes: PanelMesh[];
+  panelById: Map<number, PanelMesh>;
+  nodePos: Vec3World[];
+  totalNodes: number;
+  nDof: number;
+  resolutionLog: string;
+  panelD: Map<number, { Db: number[][]; Dm: number[][] }>;
+  panelStiff: Map<number, number>;
+  repStiff: number;
+  /** Resolved joint couplings: each app joint expanded to nearest a→b node
+   *  pairs, with the joint's stiffness class + the per-joint translational
+   *  penalty (softer-of-the-two-panels × 1e3). Drives BOTH the internal penalty
+   *  springs and the sidecar link members. */
+  jointPairs: { gi: number; gj: number; stiffness: JointStiffness; kTrans: number }[];
+  grounded: number[];
+  groundPoints: Vec3World[];
+  /** World load vector (6 DOF/node), before Dirichlet BCs are applied. */
+  F: Float64Array;
+}
+
+/** Refusal marker when preprocessing can't produce a solvable model. */
+interface AsmPreFail { fail: true; message: string; resolutionLog: string; totalNodes: number; nDof: number; }
+
+function preprocessAssembly(opts: AsmSolveOptions, report: (p: SolveProgress) => void): AsmPreprocess | AsmPreFail {
   const { panels, joints, loads, tolMm } = opts;
   const maxDof = opts.maxDof ?? 60000;
   let target = opts.targetNodesPerPanel ?? 600;
-  const report = opts.onProgress ?? (() => {});
-
-  const empty = (msg: string): AsmResult => ({
-    ok: false, message: msg, panels: [], maxDisp: 0, maxPanelId: -1, maxAt: [0, 0],
-    spanMm: 0, verdict: 'ok', maxVm: 0, maxVmPanelId: -1, maxVmAt: [0, 0],
-    utilPct: 0, stressVerdict: 'ok',
-    totalDof: 0, totalNodes: 0, iterations: 0, converged: false,
-    backend: 'PCG', factorMs: 0, solveMs: 0,
-    groundedNodes: 0, resolutionLog: '', groundPoints: [],
-  });
-
-  if (panels.length === 0) return empty('No panels selected.');
 
   // --- STAGE: preprocessing (meshing) — OUR TypeScript. ---
   report({ stage: 'meshing', pct: 5, detail: `${panels.length} panel${panels.length === 1 ? '' : 's'}` });
@@ -1383,90 +1443,28 @@ export function solveAssembly(opts: AsmSolveOptions): AsmResult {
     }
   }
 
-  // Assemble the global stiffness in a row-map (6 DOF/node).
-  const rows: Map<number, number>[] = Array.from({ length: nDof }, () => new Map());
-  const addK = (gi: number, gj: number, v: number) => {
-    if (v === 0) return;
-    const r = rows[gi];
-    r.set(gj, (r.get(gj) ?? 0) + v);
-  };
-
-  // Track a representative plate stiffness PER PANEL for joint-penalty scaling.
-  // Using a per-panel value (not the global max) keeps a joint between two soft
-  // panels from being penalised at a stiff panel's scale — a mismatch that
-  // wrecks the condition number and stalls PCG on real, mixed-thickness jobs.
+  // Per-panel D-matrices (retained for stress recovery) + representative plate
+  // stiffness per panel (for joint-penalty scaling).
   const panelStiff = new Map<number, number>();
   let repStiff = 0;
-  // Per-panel D-matrices retained for stress recovery after the solve.
   const panelD = new Map<number, { Db: number[][]; Dm: number[][] }>();
-
   for (const m of meshes) {
     const p = m.panel;
     const t = p.thicknessMm;
     const e1 = p.material.isotropic ? p.material.eAlong : (p.grainAlongLength ? p.material.eAlong : p.material.eAcross);
     const e2 = p.material.isotropic ? p.material.eAlong : (p.grainAlongLength ? p.material.eAcross : p.material.eAlong);
     const Db = bendingD(e1, e2, p.material.gShear, NU, t);
-    const Ds = shearD(p.material.gShear, p.material.gShear, t);
     const Dm = membraneD(e1, e2, p.material.gShear, NU, t);
     panelD.set(p.id, { Db, Dm });
-    const Kb = elementK(m.dx, m.dy, Db, Ds);   // 12×12 [w,θx,θy] per node
-    const Km = membraneK(m.dx, m.dy, Dm);       // 8×8  [u,v]     per node
-
-    // Representative stiffness of THIS panel: the membrane diagonal per cell is
-    // the dominant in-plane term the translational joint springs act against.
     const pStiff = Dm[0][0] / (m.dx * m.dy);
     panelStiff.set(p.id, pStiff);
     repStiff = Math.max(repStiff, pStiff);
-
-    // World basis columns: uAxis, vAxis, normal. Local dof mapping:
-    //   local [ub, vb, wb, θub, θvb, θwb]  (u,v in-plane; w out-of-plane;
-    //   θu,θv bending rotations about local u,v; θw drilling).
-    const ux = p.uAxis, vy = p.vAxis, nz = p.normal;
-    // Drilling stabilization coefficient (small, ∝ membrane stiffness · area).
-    const drill = (Dm[2][2]) * 1e-3;
-
-    const nodeIdx = (ix: number, iy: number) => iy * m.nx + ix;
-    for (const [ix, iy] of m.activeCells) {
-      const en = [nodeIdx(ix, iy), nodeIdx(ix + 1, iy), nodeIdx(ix + 1, iy + 1), nodeIdx(ix, iy + 1)];
-      const g = en.map((n) => m.gnode[n]);
-      if (g.some((x) => x < 0)) continue;
-
-      // Build the 24×24 local element (6 dof/node) by scattering bending +
-      // membrane + drilling into local DOF slots, then rotate to global.
-      // Local per-node dof order: [u, v, w, θu, θv, θw].
-      for (let ni = 0; ni < 4; ni++) {
-        for (let nj = 0; nj < 4; nj++) {
-          // 6×6 local block for the (ni,nj) node pair.
-          const blk: number[][] = Array.from({ length: 6 }, () => new Array(6).fill(0));
-          // membrane: local dof 0,1 ← Km rows [ni*2, ni*2+1]
-          blk[0][0] += Km[ni * 2][nj * 2];
-          blk[0][1] += Km[ni * 2][nj * 2 + 1];
-          blk[1][0] += Km[ni * 2 + 1][nj * 2];
-          blk[1][1] += Km[ni * 2 + 1][nj * 2 + 1];
-          // bending: local dof 2 (w), 3 (θu==θx), 4 (θv==θy) ← Kb rows [ni*3..]
-          for (let r = 0; r < 3; r++) {
-            for (let c = 0; c < 3; c++) {
-              blk[2 + r][2 + c] += Kb[ni * 3 + r][nj * 3 + c];
-            }
-          }
-          // drilling stabilization on θw (local dof 5), diagonal only.
-          if (ni === nj) blk[5][5] += drill * m.dx * m.dy;
-
-          // Rotate the 6×6 local block to global: global = T · local · Tᵀ,
-          // where T maps [local xyz] → [world xyz] using (ux,vy,nz) as columns.
-          // Both translational (0..2) and rotational (3..5) triples rotate the
-          // same way. We do it triple-by-triple.
-          rotateAndScatter(rows, blk, g[ni], g[nj], ux, vy, nz);
-        }
-      }
-    }
   }
-
   if (repStiff <= 0 || !Number.isFinite(repStiff)) repStiff = 1e3;
 
-  // --- JOINT COUPLING: penalty springs between nearest node pairs along each
-  //     contact segment. rigid → all 6 DOF; semi-rigid → translational + 5%
-  //     rotational; hinged → translational only. ---
+  // --- JOINT node-pairing: for each app joint, pair each a-node along the
+  //     contact segment with its nearest b-node. Shared by the internal penalty
+  //     springs and the sidecar link members. ---
   const panelById = new Map<number, PanelMesh>();
   for (const m of meshes) panelById.set(m.panel.id, m);
 
@@ -1482,12 +1480,7 @@ export function solveAssembly(opts: AsmSolveOptions): AsmResult {
     return out;
   };
 
-  const addSpring = (gi: number, gj: number, dofOff: number, k: number) => {
-    const di = gi * 6 + dofOff, dj = gj * 6 + dofOff;
-    addK(di, di, k); addK(dj, dj, k);
-    addK(di, dj, -k); addK(dj, di, -k);
-  };
-
+  const jointPairs: { gi: number; gj: number; stiffness: JointStiffness; kTrans: number }[] = [];
   for (const j of joints) {
     const ma = panelById.get(j.a), mb = panelById.get(j.b);
     if (!ma || !mb) continue;
@@ -1495,22 +1488,10 @@ export function solveAssembly(opts: AsmSolveOptions): AsmResult {
     const na = nodesAlong(ma, j.p0, j.p1, tol);
     const nb = nodesAlong(mb, j.p0, j.p1, tol);
     if (na.length === 0 || nb.length === 0) continue;
-    // Penalty stiffness ~1e3 × the SOFTER of the two joined panels (rigid). A
-    // per-joint scale (not the global max) keeps the condition number bounded
-    // when the job mixes thick and thin panels.
+    // Penalty stiffness ~1e3 × the SOFTER of the two joined panels — a per-joint
+    // scale (not the global max) keeps the condition number bounded on mixed-
+    // thickness jobs.
     const kTrans = Math.min(panelStiff.get(j.a) ?? repStiff, panelStiff.get(j.b) ?? repStiff) * 1e3;
-    // rigid → full rotational coupling; semi-rigid → 5%. Hinged transmits
-    // translation only, but a razor-thin (1-node-wide) contact line with zero
-    // rotational coupling is a numerical mechanism — the jointed panel can spin
-    // freely about the seam axis, so PCG never converges. We regularize the
-    // hinge with a token rotational stiffness (0.1% — 50× softer than
-    // semi-rigid, so it stays unambiguously the floppiest joint) purely to kill
-    // that free rotation. Physically this is the tiny friction any real hinge
-    // has; structurally it's negligible next to semi-rigid/rigid.
-    const kRot = j.stiffness === 'rigid' ? kTrans
-      : j.stiffness === 'semi-rigid' ? kTrans * 0.05
-        : kTrans * 0.001; // hinged (regularized translational coupling)
-    // Pair each a-node with its nearest b-node.
     for (const gi of na) {
       let bestG = -1, bestD = Infinity;
       for (const gj of nb) {
@@ -1518,17 +1499,12 @@ export function solveAssembly(opts: AsmSolveOptions): AsmResult {
         if (d < bestD) { bestD = d; bestG = gj; }
       }
       if (bestG < 0) continue;
-      for (let dof = 0; dof < 3; dof++) addSpring(gi, bestG, dof, kTrans);
-      if (kRot > 0) for (let dof = 3; dof < 6; dof++) addSpring(gi, bestG, dof, kRot);
+      jointPairs.push({ gi, gj: bestG, stiffness: j.stiffness, kTrans });
     }
   }
 
-  // --- GROUNDING: translational supports on nodes within `groundBand` of the
-  //     floor. The floor datum is the assembly's LOWEST world z (the base the
-  //     cabinet stands on) — the model rarely sits exactly at z=0. We refuse
-  //     only when NO panel reaches near that base plane (a physically floating
-  //     assembly). The band is generous (max of the tolerance and one node
-  //     spacing) so a base panel lands even when the mesh is coarse. ---
+  // --- GROUNDING: fully-fixed supports on nodes within `groundBand` of the
+  //     floor (the assembly's LOWEST world z). ---
   let zMin = Infinity, zMax = -Infinity;
   for (let g = 0; g < totalNodes; g++) {
     const z = nodePos[g][2];
@@ -1546,49 +1522,20 @@ export function solveAssembly(opts: AsmSolveOptions): AsmResult {
       groundPoints.push(nodePos[g]);
     }
   }
-  // Under-constrained refusal: need at least one grounded node. (A cabinet
-  // sitting on the floor is modelled as a FIXED base — all 6 DOF clamped on the
-  // floor-contact nodes — so even a single grounded line fully removes the six
-  // rigid-body modes.) With floorZ = the lowest node this essentially always
-  // finds the base row; the guard remains as a backstop.
   if (grounded.length < 1) {
-    return { ...empty(
-      'The assembly has no base on the floor — nothing to ground it. Check that at least one panel reaches the cabinet base.'),
-      resolutionLog, totalNodes, totalDof: nDof };
+    return { fail: true,
+      message: 'The assembly has no base on the floor — nothing to ground it. Check that at least one panel reaches the cabinet base.',
+      resolutionLog, totalNodes, nDof };
   }
 
-  // Fix all 6 DOF of grounded nodes — a panel resting on the floor is clamped
-  // there (it can't slide, lift, or tip). A single grounded line then removes
-  // every rigid-body mode of the coupled shell.
-  const fixed = new Uint8Array(nDof);
-  for (const g of grounded) {
-    for (let dof = 0; dof < 6; dof++) fixed[g * 6 + dof] = 1;
-  }
-
-  // --- Soft regularization: a tiny grounding spring on EVERY free DOF. This
-  //     removes any residual rigid-body / drilling mechanism of a panel that
-  //     happens to connect to the grounded structure only through a hinge (or
-  //     a chain of soft joints), turning a near-singular system into a well-
-  //     conditioned SPD one. The stiffness is ~1e-6 of the representative plate
-  //     stiffness — utterly negligible for any properly-constrained DOF, but
-  //     enough to pin a floating sub-assembly so Jacobi-PCG converges instead
-  //     of diverging. Without it a real cabinet (20 panels, mixed joints) does
-  //     not converge. ---
-  const kSoft = repStiff * 1e-4;
-  for (let g = 0; g < nDof; g++) {
-    if (fixed[g]) continue;
-    const r = rows[g];
-    r.set(g, (r.get(g) ?? 0) + kSoft);
-  }
-
-  // --- Load vector ---
+  // --- World load vector (pre-BC): spread each footprint load over the active
+  //     nodes inside it, acting along −normal. ---
   const F = new Float64Array(nDof);
   for (const load of loads) {
     if (!load.N) continue;
     const m = panelById.get(load.panelId);
     if (!m) continue;
     const p = m.panel;
-    // Spread the load over active nodes inside the footprint (like the plate).
     const inFoot: number[] = [];
     const half = load.size / 2;
     for (let iy = 0; iy < m.ny; iy++) {
@@ -1603,7 +1550,6 @@ export function solveAssembly(opts: AsmSolveOptions): AsmResult {
       }
     }
     if (inFoot.length === 0) {
-      // snap to nearest active node
       let best = -1, bestD = Infinity;
       for (let iy = 0; iy < m.ny; iy++) {
         for (let ix = 0; ix < m.nx; ix++) {
@@ -1616,8 +1562,6 @@ export function solveAssembly(opts: AsmSolveOptions): AsmResult {
       if (best >= 0) inFoot.push(best);
     }
     if (inFoot.length === 0) continue;
-    // The load acts along −normal (into the face). Distribute as a world force
-    // vector on each node's 3 translational DOF.
     const share = load.N / inFoot.length;
     const fWorld: Vec3World = w3scale(p.normal, -share);
     for (const g of inFoot) {
@@ -1627,9 +1571,198 @@ export function solveAssembly(opts: AsmSolveOptions): AsmResult {
     }
   }
 
+  return {
+    meshes, panelById, nodePos, totalNodes, nDof, resolutionLog,
+    panelD, panelStiff, repStiff, jointPairs, grounded, groundPoints, F,
+  };
+}
+
+/**
+ * Serialize the preprocessed assembly into the JSON model the local PyNite
+ * sidecar solves. Quads reference per-panel isotropic materials with an
+ * EFFECTIVE modulus E_eff = sqrt(eAlong·eAcross) (PyNite plates are isotropic —
+ * documented fidelity note). Joint node-pairs become link members; floor-
+ * grounded nodes become fully-fixed supports; the world load vector becomes
+ * nodal forces. `pre` and the returned `context` share node ordering so the
+ * sidecar's displacement vector maps straight back through recoverAssembly().
+ */
+export function serializeAssembly(opts: AsmSolveOptions):
+  | { ok: true; model: SidecarModel; pre: AsmPreprocess }
+  | { ok: false; message: string } {
+  if (opts.panels.length === 0) return { ok: false, message: 'No panels selected.' };
+  const pre = preprocessAssembly(opts, () => {});
+  if ('fail' in pre) return { ok: false, message: pre.message };
+
+  const nodes: [number, number, number][] = pre.nodePos.map((p) => [p[0], p[1], p[2]]);
+
+  // One isotropic material per panel (keyed by panel id). E_eff = sqrt(E∥·E⊥).
+  const materials: SidecarMaterial[] = [];
+  const matName = new Map<number, string>();
+  for (const m of pre.meshes) {
+    const mat = m.panel.material;
+    const eEff = mat.isotropic ? mat.eAlong : Math.sqrt(mat.eAlong * mat.eAcross);
+    const name = `mat_p${m.panel.id}`;
+    matName.set(m.panel.id, name);
+    materials.push({ name, E: eEff, G: mat.gShear, nu: NU, rho: mat.density });
+  }
+
+  // Quads: every active cell of every panel, as global node indices (CCW).
+  const quads: SidecarQuad[] = [];
+  for (const m of pre.meshes) {
+    const nodeIdx = (ix: number, iy: number) => iy * m.nx + ix;
+    for (const [ix, iy] of m.activeCells) {
+      const en = [nodeIdx(ix, iy), nodeIdx(ix + 1, iy), nodeIdx(ix + 1, iy + 1), nodeIdx(ix, iy + 1)];
+      const g = en.map((n) => m.gnode[n]);
+      if (g.some((x) => x < 0)) continue;
+      quads.push({ n: [g[0], g[1], g[2], g[3]], t: m.panel.thicknessMm, mat: matName.get(m.panel.id)! });
+    }
+  }
+
+  const links: SidecarLink[] = pre.jointPairs.map((jp) => ({ a: jp.gi, b: jp.gj, stiffness: jp.stiffness }));
+
+  // Loads: the world load vector as per-node forces (translational DOFs only).
+  const loads: SidecarLoad[] = [];
+  for (let g = 0; g < pre.totalNodes; g++) {
+    const fx = pre.F[g * 6], fy = pre.F[g * 6 + 1], fz = pre.F[g * 6 + 2];
+    if (fx || fy || fz) loads.push({ node: g, fx, fy, fz });
+  }
+
+  // The app's own soft grounding-spring stiffness — passed so the sidecar
+  // regularizes identically (see cae.ts kSoft in solveAssembly).
+  const kSoft = pre.repStiff * 1e-4;
+
+  return { ok: true, model: { nodes, materials, quads, links, supports: pre.grounded, loads, kSoft }, pre };
+}
+
+/**
+ * Recover an AsmResult from a preprocessed model and an externally-supplied
+ * 6-DOF-per-node displacement vector `x` (e.g. the PyNite sidecar's). Runs the
+ * SAME per-element stress recovery + verdicts the internal solve uses — the
+ * only difference is where `x` came from. `backend`/timings are stamped onto
+ * the result for the UI/log line.
+ */
+export function recoverAssembly(
+  pre: AsmPreprocess, x: Float64Array, panels: AsmPanel[],
+  backend: SolveBackend, factorMs: number, solveMs: number,
+): AsmResult {
+  return finishAssembly(pre, x, panels, {
+    backend, factorMs, solveMs, iterations: 0, converged: true,
+  });
+}
+
+/**
+ * Solve the whole assembly. Returns a refusal (ok:false) when the system is
+ * under-constrained (nothing grounded / not enough grounding to prevent rigid
+ * body motion) — reusing the guard+backstop pattern from the per-panel path.
+ */
+export function solveAssembly(opts: AsmSolveOptions): AsmResult {
+  const { panels, tolMm } = opts;
+  void tolMm;
+  const report = opts.onProgress ?? (() => {});
+
+  const empty = (msg: string): AsmResult => ({
+    ok: false, message: msg, panels: [], maxDisp: 0, maxPanelId: -1, maxAt: [0, 0],
+    spanMm: 0, verdict: 'ok', maxVm: 0, maxVmPanelId: -1, maxVmAt: [0, 0],
+    utilPct: 0, stressVerdict: 'ok',
+    totalDof: 0, totalNodes: 0, iterations: 0, converged: false,
+    backend: 'PCG', factorMs: 0, solveMs: 0,
+    groundedNodes: 0, resolutionLog: '', groundPoints: [],
+  });
+
+  if (panels.length === 0) return empty('No panels selected.');
+
+  const pre = preprocessAssembly(opts, report);
+  if ('fail' in pre) {
+    return { ...empty(pre.message), resolutionLog: pre.resolutionLog, totalNodes: pre.totalNodes, totalDof: pre.nDof };
+  }
+  const { meshes, nDof, repStiff, jointPairs, grounded, F } = pre;
+
+  // Assemble the global stiffness in a row-map (6 DOF/node).
+  const rows: Map<number, number>[] = Array.from({ length: nDof }, () => new Map());
+  const addK = (gi: number, gj: number, v: number) => {
+    if (v === 0) return;
+    const r = rows[gi];
+    r.set(gj, (r.get(gj) ?? 0) + v);
+  };
+
+  // Element stiffness assembly (bending + membrane + drilling, rotated global).
+  for (const m of meshes) {
+    const p = m.panel;
+    const t = p.thicknessMm;
+    const e1 = p.material.isotropic ? p.material.eAlong : (p.grainAlongLength ? p.material.eAlong : p.material.eAcross);
+    const e2 = p.material.isotropic ? p.material.eAlong : (p.grainAlongLength ? p.material.eAcross : p.material.eAlong);
+    const Db = bendingD(e1, e2, p.material.gShear, NU, t);
+    const Ds = shearD(p.material.gShear, p.material.gShear, t);
+    const Dm = membraneD(e1, e2, p.material.gShear, NU, t);
+    const Kb = elementK(m.dx, m.dy, Db, Ds);   // 12×12 [w,θx,θy] per node
+    const Km = membraneK(m.dx, m.dy, Dm);       // 8×8  [u,v]     per node
+
+    const ux = p.uAxis, vy = p.vAxis, nz = p.normal;
+    const drill = (Dm[2][2]) * 1e-3;
+
+    const nodeIdx = (ix: number, iy: number) => iy * m.nx + ix;
+    for (const [ix, iy] of m.activeCells) {
+      const en = [nodeIdx(ix, iy), nodeIdx(ix + 1, iy), nodeIdx(ix + 1, iy + 1), nodeIdx(ix, iy + 1)];
+      const g = en.map((n) => m.gnode[n]);
+      if (g.some((x) => x < 0)) continue;
+
+      for (let ni = 0; ni < 4; ni++) {
+        for (let nj = 0; nj < 4; nj++) {
+          const blk: number[][] = Array.from({ length: 6 }, () => new Array(6).fill(0));
+          blk[0][0] += Km[ni * 2][nj * 2];
+          blk[0][1] += Km[ni * 2][nj * 2 + 1];
+          blk[1][0] += Km[ni * 2 + 1][nj * 2];
+          blk[1][1] += Km[ni * 2 + 1][nj * 2 + 1];
+          for (let r = 0; r < 3; r++) {
+            for (let c = 0; c < 3; c++) {
+              blk[2 + r][2 + c] += Kb[ni * 3 + r][nj * 3 + c];
+            }
+          }
+          if (ni === nj) blk[5][5] += drill * m.dx * m.dy;
+          rotateAndScatter(rows, blk, g[ni], g[nj], ux, vy, nz);
+        }
+      }
+    }
+  }
+
+  // --- JOINT COUPLING: penalty springs between the preprocessed node pairs.
+  //     rigid → all 6 DOF at full stiffness; semi-rigid → translational + 5%
+  //     rotational; hinged → translational + a 0.1% token rotational stiffness
+  //     (regularizes the razor-thin-seam mechanism so PCG converges). ---
+  const addSpring = (gi: number, gj: number, dofOff: number, k: number) => {
+    const di = gi * 6 + dofOff, dj = gj * 6 + dofOff;
+    addK(di, di, k); addK(dj, dj, k);
+    addK(di, dj, -k); addK(dj, di, -k);
+  };
+  for (const jp of jointPairs) {
+    const kTrans = jp.kTrans;
+    const kRot = jp.stiffness === 'rigid' ? kTrans
+      : jp.stiffness === 'semi-rigid' ? kTrans * 0.05
+        : kTrans * 0.001;
+    for (let dof = 0; dof < 3; dof++) addSpring(jp.gi, jp.gj, dof, kTrans);
+    if (kRot > 0) for (let dof = 3; dof < 6; dof++) addSpring(jp.gi, jp.gj, dof, kRot);
+  }
+
+  // Fixed DOFs from grounding.
+  const fixed = new Uint8Array(nDof);
+  for (const g of grounded) {
+    for (let dof = 0; dof < 6; dof++) fixed[g * 6 + dof] = 1;
+  }
+
+  // Soft regularization on every free DOF (kills residual mechanisms).
+  const kSoft = repStiff * 1e-4;
+  for (let g = 0; g < nDof; g++) {
+    if (fixed[g]) continue;
+    const r = rows[g];
+    r.set(g, (r.get(g) ?? 0) + kSoft);
+  }
+
+  // Copy the (pre-BC) load vector; BCs applied below.
+  const Fsolve = new Float64Array(F);
+
   // Apply Dirichlet BCs (homogeneous).
   for (let g = 0; g < nDof; g++) {
-    if (fixed[g]) { F[g] = 0; rows[g] = new Map([[g, 1]]); }
+    if (fixed[g]) { Fsolve[g] = 0; rows[g] = new Map([[g, 1]]); }
   }
   for (let g = 0; g < nDof; g++) {
     if (fixed[g]) continue;
@@ -1657,6 +1790,7 @@ export function solveAssembly(opts: AsmSolveOptions): AsmResult {
       if (diag[g] === 0) diag[g] = 1;
     }
   }
+  const F2 = Fsolve;
 
   // --- LINEAR SOLVE: the open-source WASM core (Eigen LDLT) when available,
   //     else our built-in Jacobi-PCG. Both solve the same symmetric CSR (==CSC)
@@ -1679,7 +1813,7 @@ export function solveAssembly(opts: AsmSolveOptions): AsmResult {
     if (okFac) {
       report({ stage: 'solving', pct: 75, detail: opts.backend.name });
       const ts0 = nowMs();
-      const sol = opts.backend.solve(F);
+      const sol = opts.backend.solve(F2);
       solveMs = nowMs() - ts0;
       if (sol && sol.length === nDof) {
         x.set(sol);
@@ -1699,7 +1833,7 @@ export function solveAssembly(opts: AsmSolveOptions): AsmResult {
     // Jacobi-PCG, rel tol 1e-7, cap 20k.
     report({ stage: 'solving', pct: 60, detail: 'PCG' });
     const ts0 = nowMs();
-    const pcgRes = pcg(rowPtr, colIdx, val, diag, F, x, 1e-7, 20000,
+    const pcgRes = pcg(rowPtr, colIdx, val, diag, F2, x, 1e-7, 20000,
       (it, relRes) => report({
         stage: 'solving', pct: Math.min(90, 60 + (it / 20000) * 30),
         detail: `PCG iter ${it} · res ${relRes.toExponential(1)}`,
@@ -1709,6 +1843,35 @@ export function solveAssembly(opts: AsmSolveOptions): AsmResult {
     converged = pcgRes.converged;
     backend = 'PCG';
   }
+
+  // --- STAGE: stress recovery / verdicts / result packaging — shared with the
+  //     sidecar path via finishAssembly (same recovery over the same x). ---
+  return finishAssembly(pre, x, panels, { backend, factorMs, solveMs, iterations, converged }, report);
+}
+
+/**
+ * From a preprocessed model + a 6-DOF-per-node displacement vector `x`, run the
+ * per-element stress recovery, compute verdicts, and package the AsmResult.
+ * Shared by the internal solve and the sidecar (PyNite) path so both produce an
+ * identical result structure — the ONLY thing a backend changes is `x` and the
+ * stamped backend/timing fields.
+ */
+function finishAssembly(
+  pre: AsmPreprocess, x: Float64Array, panels: AsmPanel[],
+  info: { backend: SolveBackend; factorMs: number; solveMs: number; iterations: number; converged: boolean },
+  report: (p: SolveProgress) => void = () => {},
+): AsmResult {
+  const { meshes, panelD, totalNodes, nDof, resolutionLog, grounded, groundPoints } = pre;
+  const { backend, factorMs, solveMs, iterations, converged } = info;
+
+  const empty = (msg: string): AsmResult => ({
+    ok: false, message: msg, panels: [], maxDisp: 0, maxPanelId: -1, maxAt: [0, 0],
+    spanMm: 0, verdict: 'ok', maxVm: 0, maxVmPanelId: -1, maxVmAt: [0, 0],
+    utilPct: 0, stressVerdict: 'ok',
+    totalDof: nDof, totalNodes, iterations: 0, converged: false,
+    backend, factorMs, solveMs,
+    groundedNodes: grounded.length, resolutionLog, groundPoints,
+  });
 
   // --- STAGE: stress recovery / post-processing — OUR TypeScript. ---
   report({ stage: 'recovering', pct: 92 });
@@ -1814,7 +1977,7 @@ export function solveAssembly(opts: AsmSolveOptions): AsmResult {
   const governing = panels.find((p) => p.id === maxPanelId) ?? panels[0];
   const span = Math.max(governing.outline.bbox.w, governing.outline.bbox.h);
   if (!Number.isFinite(maxDisp) || maxDisp > span * 2) {
-    return { ...empty('Solve produced a non-physical result — check the joints and grounding.'), resolutionLog, totalNodes, totalDof: nDof, iterations, backend, factorMs, solveMs };
+    return { ...empty('Solve produced a non-physical result — check the joints and grounding.'), iterations };
   }
 
   report({ stage: 'done', pct: 100 });

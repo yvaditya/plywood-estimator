@@ -1,0 +1,5 @@
+fastapi
+uvicorn
+PyniteFEA
+numpy
+scipy
