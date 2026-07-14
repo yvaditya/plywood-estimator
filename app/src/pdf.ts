@@ -12,7 +12,7 @@
 import { jsPDF } from 'jspdf';
 import type { NestResult, NestSheet, PlacedPart } from './nest';
 import { fmtDim, fmtArea, fmtSag, type Units } from './units';
-import { assignPartLabels, allCutSteps, cutKeyFor, groupPanelsBySize, groupAllPanelsBySize, type CutStep, type PartLabel, type PanelSizeRow, type SheetOverrides, type KerfRef } from './instructions';
+import { assignPartLabels, allCutSteps, cutKeyFor, groupPanelsBySize, groupAllPanelsBySize, type CutStep, type PartLabel, type PanelSizeRow, type SheetOverrides, type KerfRef, type SequenceStyle } from './instructions';
 
 export type PdfPaper =
   | 'widescreen-16-9'
@@ -38,6 +38,10 @@ export interface PdfOptions {
    *   - 'spacing': spacing only = distance − kerf/2, and the far reference
    *     trim lands exactly at the last part's edge (see cutStepsForSheet). */
   kerfRef?: KerfRef;
+  /** Cut-sequencing style — 'row' (learned "easy cut" row-by-row, default) or
+   *  'optimized' (parallel-guide fewest-setups). Threaded into every
+   *  allCutSteps call so the exported cut pages follow the active style. */
+  sequenceStyle?: SequenceStyle;
   /** Manual cut-sequence overrides keyed by each sheet's `layoutSignature`.
    *  Threaded into every allCutSteps call so the exported sequence, measured
    *  edges and datum colors match what the user arranged in the editor. */
@@ -843,7 +847,7 @@ function buildMobilePdf(result: NestResult, opt: PdfOptions): jsPDF {
       addPage(section);
       drawMobileSheetPage(doc, sheet, opt, dims);
       if (!opt.cnc) {
-        const sc = (allCutSteps({ groups: [{ thickness: sheet.thickness, sheets: [sheet], unplaced: [] }] } as any, opt.margin, opt.kerf, opt.overridesBySig, opt.kerfRef))[0];
+        const sc = (allCutSteps({ groups: [{ thickness: sheet.thickness, sheets: [sheet], unplaced: [] }] } as any, opt.margin, opt.kerf, opt.overridesBySig, opt.kerfRef, opt.sequenceStyle))[0];
         if (sc) {
           for (let i = 0; i < sc.steps.length; i++) {
             addPage(section);
@@ -2175,7 +2179,7 @@ function drawCutsForSingleSheet(
   const PAGE_H = dims.h;
   // Generate a SheetCuts wrapper (cutStepsForSheet handles guillotine vs
   // fallback). We need the same shape drawCutCard expects.
-  const sc = (allCutSteps({ groups: [{ thickness: sheet.thickness, sheets: [sheet], unplaced: [] }] } as any, opt.margin, opt.kerf, opt.overridesBySig, opt.kerfRef))[0];
+  const sc = (allCutSteps({ groups: [{ thickness: sheet.thickness, sheets: [sheet], unplaced: [] }] } as any, opt.margin, opt.kerf, opt.overridesBySig, opt.kerfRef, opt.sequenceStyle))[0];
   if (!sc || sc.steps.length === 0) return;
 
   // Start a new page for the cut cards — keeps the sheet layout page clean.

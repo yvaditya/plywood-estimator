@@ -39,7 +39,7 @@ import {
   saveJobName,
   type ShoppingRow,
 } from './shoppingList';
-import { assignPartLabels, type PartLabel, type KerfRef } from './instructions';
+import { assignPartLabels, type PartLabel, type KerfRef, type SequenceStyle } from './instructions';
 import { openCutEditor, loadAllOverrides } from './cutEditor';
 import { splitOversizeParts, type SegmentGeo } from './splitParts';
 import { toRoman } from './nest';
@@ -180,6 +180,9 @@ const state: {
   currency: string;
   /** How each cut's dimension is quoted at the saw (persisted). */
   kerfRef: KerfRef;
+  /** Cut-sequencing style (persisted). 'row' = learned "easy cut" row-by-row
+   *  (default); 'optimized' = parallel-guide fewest-setups scheduler. */
+  sequenceStyle: SequenceStyle;
   jobName: string;
   partLabels: Map<string, PartLabel>;
   nonSheetCount: number;
@@ -215,6 +218,7 @@ const state: {
   currentSheetKey: null,
   currency: 'USD',
   kerfRef: 'keeper',
+  sequenceStyle: 'row',
   jobName: '',
   partLabels: new Map(),
   nonSheetCount: 0,
@@ -428,6 +432,7 @@ const jobNameInput = $<HTMLInputElement>('jobName');
 const currencySelect = $<HTMLSelectElement>('currency');
 const pdfPaperSelect = $<HTMLSelectElement>('pdfPaper');
 const kerfRefSelect = $<HTMLSelectElement>('kerfRef');
+const sequenceStyleSelect = $<HTMLSelectElement>('sequenceStyle');
 const kerfSelect = $<HTMLSelectElement>('kerfSelect');
 const kerfCustomRow = $('kerfCustomRow');
 
@@ -2022,6 +2027,7 @@ currencySelect.addEventListener('change', () => {
 // numeric #kerf input, which stays in the user's display units (as before).
 // --------------------------------------------------------------------------
 const KERFREF_KEY = 'plywood.kerfRef';
+const SEQSTYLE_KEY = 'plywood.sequenceStyle';
 const KERF_KEY = 'plywood.kerf'; // { mode: 'preset'|'custom', value: mm }
 
 /** Effective kerf in mm from the current select / custom input. */
@@ -2066,6 +2072,16 @@ kerfRefSelect.value = state.kerfRef;
 kerfRefSelect.addEventListener('change', () => {
   state.kerfRef = kerfRefSelect.value as KerfRef;
   try { localStorage.setItem(KERFREF_KEY, state.kerfRef); } catch { /* quota */ }
+  if (state.lastNest) renderResults();
+});
+
+// Sequence style (row-by-row "easy cut" learned default / optimized parallel
+// guide) — persisted. Re-renders so the cut cards + PDF pick up the new order.
+state.sequenceStyle = (localStorage.getItem(SEQSTYLE_KEY) as SequenceStyle) || 'row';
+sequenceStyleSelect.value = state.sequenceStyle;
+sequenceStyleSelect.addEventListener('change', () => {
+  state.sequenceStyle = sequenceStyleSelect.value as SequenceStyle;
+  try { localStorage.setItem(SEQSTYLE_KEY, state.sequenceStyle); } catch { /* quota */ }
   if (state.lastNest) renderResults();
 });
 
@@ -2545,6 +2561,7 @@ function renderResults() {
             kerf: sz.kerf,
             units: state.units,
             kerfRef: state.kerfRef,
+            sequenceStyle: state.sequenceStyle,
             strategy: state.lastStrategy,
             jobName: state.jobName || 'Plywood cut estimate',
             onChange: () => { /* overrides persisted by the editor; PDF reads them */ },
@@ -3291,6 +3308,7 @@ async function exportPdf(btn: HTMLButtonElement, paper: string) {
     jobName: state.jobName || 'Plywood cut estimate',
     paper: paper as any,
     kerfRef: state.kerfRef,
+    sequenceStyle: state.sequenceStyle,
     overridesBySig: loadAllOverrides(),
     currency: state.currency,
     jobCost: totalCost(state.shopping),

@@ -226,6 +226,212 @@ export function indexToLetters(i: number): string {
  *  (no +kerf/2), so the quoted spacing lands on the part face. */
 export type KerfRef = 'keeper' | 'center' | 'spacing';
 
+/** Which cut-sequencing style to emit.
+ *  - `row` — the LEARNED "easy cut" workflow the user recorded manually:
+ *    four squaring trims up front, then a strict top-to-bottom row-by-row
+ *    breakdown (rip a strip off, finish it completely at the bench, move on).
+ *    Derived directly from the sheet's part layout (see `rowModeSteps`).
+ *  - `optimized` — the parallel-guide scheduler (`deriveGuillotineCuts`) that
+ *    minimises flip-stop setups and rip↔cross rotations. THREE trims. */
+export type SequenceStyle = 'row' | 'optimized';
+
+/** REUSABLE offcut threshold — a clean waste strip with BOTH dims ≥ this (mm)
+ *  is worth freeing whole before the parts around it get broken down. Mirrors
+ *  packRect's REUSABLE_MM so row-mode's offcut-first ordering matches the
+ *  optimised scheduler. */
+const ROW_REUSABLE_MM = 200;
+
+/**
+ * LEARNED "easy cut" row-by-row sequencer.
+ *
+ * Emits the exact CutStep list the user produces by hand (validated against
+ * tests/fixtures/cutlog_rowmode.jsonl, the recorded 26-cut "easy cut"
+ * session). Deterministic, derived purely from the sheet's placed parts +
+ * margin + kerf — it does NOT touch `deriveGuillotineCuts`.
+ *
+ * Structure:
+ *   1. FOUR squaring trims (rip / cross / rip / cross), all datum:
+ *      near-long, near-short, far-long, far-short — so every edge is a
+ *      trusted datum before the breakdown begins.
+ *   2. ROW BANDS top-to-bottom. For each row except the last: rip the strip
+ *      off the board remainder, then immediately finish it — crosscut at the
+ *      part boundaries left-to-right; a segment holding a shorter part is
+ *      ripped to height within the segment. The final row is the board
+ *      remainder (no strip rip).
+ *   3. Measurement decoration: strip rips above the sheet's vertical midpoint
+ *      quote from the near (top) long datum, at/below quote from the far
+ *      (bottom) datum → `fromFar`. Crosscuts always quote from the left
+ *      datum (never `fromFar`). Trims are datum.
+ *
+ * A row boundary that coincides with a trim line is deduped (the trim did it).
+ */
+export function rowModeSteps(sheet: NestSheet, margin: number, kerf: number): CutStep[] {
+  const W = sheet.sheetW;
+  const L = sheet.sheetL;
+  const lengthIsY = L >= W;
+  const parts = sheet.parts;
+  if (parts.length === 0) return [];
+
+  const kh = kerf / 2;
+
+  // The sheet is landscape-locked and rows run across the LENGTH axis. We work
+  // in a "flat" frame where the LENGTH axis is horizontal (X) and rows stack
+  // down the WIDTH axis (Y) — this matches the recorded log's part coords
+  // (x along the long edge, y down the short edge). `lengthIsY` tells us how to
+  // translate a flat (rip=const-Y line, cross=const-X line) cut into rip/cross.
+  //
+  //   flat X  == part.x        (runs along the long/length edge)
+  //   flat Y  == part.y        (runs down the short/rows edge)
+  //   rip     == horizontal line (constant Y)  — runs along the length axis
+  //   cross   == vertical line   (constant X)  — cuts across the length axis
+  //
+  // In app rip/cross terms: rip runs parallel to the LENGTH axis. When the
+  // length axis is horizontal (landscape, lengthIsY === false) a constant-Y
+  // line IS the rip; when lengthIsY === true it's the cross. We build steps in
+  // the flat frame then map the axis label accordingly.
+  const ripAxis: 'rip' | 'cross' = lengthIsY ? 'cross' : 'rip';   // const-Y line
+  const crossAxis: 'rip' | 'cross' = lengthIsY ? 'rip' : 'cross'; // const-X line
+
+  const maxX = Math.max(...parts.map((p) => p.x + p.w)); // far long edge (length)
+  const maxY = Math.max(...parts.map((p) => p.y + p.h)); // far short edge (rows)
+
+  // Datum lines. Near datums land at margin + kerf/2 (the recorded style);
+  // far datums land at the part extent + kerf/2 (frees the leftover whole and
+  // squares the edge in one pass).
+  const yTop = margin + kh;   // near long edge (top)
+  const xLeft = margin + kh;  // near short edge (left)
+  const yBot = maxY + kh;     // far long edge (bottom)
+  const xRight = maxX + kh;   // far short edge (right)
+  const midWidth = L / 2;     // sheet's vertical (rows-axis) midpoint
+
+  const steps: CutStep[] = [];
+  // Emit a flat-frame cut. `constY` true → a constant-Y (rip) line at `line`;
+  // false → a constant-X (cross) line. Distance is the NEAR-edge local value
+  // (parentX/Y + distance === absolute line) — matching the log & the tree path.
+  const emit = (
+    constY: boolean, line: number,
+    px: number, py: number, pw: number, ph: number,
+    opts: { fromFar?: boolean; isDatum?: boolean; isTrim?: boolean } = {},
+  ) => {
+    steps.push({
+      index: steps.length + 1,
+      axis: constY ? ripAxis : crossAxis,
+      distance: constY ? line - py : line - px,
+      parentX: px, parentY: py, parentW: pw, parentH: ph,
+      depth: 0,
+      ...(opts.fromFar ? { fromFar: true } : {}),
+      ...(opts.isDatum ? { isDatum: true } : {}),
+      ...(opts.isTrim ? { isTrim: true } : {}),
+    });
+  };
+
+  // 1. FOUR squaring trims — rip / cross / rip / cross, each on what the
+  //    previous left. All datum. Running keeper rect shrinks with each trim.
+  emit(true, yTop, 0, 0, W, L, { isDatum: true, isTrim: true });                       // near long
+  emit(false, xLeft, 0, yTop, W, L - yTop, { isDatum: true, isTrim: true });           // near short
+  emit(true, yBot, xLeft, yTop, W - xLeft, L - yTop, { isDatum: true, isTrim: true });  // far long
+  emit(false, xRight, xLeft, yTop, W - xLeft, yBot - yTop, { isDatum: true, isTrim: true }); // far short
+
+  const bx0 = xLeft, bx1 = xRight; // usable board bounds along the length axis
+
+  // 2. ROW BANDS. Greedily cluster parts into rows top-to-bottom: a row opens
+  //    at the topmost ungrouped part and swallows every part whose top falls
+  //    inside the band, extending the band bottom to the tallest member.
+  interface Row { top: number; bottom: number; members: PlacedLike[] }
+  type PlacedLike = { x: number; y: number; w: number; h: number };
+  const bySort = [...parts].sort((a, b) => a.y - b.y || a.x - b.x);
+  const used = new Set<PlacedLike>();
+  const rows: Row[] = [];
+  for (const p of bySort) {
+    if (used.has(p)) continue;
+    let top = p.y, bottom = p.y + p.h;
+    const members: PlacedLike[] = [];
+    for (const q of bySort) {
+      if (used.has(q)) continue;
+      if (q.y >= top - 1 && q.y < bottom - 1) {
+        members.push(q); used.add(q);
+        bottom = Math.max(bottom, q.y + q.h);
+      }
+    }
+    members.sort((a, b) => a.x - b.x);
+    rows.push({ top, bottom, members });
+  }
+
+  // Finish one strip [sx0..sx0+sw] × [sy0..sy0+sh] holding `mems`.
+  const finishStrip = (
+    sx0: number, sy0: number, sw: number, sh: number,
+    mems: PlacedLike[], bandH: number, lastRow: boolean,
+  ) => {
+    const stripRight = sx0 + sw;
+    const last = mems[mems.length - 1];
+    const lastR = last.x + last.w + kh;
+    const farWaste = stripRight - lastR;
+    const lastFullHeight = last.h >= bandH - 1;
+    // A reusable clean strip beyond a FULL-HEIGHT last member is freed first
+    // (offcut-first) — matches the guillotine scheduler's REUSABLE_MM rule.
+    const hasReusableFar = lastFullHeight && farWaste > 2 &&
+      Math.min(farWaste, sh) >= ROW_REUSABLE_MM;
+    if (hasReusableFar) emit(false, lastR, sx0, sy0, sw, sh);
+
+    // Base crosscut order: left-to-right for a ripped strip, right-to-left for
+    // the last-row remainder (the recorded workflow closes the far internal
+    // boundary of the final board remainder first).
+    const idx = mems.map((_, i) => i);
+    const order = lastRow ? idx.reverse() : idx;
+    const ripToHeight = (q: PlacedLike, segX: number, segW: number) => {
+      if (q.h >= bandH - 1) return;
+      const wasteTop = q.y - sy0, wasteBot = (sy0 + sh) - (q.y + q.h);
+      const ripLine = wasteTop >= wasteBot ? q.y - kh : q.y + q.h + kh;
+      emit(true, ripLine, segX, sy0, segW, sh, { fromFar: ripLine > midWidth });
+    };
+    for (const i of order) {
+      const q = mems[i];
+      const qR = q.x + q.w + kh;
+      const segX = i > 0 ? mems[i - 1].x + mems[i - 1].w + kh : sx0;
+      // Rip a shorter part to height BEFORE closing its segment.
+      ripToHeight(q, segX, qR - segX);
+      // Close the segment with a crosscut unless it already sits at the strip's
+      // right edge (far trim did it) or was freed by the offcut-first cut.
+      let reachesRight = Math.abs(qR - stripRight) < 2;
+      if (hasReusableFar && Math.abs(qR - lastR) < 2) reachesRight = true;
+      if (!reachesRight) emit(false, qR, segX, sy0, stripRight - segX, sh);
+    }
+  };
+
+  // Walk rows top-to-bottom. Every row but the last rips its strip off the
+  // shrinking board remainder first, then is finished in place.
+  let curTop = yTop;
+  rows.forEach((r, ri) => {
+    const isLast = ri === rows.length - 1;
+    const stripBottom = r.bottom + kh;
+    const boardH = yBot - curTop;
+    const bandH = r.bottom - r.top;
+    let stripH: number;
+    if (!isLast) {
+      emit(true, stripBottom, bx0, curTop, bx1 - bx0, boardH, { fromFar: stripBottom > midWidth });
+      stripH = stripBottom - curTop;
+    } else {
+      stripH = boardH;
+    }
+    finishStrip(bx0, curTop, bx1 - bx0, stripH, r.members, bandH, isLast);
+    curTop = stripBottom;
+  });
+
+  // Dedup: a cut landing exactly on a squaring-trim line is already made.
+  const lineOf = (s: CutStep) => {
+    const constY = s.axis === ripAxis;
+    return { constY, coord: constY ? s.parentY + s.distance : s.parentX + s.distance };
+  };
+  const trims = steps.filter((s) => s.isTrim).map(lineOf);
+  const deduped = steps.filter((s) => {
+    if (s.isTrim) return true;
+    const l = lineOf(s);
+    return !trims.some((t) => t.constY === l.constY && Math.abs(t.coord - l.coord) < 0.75);
+  });
+  deduped.forEach((s, i) => { s.index = i + 1; });
+  return deduped;
+}
+
 export function cutStepsForSheet(
   sheet: NestSheet,
   sheetIndex: number,
@@ -234,6 +440,7 @@ export function cutStepsForSheet(
   kerf = 0,
   overrides?: SheetOverrides,
   kerfRef: KerfRef = 'keeper',
+  sequenceStyle: SequenceStyle = 'row',
 ): SheetCuts {
   const W = sheet.sheetW;
   const L = sheet.sheetL;
@@ -364,6 +571,35 @@ export function cutStepsForSheet(
       steps: markSameSetting(all),
       isGuillotineTree: true,
     };
+  }
+
+  // Row-mode path: the LEARNED "easy cut" sequencer. Distinct from the
+  // optimised tree — four squaring trims then a strict top-to-bottom row
+  // breakdown. Runs when the active sequence style is 'row' and margin > 0
+  // (the trims need a margin to strip). Per-cut fromFar/isDatum overrides the
+  // user has saved still apply; datum trims stay pinned. Falls through to the
+  // optimised path when there's no margin (nothing to square off) so the mode
+  // is always well-defined.
+  if (sequenceStyle === 'row' && margin > 0 && sheet.parts.length > 0) {
+    const rowSteps = rowModeSteps(sheet, margin, kerf);
+    if (rowSteps.length > 0) {
+      // Stamp per-cut overrides (edge flips / user datums) onto non-trim cuts.
+      for (const s of rowSteps) {
+        if (s.isTrim) { s.isDatum = true; continue; }
+        const o = overrides?.perCut?.[cutKeyFor(s)];
+        if (o) {
+          if (o.fromFar) s.fromFar = true;
+          if (o.isDatum) s.isDatum = true;
+        }
+      }
+      rowSteps.forEach((s, i) => { s.index = i + 1; });
+      return {
+        sheetIndex, globalIndex: sheet.globalIndex || sheetIndex, groupIndex,
+        thickness: sheet.thickness, sheetW: W, sheetL: L,
+        steps: markSameSetting(rowSteps),
+        isGuillotineTree: true,
+      };
+    }
   }
 
   // Cut-tree path: a recorded tree exists (shelf packer, or recovered from a
@@ -541,12 +777,13 @@ export function allCutSteps(
   kerf = 0,
   overridesBySig?: Record<string, SheetOverrides>,
   kerfRef: KerfRef = 'keeper',
+  sequenceStyle: SequenceStyle = 'row',
 ): SheetCuts[] {
   const out: SheetCuts[] = [];
   result.groups.forEach((g, gi) => {
     g.sheets.forEach((s, si) => {
       const ov = overridesBySig?.[layoutSignature(s)];
-      out.push(cutStepsForSheet(s, si + 1, gi + 1, margin, kerf, ov, kerfRef));
+      out.push(cutStepsForSheet(s, si + 1, gi + 1, margin, kerf, ov, kerfRef, sequenceStyle));
     });
   });
   return out;

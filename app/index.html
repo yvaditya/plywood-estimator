@@ -117,6 +117,12 @@
                 <option value="cnc">CNC nest (any angle · router / waterjet)</option>
               </select>
             </label>
+            <label style="grid-column: 1 / -1" title="How the cut order is sequenced at the bench">Sequence style
+              <select id="sequenceStyle">
+                <option value="row" selected>Row by row — easy cut (learned)</option>
+                <option value="optimized">Optimized — parallel guide (fewest setups)</option>
+              </select>
+            </label>
             <label>Optimize tries
               <select id="restarts">
                 <option value="1">1 (fastest)</option>

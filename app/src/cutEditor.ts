@@ -52,6 +52,7 @@ import {
   type SheetOverrides,
   type DatumEdge,
   type KerfRef,
+  type SequenceStyle,
 } from './instructions';
 import { fmtDim, type Units } from './units';
 import {
@@ -432,6 +433,9 @@ export interface CutEditorContext {
   kerf: number;
   units: Units;
   kerfRef: KerfRef;
+  /** Active sequence style — the editor auto-completes in THIS style so the
+   *  suggested sequence matches what the PDF will emit. */
+  sequenceStyle: SequenceStyle;
   strategy: string;
   jobName: string;
   /** Called after any change so the caller can re-render / persist externally
@@ -467,7 +471,7 @@ const SVG_NS = 'http://www.w3.org/2000/svg';
 
 /** Trims + auto layout for the current sheet (engine order, no overrides). */
 function deriveAuto(ctx: CutEditorContext): { trims: CutStep[]; layout: CutStep[]; steps: CutStep[] } {
-  const sc = cutStepsForSheet(ctx.sheet, ctx.sheet.globalIndex || 1, 1, ctx.margin, ctx.kerf, undefined, ctx.kerfRef);
+  const sc = cutStepsForSheet(ctx.sheet, ctx.sheet.globalIndex || 1, 1, ctx.margin, ctx.kerf, undefined, ctx.kerfRef, ctx.sequenceStyle);
   const trims = sc.steps.filter((s) => s.isTrim);
   const layout = sc.steps.filter((s) => !s.isTrim);
   return { trims, layout, steps: sc.steps };
