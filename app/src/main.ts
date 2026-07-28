@@ -55,11 +55,17 @@ import {
   solveAssembly,
   serializeAssembly,
   recoverAssembly,
+  previewAssembly,
+  heatColor,
   type Verdict,
+  type CaeMeshView,
+  type CaeConstraintView,
+  type MeshKind,
   type AsmPanel,
   type AsmJoint,
   type AsmLoad,
   type AsmPanelResult,
+  type AsmSolveOptions,
   type JointStiffness,
   type SolveProgress,
 } from './cae';
@@ -166,7 +172,22 @@ interface AsmState {
   /** Cached last solve result + the panel bodies it covered, so the field
    *  toggle can re-texture the overlays WITHOUT re-solving. Cleared whenever
    *  joints/loads change (same lifecycle as `analysis`). */
-  lastSolve: { res: ReturnType<typeof solveAssembly>; panelIds: number[] } | null;
+  lastSolve: { res: ReturnType<typeof solveAssembly>; panelIds: number[]; meshKey: string } | null;
+  /** Element family the mesh is built from — 'shell' (fast, 6 DOF/node) or
+   *  'solid' (hexes through the thickness, 3 DOF/node). */
+  meshKind: MeshKind;
+  /** Target active nodes per panel handed to the mesher. Drives density. */
+  targetNodes: number;
+  /** Hex layers through the thickness (solid only). */
+  solidLayers: number;
+  /** The un-solved mesh + constraints from previewAssembly, so the mesh can be
+   *  inspected BEFORE committing to a solve. Invalidated with the joints. */
+  preview: { mesh: CaeMeshView; constraints: CaeConstraintView; resolutionLog: string } | null;
+  /** Which CAE overlays are visible. */
+  show: { mesh: boolean; nodes: boolean; supports: boolean; couplings: boolean; loads: boolean };
+  /** Deformed-shape exaggeration; 0 = undeformed. 'auto' picks a factor that
+   *  makes the peak deflection ≈ 6% of the model diagonal. */
+  deformScale: number | 'auto';
 }
 
 const state: {
@@ -230,7 +251,13 @@ const state: {
   splitSegmentGeo: new Map(),
   splitInfo: [],
   jobMaterial: DEFAULT_MATERIAL_ID,
-  asm: { cabinet: null, tolMm: 2, joints: [], loads: [], solveMsg: '', analysis: null, detected: false, field: 'deflection', lastSolve: null },
+  asm: {
+    cabinet: null, tolMm: 2, joints: [], loads: [], solveMsg: '', analysis: null,
+    detected: false, field: 'deflection', lastSolve: null,
+    meshKind: 'shell', targetNodes: 600, solidLayers: 2, preview: null,
+    show: { mesh: true, nodes: false, supports: true, couplings: true, loads: true },
+    deformScale: 'auto',
+  },
 };
 
 // --------------------------------------------------------------------------
@@ -780,7 +807,13 @@ function clearAll() {
   state.partLabels = new Map();
   nextBodyId = 0;
   cumulativeRightX = 0;
-  state.asm = { cabinet: null, tolMm: state.asm.tolMm, joints: [], loads: [], solveMsg: '', analysis: null, detected: false, field: state.asm.field, lastSolve: null };
+  // Keep the user's mesh + display preferences across a Clear; only the model
+  // (cabinet, joints, loads, results) resets.
+  state.asm = {
+    ...state.asm,
+    cabinet: null, joints: [], loads: [], solveMsg: '', analysis: null,
+    detected: false, lastSolve: null, preview: null,
+  };
   viewer.clearAssemblyOverlay();
   viewer.clear();
   renderBodyList();
@@ -1045,35 +1078,27 @@ function outlineFrame(b: BodyState): { origin: Vec3; uAxis: Vec3; vAxis: Vec3; n
   return { origin, uAxis, vAxis, normal };
 }
 
+/**
+ * The panel's MID-SURFACE frame — the reference plane a shell/solid FE model
+ * has to be built on.
+ *
+ * `outlineFrame` returns the +FACE plane, which is what the UI wants (heatmap
+ * overlays and load markers are painted ON the visible face). Handing that same
+ * plane to the solver puts every panel's model half a thickness off its true
+ * centre, so a butt joint's edge-to-face distance comes out anywhere from 0 to
+ * a full thickness depending on which way each panel's face normal happens to
+ * point — and contacts get missed. It also puts a solid extrusion half outside
+ * the part.
+ */
+function panelMidFrame(b: BodyState): { origin: Vec3; uAxis: Vec3; vAxis: Vec3; normal: Vec3 } {
+  const f = outlineFrame(b);
+  return { ...f, origin: v3add(f.origin, v3scale(f.normal, -b.analysis.thickness / 2)) };
+}
+
 function forceToN(val: number, unit: 'N' | 'kg' | 'lbf'): number {
   if (unit === 'kg') return val * 9.80665;
   if (unit === 'lbf') return val * 4.4482216;
   return val;
-}
-
-/** Blue→green→yellow→red heat color for t ∈ [0,1]. */
-function heatColor(t: number): [number, number, number] {
-  t = Math.max(0, Math.min(1, t));
-  // 4-stop ramp
-  const stops: [number, [number, number, number]][] = [
-    [0.0, [40, 90, 220]],
-    [0.34, [40, 190, 120]],
-    [0.67, [235, 205, 50]],
-    [1.0, [220, 55, 45]],
-  ];
-  for (let i = 0; i < stops.length - 1; i++) {
-    const [t0, c0] = stops[i];
-    const [t1, c1] = stops[i + 1];
-    if (t <= t1) {
-      const f = (t - t0) / (t1 - t0 || 1);
-      return [
-        Math.round(c0[0] + (c1[0] - c0[0]) * f),
-        Math.round(c0[1] + (c1[1] - c0[1]) * f),
-        Math.round(c0[2] + (c1[2] - c0[2]) * f),
-      ];
-    }
-  }
-  return stops[stops.length - 1][1];
 }
 
 /** Build a CanvasTexture of one panel's result field for the overlay. `field`
@@ -1155,13 +1180,134 @@ const asmResult = $('asmResult');
 const asmFieldToggle = $('asmFieldToggle');
 const asmFieldDefl = $<HTMLButtonElement>('asmFieldDefl');
 const asmFieldStress = $<HTMLButtonElement>('asmFieldStress');
+const asmMeshKind = $<HTMLSelectElement>('asmMeshKind');
+const asmMeshDensity = $<HTMLSelectElement>('asmMeshDensity');
+const asmSolidLayers = $<HTMLSelectElement>('asmSolidLayers');
+const asmSolidLayersRow = $('asmSolidLayersRow');
+const asmMeshStats = $('asmMeshStats');
+const asmDeformRow = $('asmDeformRow');
+const asmDeformScale = $<HTMLSelectElement>('asmDeformScale');
+const asmLegend = $('asmLegend');
+const asmShowMesh = $<HTMLInputElement>('asmShowMesh');
+const asmShowNodes = $<HTMLInputElement>('asmShowNodes');
+const asmShowSupports = $<HTMLInputElement>('asmShowSupports');
+const asmShowCouplings = $<HTMLInputElement>('asmShowCouplings');
+const asmShowLoads = $<HTMLInputElement>('asmShowLoads');
+
+/**
+ * The solve options for the Analysis section's current cabinet — the single
+ * place the model is assembled from UI state. Both the mesh preview and the
+ * solve go through here so they can never disagree about the model.
+ */
+function currentAsmOptions(): { opts: AsmSolveOptions; panels: BodyState[] } | null {
+  const panels = cabinetPanels();
+  if (panels.length < 1) return null;
+  const byId = new Map(panels.map((b) => [b.id, b] as const));
+  const asmPanels = panels.map(asmPanelForBody);
+
+  const joints: AsmJoint[] = state.asm.joints
+    .filter((j) => byId.has(j.a) && byId.has(j.b))
+    .map((j) => ({ a: j.a, b: j.b, p0: j.p0, p1: j.p1, length: j.length, stiffness: j.stiffness }));
+
+  const loads: AsmLoad[] = state.asm.loads
+    .filter((l) => l.val > 0 && l.panelId != null && byId.has(l.panelId))
+    .map((l) => {
+      const b = byId.get(l.panelId!)!;
+      const pt = l.pt ?? { x: b.analysis.outline.bbox.w / 2, y: b.analysis.outline.bbox.h / 2 };
+      const magN = forceToN(l.val, l.unit);
+      return { panelId: l.panelId!, x: pt.x, y: pt.y, N: l.down ? magN : -magN, shape: l.shape, size: l.sizeMm };
+    });
+
+  return {
+    opts: {
+      panels: asmPanels, joints, loads, tolMm: state.asm.tolMm,
+      targetNodesPerPanel: state.asm.targetNodes,
+      // The DOF cap has to track the density choice. Left at the 60k default,
+      // the mesher's auto-coarsen loop pulls "Fine" straight back down to the
+      // same mesh as "Medium" — the setting silently does nothing.
+      maxDof: asmMaxDof(),
+      meshKind: state.asm.meshKind,
+      solidLayers: state.asm.solidLayers,
+    },
+    panels,
+  };
+}
+
+/**
+ * The `maxDof` handed to the mesher for the current density choice.
+ *
+ * The mesher's own budget is expressed in SHELL nodes × 6, so this converts a
+ * "nodes per panel" request into that currency, with ×1.6 headroom so the
+ * auto-coarsen loop lands near the requested density instead of clipping it.
+ * A solid mesh multiplies each in-plane node by (layers+1)×3 DOF, so its
+ * in-plane grid gets pulled back to keep the assembled system the same size.
+ */
+// Solid gets a much lower ceiling than shell: a hex has 8 nodes coupling 24
+// DOF (vs a quad's 4 × 6), so both the assembly scatter and the factorization
+// fill grow far faster per DOF. 60k solid DOF factorizes in about the same
+// wall-clock as 150k shell DOF.
+const CAE_DOF_CEILING = { shell: 150_000, solid: 60_000 } as const;
+
+function asmMaxDof(): number {
+  const panels = Math.max(1, cabinetPanels().length);
+  const solid = state.asm.meshKind === 'solid';
+  let shellNodes = state.asm.targetNodes * panels * 1.6;
+  const dofPerShellNode = solid ? 3 * (state.asm.solidLayers + 1) : 6;
+  shellNodes = Math.min(shellNodes, CAE_DOF_CEILING[solid ? 'solid' : 'shell'] / dofPerShellNode);
+  return Math.ceil(shellNodes * 6);
+}
+
+/** A mesh setting changed: the cached solve belongs to a mesh that no longer
+ *  exists, so drop it, rebuild the preview and repaint. */
+function onMeshSettingsChanged() {
+  state.asm.lastSolve = null;
+  state.asm.analysis = null;
+  if (state.asm.detected) {
+    buildCaePreview();
+    state.asm.solveMsg = state.asm.preview
+      ? `Mesh rebuilt — ${state.asm.preview.resolutionLog}. Solve to get results.`
+      : state.asm.solveMsg;
+  }
+  paintCaeVisuals();
+  renderAnalysisSection();
+}
+
+asmMeshKind.addEventListener('change', () => {
+  state.asm.meshKind = asmMeshKind.value === 'solid' ? 'solid' : 'shell';
+  asmSolidLayersRow.hidden = state.asm.meshKind !== 'solid';
+  onMeshSettingsChanged();
+});
+asmMeshDensity.addEventListener('change', () => {
+  state.asm.targetNodes = Number(asmMeshDensity.value) || 600;
+  onMeshSettingsChanged();
+});
+asmSolidLayers.addEventListener('change', () => {
+  state.asm.solidLayers = Number(asmSolidLayers.value) || 2;
+  onMeshSettingsChanged();
+});
+asmDeformScale.addEventListener('change', () => {
+  state.asm.deformScale = asmDeformScale.value === 'auto' ? 'auto' : Number(asmDeformScale.value);
+  paintCaeVisuals();
+});
+
+const bindShow = (el: HTMLInputElement, key: keyof typeof state.asm.show) => {
+  el.addEventListener('change', () => {
+    state.asm.show[key] = el.checked;
+    paintCaeVisuals();
+  });
+};
+bindShow(asmShowMesh, 'mesh');
+bindShow(asmShowNodes, 'nodes');
+bindShow(asmShowSupports, 'supports');
+bindShow(asmShowCouplings, 'couplings');
+bindShow(asmShowLoads, 'loads');
 
 /** Switch the heatmap field (Deflection/Stress). Re-textures from the cached
  *  solve — no re-solve. Updates the result line's leading emphasis too. */
 function setAsmField(field: 'deflection' | 'stress') {
   if (state.asm.field === field) return;
   state.asm.field = field;
-  paintAsmField(field);
+  paintCaeVisuals();
   renderAnalysisSection();
 }
 asmFieldDefl.addEventListener('click', () => setAsmField('deflection'));
@@ -1196,7 +1342,7 @@ function panelLabel(b: BodyState): string {
 
 /** Build a solver AsmPanel from a body using its world outline frame. */
 function asmPanelForBody(b: BodyState): AsmPanel {
-  const f = outlineFrame(b);
+  const f = panelMidFrame(b);
   return {
     id: b.id,
     label: panelLabel(b),
@@ -1256,33 +1402,45 @@ function detectAssemblyJoints() {
   renderAnalysisSection();
 }
 
-/** Draw joint lines + floor glyphs + load markers for the current (unsolved
- *  or solved) assembly state. */
+/**
+ * Redraw everything the Analysis mode shows in 3D for the current (unsolved or
+ * solved) state: the FE mesh, the solver's real boundary conditions, and the
+ * load-placement markers.
+ *
+ * The supports drawn here are the nodes the solver GROUNDS — read back out of
+ * the preprocessed model — not an estimate from panel corners. When the model
+ * isn't meshable yet we fall back to the app-level joint segments so the joints
+ * list still has something to point at.
+ */
 function paintAssemblyPreview() {
-  const panels = cabinetPanels();
-  const byId = new Map(panels.map((b) => [b.id, b] as const));
-  // Joint lines coloured by stiffness.
-  viewer.showAssemblyJoints(state.asm.joints.map((j) => ({
-    p0: j.p0, p1: j.p1, stiffness: j.stiffness,
-  })));
-  // Floor glyphs: the floor datum is the assembly's LOWEST world z (the base
-  // the cabinet stands on). Mark each panel corner/edge-mid near that plane.
-  const cornerPts: [number, number, number][] = [];
-  for (const b of panels) {
-    const f = outlineFrame(b);
-    const w = b.analysis.outline.bbox.w, h = b.analysis.outline.bbox.h;
-    for (const [su, sv] of [[0, 0], [w, 0], [w, h], [0, h], [w / 2, 0], [w / 2, h]] as [number, number][]) {
-      cornerPts.push(v3add(v3add(f.origin, v3scale(f.uAxis, su)), v3scale(f.vAxis, sv)));
-    }
+  const built = state.asm.detected ? buildCaePreview() : false;
+  if (built) {
+    // The node-pair couplings supersede the app-level joint segments (same
+    // joints, drawn where the solver actually couples them), and the grounded
+    // nodes supersede the corner-derived floor chevrons.
+    viewer.clearAssemblyJoints();
+    viewer.clearFloorGlyphs();
+  } else {
+    state.asm.preview = null;
+    viewer.showAssemblyJoints(state.asm.joints.map((j) => ({
+      p0: j.p0, p1: j.p1, stiffness: j.stiffness,
+    })));
+    viewer.clearFloorGlyphs();
   }
-  let floorZ = Infinity;
-  for (const p of cornerPts) if (p[2] < floorZ) floorZ = p[2];
-  const band = Math.max(state.asm.tolMm, 6);
-  const glyphs = cornerPts.filter((p) => p[2] - floorZ <= band);
-  viewer.showFloorGlyphs(glyphs);
-  // Load markers.
+  paintCaeVisuals();
   repaintAsmLoadMarkers();
-  void byId;
+}
+
+/**
+ * A load changed. The constraint view's nodal force vectors are derived from
+ * the loads by the preprocessor, so they have to be rebuilt — and any cached
+ * solve now belongs to a different load case, so it's dropped rather than left
+ * on screen looking current.
+ */
+function onAsmLoadsChanged() {
+  state.asm.lastSolve = null;
+  state.asm.analysis = null;
+  paintAssemblyPreview();
 }
 
 /** Redraw every assembly load marker (reuses the per-body load marker API). */
@@ -1381,21 +1539,15 @@ async function solveAssemblyForCabinet(
     renderAnalysisSection();
     return;
   }
-  const asmPanels = panels.map(asmPanelForBody);
+  const cur = currentAsmOptions();
+  if (!cur) {
+    state.asm.solveMsg = 'No panels selected for this cabinet.';
+    renderAnalysisSection();
+    return;
+  }
+  const asmPanels = cur.opts.panels;
+  const loads = cur.opts.loads;
   const byId = new Map(panels.map((b) => [b.id, b] as const));
-
-  const joints: AsmJoint[] = state.asm.joints
-    .filter((j) => byId.has(j.a) && byId.has(j.b))
-    .map((j) => ({ a: j.a, b: j.b, p0: j.p0, p1: j.p1, length: j.length, stiffness: j.stiffness }));
-
-  const loads: AsmLoad[] = state.asm.loads
-    .filter((l) => l.val > 0 && l.panelId != null && byId.has(l.panelId))
-    .map((l) => {
-      const b = byId.get(l.panelId!)!;
-      const pt = l.pt ?? { x: b.analysis.outline.bbox.w / 2, y: b.analysis.outline.bbox.h / 2 };
-      const magN = forceToN(l.val, l.unit);
-      return { panelId: l.panelId!, x: pt.x, y: pt.y, N: l.down ? magN : -magN, shape: l.shape, size: l.sizeMm };
-    });
 
   if (loads.length === 0) {
     state.asm.solveMsg = 'No load — add a load or apply a preset first.';
@@ -1427,7 +1579,7 @@ async function solveAssemblyForCabinet(
   await stage(SOLVE_STAGE_LABEL.assembling, 25);
   await yieldFrame();
 
-  const solveOpts = { panels: asmPanels, joints, loads, tolMm: state.asm.tolMm };
+  const solveOpts = cur.opts;
   let res: ReturnType<typeof solveAssembly> | null = null;
 
   // --- PRIMARY: PyNite local sidecar. Serialize → POST → map displacements
@@ -1490,8 +1642,7 @@ async function solveAssemblyForCabinet(
 
   // Cache the result so the Deflection/Stress field toggle can re-texture the
   // overlays without re-solving, then paint the current field.
-  state.asm.lastSolve = { res, panelIds: panels.map((b) => b.id) };
-  paintAsmField(state.asm.field);
+  state.asm.lastSolve = { res, panelIds: panels.map((b) => b.id), meshKey: meshSettingsKey() };
   paintAssemblyPreview();
 
   const maxBody = byId.get(res.maxPanelId);
@@ -1556,6 +1707,156 @@ function paintAsmField(field: 'deflection' | 'stress') {
   }
 }
 
+// --------------------------------------------------------------------------
+// MESH + CONSTRAINT VIEW
+//
+// `previewAssembly` runs the SAME preprocessing the solve runs, so what is
+// drawn here — element grid, grounded nodes, joint couplings, nodal force
+// vectors — is the model the solver will actually see, not an illustration of
+// it. Changing any mesh setting invalidates a cached solve, because the result
+// no longer belongs to the mesh on screen.
+// --------------------------------------------------------------------------
+
+/** Every mesh-affecting setting, as a comparison key. */
+function meshSettingsKey(): string {
+  const s = state.asm;
+  return `${s.meshKind}:${s.targetNodes}:${s.solidLayers}`;
+}
+
+/** Build (or rebuild) the un-solved mesh + constraint preview. Cheap enough to
+ *  run on any model edit; returns false when the model isn't solvable yet. */
+function buildCaePreview(): boolean {
+  const cur = currentAsmOptions();
+  if (!cur) { state.asm.preview = null; return false; }
+  const pv = previewAssembly(cur.opts);
+  if (!pv.ok) {
+    state.asm.preview = null;
+    state.asm.solveMsg = pv.message;
+    return false;
+  }
+  state.asm.preview = { mesh: pv.mesh, constraints: pv.constraints, resolutionLog: pv.resolutionLog };
+  return true;
+}
+
+/** Resolve the deformed-shape exaggeration. 'auto' scales the peak deflection
+ *  to ~6% of the model diagonal, which reads clearly at any zoom. */
+function resolveDeformScale(maxDisp: number): number {
+  const s = state.asm.deformScale;
+  if (s === 0) return 0;
+  if (typeof s === 'number') return s;
+  if (!(maxDisp > 0)) return 0;
+  const diag = viewer.modelDiagonal() || 1000;
+  return (diag * 0.06) / maxDisp;
+}
+
+/** True when the cached solve was produced from the mesh currently on screen. */
+function solveMatchesMesh(): boolean {
+  const ls = state.asm.lastSolve;
+  return !!ls && ls.res.ok && !!ls.res.mesh && ls.meshKey === meshSettingsKey();
+}
+
+/** Draw the FE mesh — contoured + deformed when a matching solve is cached,
+ *  plain translucent gray otherwise. */
+function paintCaeMesh() {
+  const st = state.asm;
+  const solved = solveMatchesMesh() ? st.lastSolve!.res : null;
+  const mesh = solved?.mesh ?? st.preview?.mesh ?? null;
+  if (!st.show.mesh || !mesh) {
+    viewer.clearCaeMesh();
+    viewer.setCaeMeshFocus(false);
+    return;
+  }
+  const contoured = !!solved;
+  viewer.setCaeMeshFocus(true);
+  viewer.showCaeMesh(mesh, {
+    faces: true,
+    edges: true,
+    points: st.show.nodes,
+    field: contoured ? (st.field === 'stress' ? solved!.nodeVm : solved!.nodeDispMag) : null,
+    fieldMax: contoured ? (st.field === 'stress' ? solved!.maxVm : solved!.maxDisp) : 0,
+    disp: contoured ? solved!.nodeDisp : null,
+    dispScale: contoured ? resolveDeformScale(solved!.maxDisp) : 0,
+    opacity: 1,
+  });
+}
+
+/** Draw the boundary conditions: fixed nodes, joint couplings, load vectors. */
+function paintCaeConstraints() {
+  const st = state.asm;
+  const solved = solveMatchesMesh() ? st.lastSolve!.res : null;
+  const cv = solved?.constraints ?? st.preview?.constraints ?? null;
+  if (!cv) { viewer.clearCaeConstraints(); return; }
+  const glyphMm = Math.max(5, (viewer.modelDiagonal() || 1000) * 0.006);
+  viewer.showCaeConstraints({
+    supports: st.show.supports ? cv.grounded : null,
+    couplings: st.show.couplings ? cv.jointLinks : null,
+    loads: st.show.loads ? cv.loads : null,
+  }, { glyphMm });
+}
+
+/** Repaint every CAE overlay from current state. The mesh view and the
+ *  smoothed per-panel texture are mutually exclusive — drawing both puts two
+ *  surfaces at the same depth and neither reads. */
+function paintCaeVisuals() {
+  const st = state.asm;
+  if (st.show.mesh) {
+    // Clear EVERY panel's texture overlay, not just the last solve's — the PDF
+    // capture and earlier solves both leave quads behind, and they'd hang in
+    // front of the deformed mesh as an undeformed ghost.
+    for (const b of state.bodies) viewer.clearDeflectionOverlay(b.id);
+    paintCaeMesh();
+  } else {
+    viewer.clearCaeMesh();
+    viewer.setCaeMeshFocus(false);
+    paintAsmField(st.field);
+  }
+  paintCaeConstraints();
+  renderMeshStats();
+  renderCaeLegend();
+}
+
+/** Mesh resolution + constraint counts under the Mesh controls. */
+function renderMeshStats() {
+  const st = state.asm;
+  const solved = solveMatchesMesh() ? st.lastSolve!.res : null;
+  const mesh = solved?.mesh ?? st.preview?.mesh ?? null;
+  const cv = solved?.constraints ?? st.preview?.constraints ?? null;
+  if (!mesh) {
+    asmMeshStats.innerHTML = '<span class="asm-hint">Detect joints to build the mesh.</span>';
+    return;
+  }
+  const elemWord = mesh.nodesPerElem === 8 ? 'hex' : 'quad';
+  const size = Math.abs(mesh.maxEdgeMm - mesh.minEdgeMm) < 0.05
+    ? fmtSag(mesh.minEdgeMm, state.units)
+    : `${fmtSag(mesh.minEdgeMm, state.units)}–${fmtSag(mesh.maxEdgeMm, state.units)}`;
+  const rows = [
+    `<b>${mesh.elemCount.toLocaleString()}</b> ${elemWord} · <b>${mesh.nodeCount.toLocaleString()}</b> nodes · <b>${mesh.dofCount.toLocaleString()}</b> DOF`,
+    `element size ${size}${mesh.kind === 'solid' ? ` · ${mesh.throughLayers} layer${mesh.throughLayers === 1 ? '' : 's'} through t` : ''}`,
+  ];
+  if (cv) {
+    rows.push(
+      `<b>${cv.groundedCount.toLocaleString()}</b> fixed nodes · <b>${cv.jointLinks.length.toLocaleString()}</b> couplings · <b>${cv.loads.length.toLocaleString()}</b> loaded nodes (${cv.totalLoadN.toFixed(0)} N)`,
+    );
+  }
+  asmMeshStats.innerHTML = rows.map((r) => `<div class="asm-mesh-stat">${r}</div>`).join('');
+}
+
+/** Colour-ramp legend for the contoured mesh (min → max of the shown field). */
+function renderCaeLegend() {
+  const solved = solveMatchesMesh() ? state.asm.lastSolve!.res : null;
+  if (!solved) { asmLegend.innerHTML = ''; return; }
+  const stress = state.asm.field === 'stress';
+  const hi = stress ? `${solved.maxVm.toFixed(2)} MPa` : fmtSag(solved.maxDisp, state.units);
+  const stops = [0, 0.25, 0.5, 0.75, 1]
+    .map((t) => `rgb(${heatColor(t).join(',')}) ${t * 100}%`)
+    .join(', ');
+  asmLegend.innerHTML =
+    `<span class="asm-legend-cap">${stress ? 'von Mises' : 'deflection'}</span>`
+    + `<span class="asm-legend-lo">0</span>`
+    + `<span class="asm-legend-bar" style="background:linear-gradient(90deg, ${stops})"></span>`
+    + `<span class="asm-legend-hi">${hi}</span>`;
+}
+
 /** Snapshot the solved cabinet with BOTH field overlays (deflection + stress)
  *  for the PDF and store the analysis. Restores the on-screen field after. */
 async function captureAssemblyAnalysis(
@@ -1564,6 +1865,15 @@ async function captureAssemblyAnalysis(
   await yieldFrame();
   const SHOT = { w: 1400, h: 1000 };
   const visibleIds = new Set(panels.map((b) => b.id));
+
+  // The PDF pages show the smoothed per-panel texture on the shaded solids, so
+  // step out of the mesh view for the duration of the capture: the mesh overlay
+  // and the texture overlay occupy the same depth, and the texture quads are
+  // separate objects that would otherwise keep floating in front of the mesh
+  // as an undeformed ghost after the capture restores.
+  viewer.clearCaeMesh();
+  viewer.clearCaeConstraints();
+  viewer.setCaeMeshFocus(false);
 
   const shotField = (field: 'deflection' | 'stress'): { png: string; w: number; h: number } => {
     paintAsmField(field);
@@ -1585,8 +1895,8 @@ async function captureAssemblyAnalysis(
   const defl = shotField('deflection');
   await yieldFrame();
   const stress = shotField('stress');
-  // Restore the field the user was viewing.
-  paintAsmField(state.asm.field);
+  // Back to whatever the user was actually looking at (mesh view or texture).
+  paintCaeVisuals();
 
   const byId = new Map(panels.map((b) => [b.id, b] as const));
 
@@ -1722,6 +2032,11 @@ function renderAnalysisSection() {
   asmFieldDefl.setAttribute('aria-selected', String(state.asm.field === 'deflection'));
   asmFieldStress.setAttribute('aria-selected', String(state.asm.field === 'stress'));
 
+  // Deformed-shape scale + colour bar — only meaningful on a contoured mesh.
+  asmDeformRow.hidden = !solveMatchesMesh();
+  renderCaeLegend();
+  renderMeshStats();
+
   // Result line — verdict class is the WORST of deflection + stress.
   const verdictClass = state.asm.analysis
     ? `cae-${state.asm.analysis.combinedVerdict}` : '';
@@ -1755,19 +2070,21 @@ function wireAnalysisSection() {
     const ld = state.asm.loads[i];
     row.querySelector<HTMLInputElement>('[data-lf="val"]')!.addEventListener('change', (e) => {
       ld.val = Math.max(0, parseFloat((e.target as HTMLInputElement).value) || 0);
+      onAsmLoadsChanged();
     });
     row.querySelector<HTMLSelectElement>('[data-lf="unit"]')!.addEventListener('change', (e) => {
       ld.unit = (e.target as HTMLSelectElement).value as CaeLoad['unit'];
+      onAsmLoadsChanged();
     });
     row.querySelector<HTMLButtonElement>('[data-lf="dir"]')!.addEventListener('click', () => {
-      ld.down = !ld.down; repaintAsmLoadMarkers(); renderAnalysisSection();
+      ld.down = !ld.down; onAsmLoadsChanged(); renderAnalysisSection();
     });
     row.querySelector<HTMLSelectElement>('[data-lf="shape"]')!.addEventListener('change', (e) => {
-      ld.shape = (e.target as HTMLSelectElement).value as CaeLoad['shape']; repaintAsmLoadMarkers();
+      ld.shape = (e.target as HTMLSelectElement).value as CaeLoad['shape']; onAsmLoadsChanged();
     });
     row.querySelector<HTMLInputElement>('[data-lf="size"]')!.addEventListener('change', (e) => {
       ld.sizeMm = toMm(Math.max(0, parseFloat((e.target as HTMLInputElement).value) || 0), state.units);
-      repaintAsmLoadMarkers();
+      onAsmLoadsChanged();
     });
     row.querySelector<HTMLButtonElement>('[data-lf="place"]')!.addEventListener('click', (e) => {
       const btn = e.target as HTMLButtonElement;
@@ -1778,12 +2095,12 @@ function wireAnalysisSection() {
         if (!b) return; // ignore clicks on panels outside this cabinet
         ld.panelId = bodyId;
         ld.pt = worldToOutline(b, point);
-        repaintAsmLoadMarkers();
+        onAsmLoadsChanged();
         renderAnalysisSection();
       });
     });
     row.querySelector<HTMLButtonElement>('[data-lf="remove"]')!.addEventListener('click', () => {
-      state.asm.loads.splice(i, 1); repaintAsmLoadMarkers(); renderAnalysisSection();
+      state.asm.loads.splice(i, 1); onAsmLoadsChanged(); renderAnalysisSection();
     });
   });
 }
@@ -1851,11 +2168,11 @@ asmAddLoadBtn.addEventListener('click', () => {
   state.asm.loads.push(newAsmLoad());
   renderAnalysisSection();
 });
-asmPreset50.addEventListener('click', () => { presetOnTop(50); repaintAsmLoadMarkers(); renderAnalysisSection(); });
-asmPresetShelf.addEventListener('click', () => { presetPerShelf(20); repaintAsmLoadMarkers(); renderAnalysisSection(); });
+asmPreset50.addEventListener('click', () => { presetOnTop(50); onAsmLoadsChanged(); renderAnalysisSection(); });
+asmPresetShelf.addEventListener('click', () => { presetPerShelf(20); onAsmLoadsChanged(); renderAnalysisSection(); });
 asmPresetClear.addEventListener('click', () => {
   state.asm.loads = [];
-  repaintAsmLoadMarkers();
+  onAsmLoadsChanged();
   renderAnalysisSection();
 });
 asmSolveBtn.addEventListener('click', async () => {

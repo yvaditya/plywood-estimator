@@ -837,6 +837,50 @@ button.primary:disabled {
 .asm-field-tab.active {
   background: var(--bg); color: var(--text); box-shadow: 0 1px 2px rgba(0, 0, 0, 0.06);
 }
+/* ---- Mesh controls: element family / density / through-thickness layers ---- */
+.asm-mesh-row { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 8px; }
+.asm-mesh-row label {
+  flex: 1 1 88px; display: flex; flex-direction: column; gap: 3px;
+  font-size: 10px; text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted); font-weight: 600;
+}
+.asm-mesh-row label[hidden] { display: none; }
+.asm-mesh-row select { padding: 3px 4px; font-size: 11px; }
+.asm-mesh-toggles { display: flex; gap: 4px 10px; flex-wrap: wrap; margin-bottom: 8px; }
+.asm-mesh-toggles .check-row {
+  display: inline-flex; align-items: center; gap: 4px;
+  font-size: 11px; color: var(--text-2); cursor: pointer;
+}
+.asm-mesh-toggles .check-row input { margin: 0; }
+.asm-mesh-stats {
+  font-family: var(--font-mono); font-variant-numeric: tabular-nums;
+  font-size: 10.5px; color: var(--muted); line-height: 1.5;
+}
+.asm-mesh-stat b { color: var(--text-2); font-weight: 600; }
+
+/* ---- Deformed-shape scale + fringe colour bar (post-solve) ---- */
+.asm-deform-row { display: flex; align-items: flex-end; gap: 10px; margin-top: 8px; }
+.asm-deform-row[hidden] { display: none; }
+.asm-deform-row label {
+  display: flex; flex-direction: column; gap: 3px; flex: 0 0 auto;
+  font-size: 10px; text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted); font-weight: 600;
+}
+.asm-deform-row select { padding: 3px 4px; font-size: 11px; }
+.asm-legend {
+  flex: 1 1 auto; display: grid; grid-template-columns: auto 1fr auto;
+  grid-template-areas: "cap cap cap" "lo bar hi";
+  align-items: center; gap: 2px 5px;
+  font-family: var(--font-mono); font-variant-numeric: tabular-nums;
+  font-size: 9.5px; color: var(--muted);
+}
+.asm-legend:empty { display: none; }
+.asm-legend-cap {
+  grid-area: cap; font-family: var(--font-sans, inherit);
+  text-transform: uppercase; letter-spacing: 0.05em; font-weight: 600; font-size: 9px;
+}
+.asm-legend-lo { grid-area: lo; }
+.asm-legend-hi { grid-area: hi; color: var(--text-2); font-weight: 600; }
+.asm-legend-bar { grid-area: bar; height: 8px; border-radius: 2px; border: 1px solid var(--line); }
+
 .asm-result {
   margin-top: 10px; font-family: var(--font-mono); font-variant-numeric: tabular-nums;
   font-size: 11px; color: var(--text-2); line-height: 1.45;

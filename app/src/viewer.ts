@@ -32,6 +32,7 @@ import { SMAAPass } from 'three/examples/jsm/postprocessing/SMAAPass.js';
 import { OutputPass } from 'three/examples/jsm/postprocessing/OutputPass.js';
 import { RoomEnvironment } from 'three/examples/jsm/environments/RoomEnvironment.js';
 import type { OcctResult, OcctMesh } from './stepLoader';
+import { heatColor } from './cae';
 
 export type GrainLock = 'free' | 'length' | 'width';
 
@@ -58,6 +59,48 @@ export interface BodyHandle {
   mesh: THREE.Mesh;
   /** Each body's stable color, sRGB hex string (also used in 2D layout). */
   hexColor: string;
+}
+
+/** The FE discretisation to draw — structurally `CaeMeshView` from cae.ts,
+ *  restated here so the viewer stays independent of the solver's types. */
+export interface CaeMeshData {
+  nodes: Float32Array;      // 3 floats per node, world mm
+  elems: Int32Array;        // nodesPerElem indices per element
+  nodesPerElem: 4 | 8;      // 4 = shell quad, 8 = solid hex
+  nodeCount: number;
+  elemCount: number;
+}
+
+export interface CaeMeshStyle {
+  /** Fill the element faces (default true). */
+  faces?: boolean;
+  /** Draw element edges (default true). */
+  edges?: boolean;
+  /** Draw a dot per node (default false). */
+  points?: boolean;
+  /** Per-node scalar field for the contour; NaN entries render neutral gray. */
+  field?: Float32Array | null;
+  /** Field value mapped to the top of the ramp. 0 disables contouring. */
+  fieldMax?: number;
+  /** Per-node displacement (3 floats/node) for the deformed shape. */
+  disp?: Float32Array | null;
+  /** Displacement exaggeration factor (0 = undeformed). */
+  dispScale?: number;
+  /** Face opacity — drop it to see the mesh interior. */
+  opacity?: number;
+}
+
+/** One joint node-pair coupling, drawn as a segment. */
+export interface CaeCouplingLine {
+  p0: [number, number, number];
+  p1: [number, number, number];
+  stiffness: string;
+}
+
+/** One nodal load: arrow along `f`, tip on `at`. */
+export interface CaeLoadArrow {
+  at: [number, number, number];
+  f: [number, number, number];
 }
 
 /**
@@ -117,6 +160,11 @@ export class Viewer {
   private caeLoadMarkers = new Map<number, Map<number, THREE.Object3D>>();
   /** Assembly joint contact lines (one group for the whole cabinet). */
   private asmJointGroup: THREE.Object3D | null = null;
+  /** FE mesh overlay (element faces + edges + nodes) and the constraint
+   *  glyph set (supports / joint couplings / load arrows). */
+  private caeMeshGroup: THREE.Group | null = null;
+  private caeConstraintGroup: THREE.Group | null = null;
+  private caeMeshFocus = false;
   /** Assembly floor-support glyphs (one group for the whole cabinet). */
   private asmFloorGroup: THREE.Object3D | null = null;
   /** When set, the next body-face click is captured for force placement
@@ -601,6 +649,9 @@ export class Viewer {
   clearAssemblyOverlay() {
     this.clearAssemblyJoints();
     this.clearFloorGlyphs();
+    this.clearCaeMesh();
+    this.clearCaeConstraints();
+    this.setCaeMeshFocus(false);
     for (const o of this.caeOverlays.values()) { this.caeGroup.remove(o); disposeObject3D(o); }
     this.caeOverlays.clear();
     for (const perBody of this.caeLoadMarkers.values()) {
@@ -668,6 +719,257 @@ export class Viewer {
   clearDeflectionOverlay(bodyId: number) {
     const m = this.caeOverlays.get(bodyId);
     if (m) { this.caeGroup.remove(m); disposeObject3D(m); this.caeOverlays.delete(bodyId); }
+  }
+
+  // -------------------------------------------------------------------------
+  // FE MESH VIEW
+  //
+  // Draws the solver's own discretisation: element faces (optionally contoured
+  // by a per-node result field), element edges, and node dots — on the
+  // undeformed geometry or on a scaled deformed shape. Shell meshes draw every
+  // quad; solid meshes draw only the hull faces (a face used by one hex), so
+  // you see the outside of the solid rather than a fog of interior faces.
+  // -------------------------------------------------------------------------
+
+  /** Replace the mesh overlay. Pass `null` to remove it. */
+  showCaeMesh(data: CaeMeshData | null, style: CaeMeshStyle = {}) {
+    this.clearCaeMesh();
+    if (!data || data.elemCount === 0) return;
+
+    const {
+      faces = true, edges = true, points = false,
+      field = null, fieldMax = 0, disp = null, dispScale = 0, opacity = 1,
+    } = style;
+
+    // Display positions = undeformed + scaled displacement.
+    const pos = new Float32Array(data.nodes.length);
+    pos.set(data.nodes);
+    if (disp && dispScale !== 0) {
+      const n = Math.min(data.nodeCount, Math.floor(disp.length / 3));
+      for (let i = 0; i < n; i++) {
+        pos[i * 3] += disp[i * 3] * dispScale;
+        pos[i * 3 + 1] += disp[i * 3 + 1] * dispScale;
+        pos[i * 3 + 2] += disp[i * 3 + 2] * dispScale;
+      }
+    }
+
+    // Per-node contour colors (NaN / no field → neutral gray).
+    let colors: Float32Array | null = null;
+    if (field && fieldMax > 0) {
+      colors = new Float32Array(data.nodeCount * 3);
+      for (let i = 0; i < data.nodeCount; i++) {
+        const v = field[i];
+        if (Number.isNaN(v)) { colors[i * 3] = 0.65; colors[i * 3 + 1] = 0.65; colors[i * 3 + 2] = 0.66; continue; }
+        const [r, g, b] = heatColor(Math.abs(v) / fieldMax);
+        // Vertex colors feed a MeshBasicMaterial in linear space.
+        colors[i * 3] = srgbToLinear(r / 255);
+        colors[i * 3 + 1] = srgbToLinear(g / 255);
+        colors[i * 3 + 2] = srgbToLinear(b / 255);
+      }
+    }
+
+    const group = new THREE.Group();
+    const quads = data.nodesPerElem === 8 ? hullFacesOfHexes(data) : quadsOfShell(data);
+
+    if (faces) {
+      const tri = new Uint32Array(quads.length / 4 * 6);
+      for (let q = 0, t = 0; q < quads.length; q += 4) {
+        const a = quads[q], b = quads[q + 1], c = quads[q + 2], d = quads[q + 3];
+        tri[t++] = a; tri[t++] = b; tri[t++] = c;
+        tri[t++] = a; tri[t++] = c; tri[t++] = d;
+      }
+      const geom = new THREE.BufferGeometry();
+      geom.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+      if (colors) geom.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+      geom.setIndex(new THREE.BufferAttribute(tri, 1));
+      geom.computeVertexNormals();
+      // Lambert, not Basic: an unlit mesh loses every edge of the assembly and
+      // reads as a flat silhouette. A little shading keeps the panels legible
+      // while the contour still carries the actual result.
+      const mat = new THREE.MeshLambertMaterial({
+        vertexColors: !!colors,
+        color: colors ? 0xffffff : 0xb9c2cc,
+        emissive: colors ? 0x3a3a3a : 0x2a2f36,
+        side: THREE.DoubleSide,
+        transparent: opacity < 1,
+        opacity,
+        // Push faces back so the wireframe on top never z-fights with them.
+        polygonOffset: true,
+        polygonOffsetFactor: 1,
+        polygonOffsetUnits: 1,
+      });
+      const mesh = new THREE.Mesh(geom, mat);
+      mesh.renderOrder = 5;
+      group.add(mesh);
+    }
+
+    if (edges) {
+      const segs = uniqueQuadEdges(quads);
+      const eGeom = new THREE.BufferGeometry();
+      eGeom.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+      eGeom.setIndex(new THREE.BufferAttribute(segs, 1));
+      const eMat = new THREE.LineBasicMaterial({
+        color: faces ? 0x1b2733 : 0x37414f,
+        transparent: true,
+        opacity: faces ? 0.6 : 0.9,
+      });
+      const lines = new THREE.LineSegments(eGeom, eMat);
+      lines.renderOrder = 6;
+      group.add(lines);
+    }
+
+    if (points) {
+      const pGeom = new THREE.BufferGeometry();
+      pGeom.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+      const pMat = new THREE.PointsMaterial({ color: 0x1b2733, size: 2.4, sizeAttenuation: false });
+      const pts = new THREE.Points(pGeom, pMat);
+      pts.renderOrder = 7;
+      group.add(pts);
+    }
+
+    this.caeGroup.add(group);
+    this.caeMeshGroup = group;
+  }
+
+  clearCaeMesh() {
+    if (this.caeMeshGroup) {
+      this.caeGroup.remove(this.caeMeshGroup);
+      disposeObject3D(this.caeMeshGroup);
+      this.caeMeshGroup = null;
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // CONSTRAINT VIEW — the boundary conditions the solver actually applied.
+  //
+  //   supports  fixed nodes         → green pyramid under each node
+  //   couplings joint node-pairs    → short segment per penalty spring pair,
+  //                                   coloured by the joint's stiffness class
+  //   loads     nodal force vectors → arrows along the force, length ∝ √|F|
+  //
+  // All three are instanced/batched: a workbench mesh grounds several hundred
+  // nodes and couples a few thousand pairs, which would be far too many
+  // individual Object3Ds.
+  // -------------------------------------------------------------------------
+
+  showCaeConstraints(
+    data: {
+      supports?: Float32Array | null;          // 3 floats per fixed node
+      couplings?: CaeCouplingLine[] | null;
+      loads?: CaeLoadArrow[] | null;
+    },
+    opts: { glyphMm?: number } = {},
+  ) {
+    this.clearCaeConstraints();
+    const group = new THREE.Group();
+    const s = opts.glyphMm ?? 12;
+
+    // --- Supports: a 4-sided pyramid apex-up, sitting just below the node. ---
+    const sup = data.supports;
+    if (sup && sup.length >= 3) {
+      const count = Math.floor(sup.length / 3);
+      const geom = new THREE.ConeGeometry(s * 0.55, s, 4);
+      // Cone is +Y up around the origin; move it so the APEX touches (0,0,0)
+      // and the base hangs below, then stand it up in the Z-up world.
+      geom.translate(0, -s / 2, 0);
+      geom.rotateX(Math.PI / 2);
+      const mat = new THREE.MeshBasicMaterial({ color: 0x2f7d4f, transparent: true, opacity: 0.85 });
+      const inst = new THREE.InstancedMesh(geom, mat, count);
+      const m4 = new THREE.Matrix4();
+      for (let i = 0; i < count; i++) {
+        m4.makeTranslation(sup[i * 3], sup[i * 3 + 1], sup[i * 3 + 2]);
+        inst.setMatrixAt(i, m4);
+      }
+      inst.instanceMatrix.needsUpdate = true;
+      inst.renderOrder = 7;
+      group.add(inst);
+    }
+
+    // --- Joint couplings: one segment per coupled node pair. ---
+    const cpl = data.couplings;
+    if (cpl && cpl.length) {
+      const byClass = new Map<string, number[]>();
+      for (const c of cpl) {
+        const arr = byClass.get(c.stiffness) ?? [];
+        arr.push(c.p0[0], c.p0[1], c.p0[2], c.p1[0], c.p1[1], c.p1[2]);
+        byClass.set(c.stiffness, arr);
+      }
+      const color: Record<string, number> = { rigid: 0xd6336c, 'semi-rigid': 0x7048e8, hinged: 0x1c7ed6 };
+      for (const [cls, arr] of byClass) {
+        const geom = new THREE.BufferGeometry();
+        geom.setAttribute('position', new THREE.BufferAttribute(new Float32Array(arr), 3));
+        const line = new THREE.LineSegments(geom, new THREE.LineBasicMaterial({
+          color: color[cls] ?? 0xd6336c, transparent: true, opacity: 0.9,
+        }));
+        line.renderOrder = 8;
+        group.add(line);
+      }
+    }
+
+    // --- Loads: arrows along the applied force. ---
+    const loads = data.loads;
+    if (loads && loads.length) {
+      let maxF = 0;
+      for (const l of loads) maxF = Math.max(maxF, Math.hypot(l.f[0], l.f[1], l.f[2]));
+      if (maxF > 0) {
+        // Square-root scaling: a patch spread over many nodes still shows a
+        // readable arrow instead of collapsing to a dot next to one big one.
+        const len = (mag: number) => s * (1.4 + 3.4 * Math.sqrt(mag / maxF));
+        const geom = arrowGlyphGeometry();      // unit length, along +Y, tip at origin
+        const mat = new THREE.MeshBasicMaterial({ color: 0xc92a2a });
+        const inst = new THREE.InstancedMesh(geom, mat, loads.length);
+        const m4 = new THREE.Matrix4();
+        const q = new THREE.Quaternion();
+        const up = new THREE.Vector3(0, 1, 0);
+        const dir = new THREE.Vector3();
+        const scale = new THREE.Vector3();
+        const at = new THREE.Vector3();
+        for (let i = 0; i < loads.length; i++) {
+          const l = loads[i];
+          const mag = Math.hypot(l.f[0], l.f[1], l.f[2]);
+          if (mag <= 0) { m4.makeScale(0, 0, 0); inst.setMatrixAt(i, m4); continue; }
+          // The arrow points ALONG the force and its tip sits on the node.
+          dir.set(l.f[0] / mag, l.f[1] / mag, l.f[2] / mag);
+          q.setFromUnitVectors(up, dir);
+          const L = len(mag);
+          scale.set(s * 0.16, L, s * 0.16);
+          at.set(l.at[0], l.at[1], l.at[2]);
+          m4.compose(at, q, scale);
+          inst.setMatrixAt(i, m4);
+        }
+        inst.instanceMatrix.needsUpdate = true;
+        inst.renderOrder = 8;
+        group.add(inst);
+      }
+    }
+
+    this.caeGroup.add(group);
+    this.caeConstraintGroup = group;
+  }
+
+  clearCaeConstraints() {
+    if (this.caeConstraintGroup) {
+      this.caeGroup.remove(this.caeConstraintGroup);
+      disposeObject3D(this.caeConstraintGroup);
+      this.caeConstraintGroup = null;
+    }
+  }
+
+  /**
+   * Hide (or restore) the CAD solids while the FE mesh is shown. The mesh IS
+   * the model in this view — leaving the shaded solids underneath puts a second
+   * surface at almost the same depth, which z-fights the contour and tints it.
+   * The grain arrows and the selection outlines go with them.
+   */
+  setCaeMeshFocus(on: boolean) {
+    if (this.caeMeshFocus === on) return;
+    this.caeMeshFocus = on;
+    for (const b of this.bodies) b.mesh.visible = !on;
+    this.nonSheetGroup.visible = !on;
+    this.grainGroup.visible = !on;
+    // Outline passes raycast against hidden meshes otherwise.
+    this.outlinePass.enabled = !on;
+    this.outlineDimPass.enabled = !on;
   }
 
   resize(container: HTMLElement) {
@@ -1711,6 +2013,109 @@ function buildArrowShape(
     s.lineTo(-half, -sh);
   }
   return s;
+}
+
+// ---------------------------------------------------------------------------
+// FE mesh geometry helpers
+// ---------------------------------------------------------------------------
+
+/** sRGB → linear, for vertex colors fed to a three.js material. */
+function srgbToLinear(c: number): number {
+  return c <= 0.04045 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4);
+}
+
+/** Shell mesh → its quads (already one quad per element). */
+function quadsOfShell(data: CaeMeshData): Int32Array {
+  return data.elems;
+}
+
+/**
+ * Solid mesh → the HULL quads only: each hex contributes 6 faces, and a face
+ * shared by two hexes is interior and dropped. What's left is the outside
+ * surface of the solid — which is what you want to look at, and roughly an
+ * order of magnitude fewer triangles than drawing every face.
+ */
+function hullFacesOfHexes(data: CaeMeshData): Int32Array {
+  // Local face node ordering for the hex layout used by cae.solidMeshView:
+  // 0-3 = bottom (−normal) face, 4-7 = top, matched corner for corner.
+  const FACES = [
+    [0, 3, 2, 1], [4, 5, 6, 7],
+    [0, 1, 5, 4], [1, 2, 6, 5], [2, 3, 7, 6], [3, 0, 4, 7],
+  ];
+  const seen = new Map<string, { quad: number[]; count: number }>();
+  for (let e = 0; e < data.elemCount; e++) {
+    const base = e * 8;
+    for (const f of FACES) {
+      const quad = [
+        data.elems[base + f[0]], data.elems[base + f[1]],
+        data.elems[base + f[2]], data.elems[base + f[3]],
+      ];
+      const key = quad.slice().sort((a, b) => a - b).join(',');
+      const hit = seen.get(key);
+      if (hit) hit.count++;
+      else seen.set(key, { quad, count: 1 });
+    }
+  }
+  const out: number[] = [];
+  for (const { quad, count } of seen.values()) {
+    if (count === 1) out.push(quad[0], quad[1], quad[2], quad[3]);
+  }
+  return Int32Array.from(out);
+}
+
+/** Deduplicated edge index list for a quad soup (4 indices per quad). */
+function uniqueQuadEdges(quads: Int32Array): Uint32Array {
+  const seen = new Set<number>();
+  const out: number[] = [];
+  for (let q = 0; q < quads.length; q += 4) {
+    for (let k = 0; k < 4; k++) {
+      const a = quads[q + k];
+      const b = quads[q + ((k + 1) % 4)];
+      const lo = Math.min(a, b), hi = Math.max(a, b);
+      // Pack into one number; safe while node counts stay under ~4M.
+      const key = lo * 4194304 + hi;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      out.push(a, b);
+    }
+  }
+  return Uint32Array.from(out);
+}
+
+/**
+ * A unit arrow along +Y with its TIP at the origin and its tail at y = −1,
+ * so an instance matrix can place the tip on the loaded node and scale the
+ * shaft to the force magnitude. Shaft radius is 1 in local X/Z — the instance
+ * scale sets the real thickness.
+ */
+function arrowGlyphGeometry(): THREE.BufferGeometry {
+  const headLen = 0.32;
+  const shaft = new THREE.CylinderGeometry(1, 1, 1 - headLen, 8, 1, true);
+  shaft.translate(0, -(headLen + (1 - headLen) / 2), 0);
+  const head = new THREE.ConeGeometry(2.1, headLen, 8);
+  head.translate(0, -headLen / 2, 0);
+  return mergeGeometries([shaft, head]);
+}
+
+/** Minimal position-only geometry merge (avoids pulling in BufferGeometryUtils). */
+function mergeGeometries(geoms: THREE.BufferGeometry[]): THREE.BufferGeometry {
+  const parts: Float32Array[] = [];
+  let total = 0;
+  for (const g of geoms) {
+    const nonIndexed = g.index ? g.toNonIndexed() : g;
+    const arr = nonIndexed.getAttribute('position').array as Float32Array;
+    parts.push(arr instanceof Float32Array ? arr : Float32Array.from(arr));
+    total += arr.length;
+    if (nonIndexed !== g) nonIndexed.dispose();
+    g.dispose();
+  }
+  const merged = new Float32Array(total);
+  let off = 0;
+  for (const p of parts) { merged.set(p, off); off += p.length; }
+  const out = new THREE.BufferGeometry();
+  out.setAttribute('position', new THREE.BufferAttribute(merged, 3));
+  out.computeVertexNormals();
+  return out;
 }
 
 function clamp(n: number, lo: number, hi: number) {

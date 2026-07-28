@@ -36,7 +36,7 @@ Quick orientation for a fresh session working on this repo.
 | `shoppingList.ts` | Buy/have rollup + CSV export, localStorage persistence |
 | `dxf.ts` | DXF R12 writer (layers SHEET / MARGIN / PARTS / LABELS / DIMS) |
 | `pdf.ts` | jsPDF report (cover → contents → quick ref → shopping → job-wide Panels TABLE → per-sheet (overview + panels table + cut sequence) → per-cabinet assembly + IKEA-style step pages) |
-| `cae.ts` | CAE: material cards (each carries `fbAlong`/`fbAcross` bending strengths for utilization %), panel weight, sag screening, orthotropic Mindlin plate FEM + ASSEMBLY flat-shell solver (membrane+bending, 6 DOF/node, penalty joints rigid/semi-rigid/hinged, floor grounding). The assembly LINEAR SOLVE has TWO backends handed the identical symmetric CSR (==CSC) system: **Eigen SimplicialLDLT compiled to WASM** (`solverBackend.ts` → `app/src/wasm/eigen-solver.{js,wasm}`, built from `app/native/solver.cpp` via `build.ps1`; committed so users never need emsdk) when it loads, else the built-in **Jacobi-PCG** fallback. `solveAssembly(opts)` takes `opts.backend` (DirectLinearSolver | null) + `opts.onProgress` (staged UI feedback); it reports `res.backend`/`factorMs`/`solveMs`. Benchmark (workbench, 50 kg preset, 58 452 DOF): **LDLT factor 263 ms + solve 6 ms** vs **PCG 348 iters / 765 ms** — LDLT ~2.8× faster, and re-solves after the factor are ~6 ms. The per-panel plate path stays pure-TS PCG (tiny systems). After the solve it does STRESS RECOVERY per element (membrane N + bending M at the centre → surface σ=N/t±6M/t² → per-face von Mises → nodal average), returning per-panel `vm` field + global `maxVm`/`maxVmPanelId`/`maxVmAt` + `utilPct` (peak grain-axis bending σ vs the card's fbAlong/fbAcross) + `stressVerdict` (<50% ok, <100% borderline, ≥100% weak). tests/cae_check.ts has SEVEN validation cases — keep all passing. Assembly cases (e,f,g) run against BOTH backends when the WASM loads under node (per-backend PASS + case (e) cross-backend agreement <1e-4; measured 1.2e-12). Case (g) checks recovered SS-strip surface stress; it uses a SHORT/THICK strip on hinged legs so the soft-grounding regularization — which perturbs absolute deflection for slender panels — doesn't steal the end reactions; centre moment stays P·L/4. tests/asm_bench.py times PCG vs LDLT in-browser (forces PCG via `window.__caeForcePcg`). Per-panel INTERACTIVE CAE was removed (user: useless); the ONLY CAE surface is the Analysis sidebar MODE (segmented Cut planning / Analysis switch under the brand header, green dot when solved; joints list + presets + patch loads + a Deflection/Stress heatmap field toggle that re-textures from the cached solve — no re-solve). The Solve button shows a STAGED progress bar (Meshing → Assembling <DOF> → Factorizing/Solving <backend> → Recovering stresses → Rendering; same `.busy` progress pattern as the PDF button — preprocessing=our TS, solve=the WASM core, post=browser). Result line reports both deflection AND max stress (MPa) + util% + the backend name & timing, verdict = worst of the two. Structure table + Assembly PDF page (now with stress numbers + a second von-Mises heatmap under the deflection one) gate on an assembly solve |
+| `cae.ts` | CAE: material cards (each carries `fbAlong`/`fbAcross` bending strengths for utilization %), panel weight, sag screening, orthotropic Mindlin plate FEM + ASSEMBLY flat-shell solver (membrane+bending, 6 DOF/node, penalty joints rigid/semi-rigid/hinged, floor grounding). The assembly LINEAR SOLVE has TWO backends handed the identical symmetric CSR (==CSC) system: **Eigen SimplicialLDLT compiled to WASM** (`solverBackend.ts` → `app/src/wasm/eigen-solver.{js,wasm}`, built from `app/native/solver.cpp` via `build.ps1`; committed so users never need emsdk) when it loads, else the built-in **Jacobi-PCG** fallback. `solveAssembly(opts)` takes `opts.backend` (DirectLinearSolver | null) + `opts.onProgress` (staged UI feedback); it reports `res.backend`/`factorMs`/`solveMs`. Benchmark (workbench, 50 kg preset, 58 452 DOF): **LDLT factor 263 ms + solve 6 ms** vs **PCG 348 iters / 765 ms** — LDLT ~2.8× faster, and re-solves after the factor are ~6 ms. The per-panel plate path stays pure-TS PCG (tiny systems). After the solve it does STRESS RECOVERY per element (membrane N + bending M at the centre → surface σ=N/t±6M/t² → per-face von Mises → nodal average), returning per-panel `vm` field + global `maxVm`/`maxVmPanelId`/`maxVmAt` + `utilPct` (peak grain-axis bending σ vs the card's fbAlong/fbAcross) + `stressVerdict` (<50% ok, <100% borderline, ≥100% weak). There is ALSO a **SOLID (hexahedral) path**: `opts.meshKind:'solid'` re-discretises the SAME preprocessed model through the thickness into `solidLayers` (default 2) 8-node hexes per in-plane cell, 3 DOF/node, and `solveAssemblySolid`/`finishSolid` run the whole solve+recovery on it. The hex uses **Wilson incompatible modes** (9 internal DOF statically condensed per element) — without them a trilinear hex shear-locks and comes out ~5× too stiff in bending, which is fatal at the 2–3 elements we can afford through an 18 mm panel. Material is **full 3D orthotropy** (`orthotropic3D`, compliance inverted so Maxwell symmetry is exact) with through-thickness modulus `0.15×E_across` and rolling shear `0.2×G12` — the ratios that make a solid model behave like plywood rather than a plastic slab. Every hex in a panel is the same rectangular box, so the 24×24 is formed ONCE per panel and rotated per element. Solid node `g·levels + l` maps back to mid-surface shell node `g`, which is how joints/grounding/loads lift over and how results collapse back onto the per-panel grid (worst value over the stack) so the texture overlay + PDF keep working. tests/cae_check.ts has NINE validation cases — keep all passing. Assembly cases (e,f,g) run against BOTH backends when the WASM loads under node (per-backend PASS + case (e) cross-backend agreement <1e-4; measured 1.2e-12). Case (g) checks recovered SS-strip surface stress; it uses a SHORT/THICK strip on hinged legs so the soft-grounding regularization — which perturbs absolute deflection for slender panels — doesn't steal the end reactions; centre moment stays P·L/4. tests/asm_bench.py times PCG vs LDLT in-browser (forces PCG via `window.__caeForcePcg`). Per-panel INTERACTIVE CAE was removed (user: useless); the ONLY CAE surface is the Analysis sidebar MODE (segmented Cut planning / Analysis switch under the brand header, green dot when solved; joints list + presets + patch loads + a Deflection/Stress heatmap field toggle that re-textures from the cached solve — no re-solve). The Solve button shows a STAGED progress bar (Meshing → Assembling <DOF> → Factorizing/Solving <backend> → Recovering stresses → Rendering; same `.busy` progress pattern as the PDF button — preprocessing=our TS, solve=the WASM core, post=browser). Result line reports both deflection AND max stress (MPa) + util% + the backend name & timing, verdict = worst of the two. Structure table + Assembly PDF page (now with stress numbers + a second von-Mises heatmap under the deflection one) gate on an assembly solve |
 | `cutEditor.ts` | "Edit cuts" popup: DIRECT cutting (click candidate line → commit). Clicking a piece EDGE opens a context popup: arm as measured-from, or set/unset a DATUM edge. Datum edges render blue, become the piece's default measuring edge (fromFar when far), and PROPAGATE to child pieces that retain the same boundary segment (datums stored as geometric line segments; persisted as `SheetOverrides.datumEdges` piece-key+side). manual_cut log records measuredFrom + provenance (armed/datum/default). Overrides keyed by layoutSignature + cutKeyFor in localStorage |
 | `trainingLog.ts` | Opt-in JSONL recorder of manual sequence edits (full layout + auto sequence context per session) — source data for future learned ordering modes |
 | `units.ts` | mm/inch conversion, fractional-inch formatting, money fmt, fmtSag (decimal, sub-mm safe) |
@@ -182,7 +182,67 @@ the expand state across renders.
   end-to-end in headless Chromium because each trial's layout build is
   meatier.
 
+## CAE mesh + constraint view (the Analysis mode's 3D display)
+`previewAssembly(opts)` runs the SAME `preprocessAssembly` the solve runs and
+returns a `CaeMeshView` + `CaeConstraintView` WITHOUT solving. That is the whole
+point: what the viewer draws is the model the solver sees, not an illustration
+of it. `solveAssembly`/`solveAssemblySolid` return the same two structures on
+the result, plus per-node `nodeDisp` / `nodeDispMag` / `nodeVm` in mesh node
+order, so results are contoured ON the mesh and the deformed shape is real
+nodal displacement.
+
+- `viewer.showCaeMesh(data, style)` — element faces (Lambert + vertex colours
+  from `cae.heatColor`), deduped element edges, optional node dots, optional
+  deformed positions. Solid meshes draw only HULL faces (a face used by one
+  hex) — drawing every face is ~10× the triangles and shows nothing.
+- `viewer.showCaeConstraints({supports, couplings, loads})` — instanced pyramid
+  per grounded node, one segment per joint node-pair coloured by stiffness,
+  instanced arrow per nodal force (length ∝ √|F| so a spread patch stays
+  readable next to a point load).
+- `viewer.setCaeMeshFocus(true)` HIDES the CAD solids, grain arrows and outline
+  passes while the mesh is up. Leaving them on puts a second surface at the same
+  depth and the contour z-fights / tints.
+- `main.ts` `paintCaeVisuals()` is the single repaint. Mesh view and the smoothed
+  per-panel texture are MUTUALLY EXCLUSIVE — with the mesh on it clears every
+  body's `showDeflectionOverlay` first, because those quads are separate objects
+  that otherwise float in front of the deformed mesh as an undeformed ghost.
+  `captureAssemblyAnalysis` (PDF snapshots) deliberately drops out of mesh view
+  for the capture and restores through `paintCaeVisuals()`.
+- Sidebar controls: element family (shell/solid), density, through-thickness
+  layers, per-overlay checkboxes, a live stats line (elements/nodes/DOF, element
+  size, fixed nodes / couplings / loaded nodes + total N), a deform-scale select
+  ('auto' puts peak deflection at ~6% of the model diagonal) and the fringe
+  colour bar. `tests/cae_mesh_drive.py` drives all of it end to end.
+
 ## Known sharp edges
+- **The FE model is built on the panel MID-SURFACE, not its face.**
+  `outlineFrame(b)` returns the +FACE plane — correct for the UI, which paints
+  heatmap overlays and load markers on the visible face. `asmPanelForBody` must
+  use `panelMidFrame(b)` (face minus `normal × t/2`). Handing the face plane to
+  the solver puts every panel's model half a thickness off centre, so a butt
+  joint's edge-to-face distance comes out anywhere from 0 to a full thickness
+  depending which way each panel's face normal happens to point, and contacts
+  get silently missed. Fixing this took the workbench from 28 detected joints /
+  638 node couplings to 76 / 2001, and max deflection from 11.0 mm (BORDERLINE)
+  to 3.9 mm (OK) — the cabinet was never that floppy, the seams just weren't
+  being found. It also puts a solid extrusion (±t/2 about the plane) inside the
+  actual part instead of half outside it.
+- **`pointOnPanel` contact tolerance is normal-alignment weighted.** Mid-plane
+  separation at contact is `t_dst/2` for a perpendicular butt joint but
+  `t_dst/2 + t_src/2` for a parallel face lap; the test scales the source term by
+  `|n_src · n_dst|` so it covers both. A flat `+ t_src/2` invents butt joints
+  across a 9 mm air gap; omitting it misses every lap.
+- **Mesh density needs `maxDof` to move with it.** `preprocessAssembly`
+  auto-coarsens to hold `maxDof`, so leaving it at the 60k default made the
+  sidebar's Fine setting produce the exact same mesh as Medium — the control
+  silently did nothing. `asmMaxDof()` derives the cap from the density choice,
+  with per-family ceilings (`CAE_DOF_CEILING`: shell 150k, solid 60k — a hex
+  couples 8 nodes × 24 DOF, so solid fill grows far faster per DOF).
+- **A locking element still reports the right stresses.** Equilibrium fixes σ
+  regardless of how over-stiff the element is, so a stress check cannot detect
+  shear locking — case (h) checks the hex on DISPLACEMENT against beam theory
+  (12×1×2 mesh, 0.20% error; a plain H8 lands near a fifth of the true value).
+  Don't "simplify" the incompatible modes out of `hexKIncompatible`.
 - **Non-sheet bodies** (round legs, blocks, etc.) are filtered in
   `analyzeBody`. They render in 3D in a separate `nonSheetGroup` and
   `snapshotFiltered` toggles that group off before each PDF snapshot.

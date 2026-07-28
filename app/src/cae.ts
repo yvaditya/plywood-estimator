@@ -924,6 +924,12 @@ export interface AsmSolveOptions {
   /** Optional progress callback (staged UI feedback). Called synchronously at
    *  each stage boundary; the caller yields to the browser between stages. */
   onProgress?: (p: SolveProgress) => void;
+  /** Which element family to build. 'shell' (default) is the 6-DOF flat-shell
+   *  path; 'solid' extrudes each cell through the thickness into 8-node hexes
+   *  with incompatible modes (3 DOF/node). */
+  meshKind?: MeshKind;
+  /** Solid only: hex layers through the panel thickness (default 2). */
+  solidLayers?: number;
 }
 
 /** Which linear backend actually solved the system (for the result/log line). */
@@ -984,6 +990,105 @@ export interface AsmResult {
   resolutionLog: string;
   /** Grounded node world positions (for glyphs). */
   groundPoints: Vec3World[];
+  /** The discretisation this result came from — lets the viewer draw the
+   *  result ON the mesh (contoured elements + element edges + deformed shape)
+   *  instead of only as a smoothed texture. Null on a refusal. */
+  mesh: CaeMeshView | null;
+  /** The constraints the solver actually applied (identical to what
+   *  previewAssembly reports pre-solve). Null on a refusal. */
+  constraints: CaeConstraintView | null;
+  /** Nodal translations in MESH NODE ORDER, 3 floats per node (mm, world).
+   *  Feeds the deformed-shape display. */
+  nodeDisp: Float32Array;
+  /** Per-node |u| (mm) in mesh node order — the deflection contour field. */
+  nodeDispMag: Float32Array;
+  /** Per-node von Mises surface stress (MPa) in mesh node order, nodally
+   *  averaged from the incident elements. NaN where nothing was recovered. */
+  nodeVm: Float32Array;
+}
+
+// ---------------------------------------------------------------------------
+// MESH + CONSTRAINT VIEW
+//
+// The solver's discretisation, in a shape the 3D viewer can draw directly.
+// This is deliberately the SAME data preprocessAssembly() hands the assembler
+// — not a re-derivation — so "show me the mesh" shows the mesh that is
+// actually solved, and the support/joint/load glyphs mark the nodes that are
+// actually grounded, coupled and loaded.
+// ---------------------------------------------------------------------------
+
+/** Which element family the mesh is built from. */
+export type MeshKind = 'shell' | 'solid';
+
+export interface CaeMeshView {
+  kind: MeshKind;
+  /** World node positions, 3 floats per node, in solver node order. */
+  nodes: Float32Array;
+  /** Connectivity: `nodesPerElem` node indices per element. */
+  elems: Int32Array;
+  /** 4 → shell quads (in-plane); 8 → solid hexes (through-thickness). */
+  nodesPerElem: 4 | 8;
+  /** Owning panel id per element. */
+  panelOf: Int32Array;
+  nodeCount: number;
+  elemCount: number;
+  dofPerNode: number;
+  dofCount: number;
+  /** In-plane element edge size range (mm) — the mesh stats line. */
+  minEdgeMm: number;
+  maxEdgeMm: number;
+  /** Solid only: element layers through the panel thickness. */
+  throughLayers: number;
+}
+
+/** One node-pair coupling the solver created for a detected joint. */
+export interface CaeJointLink { p0: Vec3World; p1: Vec3World; stiffness: JointStiffness; }
+
+/** One nodal force (N, world) produced by a patch load. */
+export interface CaeNodalLoad { at: Vec3World; f: Vec3World; }
+
+export interface CaeConstraintView {
+  /** World positions of fully-fixed (floor-grounded) nodes, 3 floats each. */
+  grounded: Float32Array;
+  groundedCount: number;
+  /** The node-pair couplings — one per penalty spring set. */
+  jointLinks: CaeJointLink[];
+  /** Nodal force vectors from the patch loads. */
+  loads: CaeNodalLoad[];
+  /** Σ|F| over the loaded nodes (N). */
+  totalLoadN: number;
+}
+
+export type AsmPreview =
+  | { ok: true; mesh: CaeMeshView; constraints: CaeConstraintView; resolutionLog: string }
+  | { ok: false; message: string };
+
+/**
+ * The single fringe-plot colour ramp for every CAE display: blue → green →
+ * yellow → red for t ∈ [0,1]. Lives here (not in a renderer) so the 3D mesh
+ * contour, the panel texture overlay and the PDF legend can't drift apart.
+ */
+export function heatColor(t: number): [number, number, number] {
+  t = Math.max(0, Math.min(1, t));
+  const stops: [number, [number, number, number]][] = [
+    [0.0, [40, 90, 220]],
+    [0.34, [40, 190, 120]],
+    [0.67, [235, 205, 50]],
+    [1.0, [220, 55, 45]],
+  ];
+  for (let i = 0; i < stops.length - 1; i++) {
+    const [t0, c0] = stops[i];
+    const [t1, c1] = stops[i + 1];
+    if (t <= t1) {
+      const f = (t - t0) / (t1 - t0 || 1);
+      return [
+        Math.round(c0[0] + (c1[0] - c0[0]) * f),
+        Math.round(c0[1] + (c1[1] - c0[1]) * f),
+        Math.round(c0[2] + (c1[2] - c0[2]) * f),
+      ];
+    }
+  }
+  return stops[stops.length - 1][1];
 }
 
 // ---------------------------------------------------------------------------
@@ -1186,11 +1291,29 @@ export function detectJoints(panels: AsmPanel[], tolMm: number): AsmJoint[] {
   return joints;
 }
 
-/** True if world point `pt` lies within `tol` of panel `p` (plane + footprint). */
-function pointOnPanel(pt: Vec3World, p: AsmPanel, tol: number): boolean {
+/**
+ * True if world point `pt` — a sample on the mid-surface of a panel whose own
+ * half-thickness is `srcHalfT` and whose normal is `srcNormal` — lies close
+ * enough to panel `p` for the two SOLIDS to be in contact.
+ *
+ * Both panels are modelled on their mid-surfaces, so the mid-plane separation
+ * at contact depends on how the normals sit relative to each other:
+ *   • perpendicular (a butt joint — an edge into a face): the source panel's
+ *     thickness runs parallel to the target's plane and adds nothing, so
+ *     contact means d ≤ t_dst/2.
+ *   • parallel (a face-to-face lap): the source's own half-thickness closes
+ *     the gap, so contact means d ≤ t_dst/2 + t_src/2.
+ * `|nSrc · nDst|` interpolates between the two exactly, instead of either
+ * missing lap joints or inventing butt joints across a 9 mm air gap.
+ */
+function pointOnPanel(
+  pt: Vec3World, p: AsmPanel, tol: number,
+  srcHalfT = 0, srcNormal: Vec3World | null = null,
+): boolean {
   const rel = w3sub(pt, p.origin);
   const d = Math.abs(w3dot(rel, p.normal));
-  if (d > tol + p.thicknessMm / 2 + 0.01) return false;
+  const align = srcNormal ? Math.abs(w3dot(srcNormal, p.normal)) : 0;
+  if (d > tol + p.thicknessMm / 2 + srcHalfT * align + 0.01) return false;
   const ox = w3dot(rel, p.uAxis);
   const oy = w3dot(rel, p.vAxis);
   // Allow a tol slack around the footprint so an edge that lands just outside
@@ -1224,7 +1347,7 @@ function bestContact(a: AsmPanel, b: AsmPanel, tol: number): { p0: Vec3World; p1
       for (let s = 0; s <= steps; s++) {
         const t = s / steps;
         const pt = w3add(e.p0, w3scale(w3sub(e.p1, e.p0), t));
-        if (pointOnPanel(pt, dst, tol)) {
+        if (pointOnPanel(pt, dst, tol, src.thicknessMm / 2, src.normal)) {
           if (runStart < 0) runStart = s;
         } else {
           closeRun(s - 1);
@@ -1578,6 +1701,198 @@ function preprocessAssembly(opts: AsmSolveOptions, report: (p: SolveProgress) =>
 }
 
 /**
+ * The shell discretisation as a drawable mesh: one quad per active cell,
+ * referencing the solver's own global node numbering. Cells touching an
+ * inactive corner are skipped — exactly as the assembler skips them — so the
+ * drawn mesh and the solved mesh are the same set of elements.
+ */
+function shellMeshView(pre: AsmPreprocess): CaeMeshView {
+  const { meshes, nodePos, totalNodes, nDof } = pre;
+
+  let elemCount = 0;
+  for (const m of meshes) elemCount += m.activeCells.length;
+
+  const nodes = new Float32Array(totalNodes * 3);
+  for (let g = 0; g < totalNodes; g++) {
+    const p = nodePos[g];
+    nodes[g * 3] = p[0]; nodes[g * 3 + 1] = p[1]; nodes[g * 3 + 2] = p[2];
+  }
+
+  const elems = new Int32Array(elemCount * 4);
+  const panelOf = new Int32Array(elemCount);
+  let minEdge = Infinity, maxEdge = 0;
+  let e = 0;
+  for (const m of meshes) {
+    minEdge = Math.min(minEdge, m.dx, m.dy);
+    maxEdge = Math.max(maxEdge, m.dx, m.dy);
+    const nodeIdx = (ix: number, iy: number) => iy * m.nx + ix;
+    for (const [ix, iy] of m.activeCells) {
+      const g0 = m.gnode[nodeIdx(ix, iy)];
+      const g1 = m.gnode[nodeIdx(ix + 1, iy)];
+      const g2 = m.gnode[nodeIdx(ix + 1, iy + 1)];
+      const g3 = m.gnode[nodeIdx(ix, iy + 1)];
+      if (g0 < 0 || g1 < 0 || g2 < 0 || g3 < 0) continue;
+      elems[e * 4] = g0; elems[e * 4 + 1] = g1; elems[e * 4 + 2] = g2; elems[e * 4 + 3] = g3;
+      panelOf[e] = m.panel.id;
+      e++;
+    }
+  }
+
+  return {
+    kind: 'shell',
+    nodes,
+    elems: elems.subarray(0, e * 4),
+    nodesPerElem: 4,
+    panelOf: panelOf.subarray(0, e),
+    nodeCount: totalNodes,
+    elemCount: e,
+    dofPerNode: 6,
+    dofCount: nDof,
+    minEdgeMm: Number.isFinite(minEdge) ? minEdge : 0,
+    maxEdgeMm: maxEdge,
+    throughLayers: 1,
+  };
+}
+
+/**
+ * The SOLID discretisation: every shell cell extruded through the panel
+ * thickness into `layers` 8-node hexahedra. Node numbering is
+ * `shellNode * (layers + 1) + level`, so a solid node maps back to its
+ * mid-surface shell node by integer division — which is what lets the solid
+ * path reuse the shell's joint pairing and grounding.
+ *
+ * Level 0 sits on the −normal face, level `layers` on the +normal face; the
+ * shell node's own position is the mid-surface.
+ */
+function solidMeshView(pre: AsmPreprocess, layersIn = 2): CaeMeshView {
+  const { meshes, nodePos, totalNodes } = pre;
+  const layers = Math.max(1, Math.round(layersIn));
+  const levels = layers + 1;
+
+  // Owning panel per global shell node (nodes are never shared between panels
+  // — joints couple them with penalty springs instead of merging them).
+  const ownerThick = new Float64Array(totalNodes);
+  const ownerNx = new Float64Array(totalNodes * 3);
+  for (const m of meshes) {
+    const n = m.panel.normal;
+    for (let i = 0; i < m.gnode.length; i++) {
+      const g = m.gnode[i];
+      if (g < 0) continue;
+      ownerThick[g] = m.panel.thicknessMm;
+      ownerNx[g * 3] = n[0]; ownerNx[g * 3 + 1] = n[1]; ownerNx[g * 3 + 2] = n[2];
+    }
+  }
+
+  const nodeCount = totalNodes * levels;
+  const nodes = new Float32Array(nodeCount * 3);
+  for (let g = 0; g < totalNodes; g++) {
+    const p = nodePos[g];
+    const t = ownerThick[g];
+    const nx = ownerNx[g * 3], ny = ownerNx[g * 3 + 1], nz = ownerNx[g * 3 + 2];
+    for (let l = 0; l < levels; l++) {
+      const off = (l / layers - 0.5) * t;   // −t/2 … +t/2
+      const s = (g * levels + l) * 3;
+      nodes[s] = p[0] + nx * off;
+      nodes[s + 1] = p[1] + ny * off;
+      nodes[s + 2] = p[2] + nz * off;
+    }
+  }
+
+  let cellCount = 0;
+  for (const m of meshes) cellCount += m.activeCells.length;
+  const elems = new Int32Array(cellCount * layers * 8);
+  const panelOf = new Int32Array(cellCount * layers);
+  let minEdge = Infinity, maxEdge = 0;
+  let e = 0;
+  for (const m of meshes) {
+    minEdge = Math.min(minEdge, m.dx, m.dy);
+    maxEdge = Math.max(maxEdge, m.dx, m.dy);
+    const nodeIdx = (ix: number, iy: number) => iy * m.nx + ix;
+    for (const [ix, iy] of m.activeCells) {
+      const q = [
+        m.gnode[nodeIdx(ix, iy)],
+        m.gnode[nodeIdx(ix + 1, iy)],
+        m.gnode[nodeIdx(ix + 1, iy + 1)],
+        m.gnode[nodeIdx(ix, iy + 1)],
+      ];
+      if (q.some((g) => g < 0)) continue;
+      for (let l = 0; l < layers; l++) {
+        const base = e * 8;
+        // Standard hex ordering: bottom face 0-3 (level l), top face 4-7.
+        for (let k = 0; k < 4; k++) elems[base + k] = q[k] * levels + l;
+        for (let k = 0; k < 4; k++) elems[base + 4 + k] = q[k] * levels + l + 1;
+        panelOf[e] = m.panel.id;
+        e++;
+      }
+    }
+  }
+
+  return {
+    kind: 'solid',
+    nodes,
+    elems: elems.subarray(0, e * 8),
+    nodesPerElem: 8,
+    panelOf: panelOf.subarray(0, e),
+    nodeCount,
+    elemCount: e,
+    dofPerNode: 3,
+    dofCount: nodeCount * 3,
+    minEdgeMm: Number.isFinite(minEdge) ? minEdge : 0,
+    maxEdgeMm: maxEdge,
+    throughLayers: layers,
+  };
+}
+
+/**
+ * The boundary conditions the solver applies, as drawable glyph data:
+ * grounded nodes, joint node-pair couplings, and the nodal force vectors the
+ * patch loads resolved to. Read straight off the preprocessed model.
+ */
+function constraintView(pre: AsmPreprocess): CaeConstraintView {
+  const { nodePos, groundPoints, jointPairs, F, totalNodes } = pre;
+
+  const grounded = new Float32Array(groundPoints.length * 3);
+  for (let i = 0; i < groundPoints.length; i++) {
+    const p = groundPoints[i];
+    grounded[i * 3] = p[0]; grounded[i * 3 + 1] = p[1]; grounded[i * 3 + 2] = p[2];
+  }
+
+  const jointLinks: CaeJointLink[] = jointPairs.map((jp) => ({
+    p0: nodePos[jp.gi], p1: nodePos[jp.gj], stiffness: jp.stiffness,
+  }));
+
+  const loads: CaeNodalLoad[] = [];
+  let totalLoadN = 0;
+  for (let g = 0; g < totalNodes; g++) {
+    const fx = F[g * 6], fy = F[g * 6 + 1], fz = F[g * 6 + 2];
+    if (fx === 0 && fy === 0 && fz === 0) continue;
+    loads.push({ at: nodePos[g], f: [fx, fy, fz] });
+    totalLoadN += Math.hypot(fx, fy, fz);
+  }
+
+  return { grounded, groundedCount: groundPoints.length, jointLinks, loads, totalLoadN };
+}
+
+/**
+ * Build the model WITHOUT solving it, and hand back the mesh + constraints for
+ * display. This is the "show me what you're about to solve" path: it runs the
+ * identical preprocessing the solve runs, so the mesh density, the grounded
+ * nodes, the joint couplings and the load distribution shown are the ones the
+ * solver will use.
+ */
+export function previewAssembly(opts: AsmSolveOptions): AsmPreview {
+  if (opts.panels.length === 0) return { ok: false, message: 'No panels selected.' };
+  const pre = preprocessAssembly(opts, opts.onProgress ?? (() => {}));
+  if ('fail' in pre) return { ok: false, message: pre.message };
+  return {
+    ok: true,
+    mesh: opts.meshKind === 'solid' ? solidMeshView(pre) : shellMeshView(pre),
+    constraints: constraintView(pre),
+    resolutionLog: pre.resolutionLog,
+  };
+}
+
+/**
  * Serialize the preprocessed assembly into the JSON model the local PyNite
  * sidecar solves. Quads reference per-panel isotropic materials with an
  * EFFECTIVE modulus E_eff = sqrt(eAlong·eAcross) (PyNite plates are isotropic —
@@ -1667,6 +1982,8 @@ export function solveAssembly(opts: AsmSolveOptions): AsmResult {
     totalDof: 0, totalNodes: 0, iterations: 0, converged: false,
     backend: 'PCG', factorMs: 0, solveMs: 0,
     groundedNodes: 0, resolutionLog: '', groundPoints: [],
+    mesh: null, constraints: null,
+    nodeDisp: new Float32Array(0), nodeDispMag: new Float32Array(0), nodeVm: new Float32Array(0),
   });
 
   if (panels.length === 0) return empty('No panels selected.');
@@ -1675,6 +1992,12 @@ export function solveAssembly(opts: AsmSolveOptions): AsmResult {
   if ('fail' in pre) {
     return { ...empty(pre.message), resolutionLog: pre.resolutionLog, totalNodes: pre.totalNodes, totalDof: pre.nDof };
   }
+
+  // The solid path shares this preprocessed model — the same in-plane grid,
+  // joint pairing, grounding and load distribution — and re-discretises it
+  // through the thickness into hexes.
+  if (opts.meshKind === 'solid') return solveAssemblySolid(pre, opts, panels, report, empty);
+
   const { meshes, nDof, repStiff, jointPairs, grounded, F } = pre;
 
   // Assemble the global stiffness in a row-map (6 DOF/node).
@@ -1871,6 +2194,8 @@ function finishAssembly(
     totalDof: nDof, totalNodes, iterations: 0, converged: false,
     backend, factorMs, solveMs,
     groundedNodes: grounded.length, resolutionLog, groundPoints,
+    mesh: null, constraints: null,
+    nodeDisp: new Float32Array(0), nodeDispMag: new Float32Array(0), nodeVm: new Float32Array(0),
   });
 
   // --- STAGE: stress recovery / post-processing — OUR TypeScript. ---
@@ -1884,6 +2209,14 @@ function finishAssembly(
   let maxVmAt: Vec2 = [0, 0];
   // Peak bending stresses along/across the grain over ALL panels (for util%).
   let peakAlong = 0, peakAcross = 0;
+
+  // Per-GLOBAL-node fields, in mesh node order — these drive the mesh-view
+  // contour + deformed shape. Built alongside the per-panel grids below so the
+  // two stay consistent (same displacements, same recovered element stresses).
+  const nodeDisp = new Float32Array(totalNodes * 3);
+  const nodeDispMag = new Float32Array(totalNodes);
+  const gVmSum = new Float64Array(totalNodes);
+  const gVmCnt = new Int32Array(totalNodes);
 
   for (const m of meshes) {
     const p = m.panel;
@@ -1905,6 +2238,8 @@ function finishAssembly(
         const dxv = x[g * 6], dyv = x[g * 6 + 1], dzv = x[g * 6 + 2];
         const mag = Math.hypot(dxv, dyv, dzv);
         disp[iy * m.nx + ix] = mag;
+        nodeDisp[g * 3] = dxv; nodeDisp[g * 3 + 1] = dyv; nodeDisp[g * 3 + 2] = dzv;
+        nodeDispMag[g] = mag;
         if (mag > pMax) pMax = mag;
         if (mag > maxDisp) {
           maxDisp = mag; maxPanelId = p.id; maxAt = [ix * m.dx, iy * m.dy];
@@ -1954,6 +2289,7 @@ function finishAssembly(
       if (along > peakAlong) peakAlong = along;
       if (across > peakAcross) peakAcross = across;
       for (const n of en) { vmSum[n] += vm; vmCnt[n] += 1; }
+      for (const gg of g) { gVmSum[gg] += vm; gVmCnt[gg] += 1; }
     }
 
     // Nodal average → a smooth field.
@@ -1996,13 +2332,662 @@ function finishAssembly(
   const stressVerdict: 'ok' | 'borderline' | 'weak' =
     utilPct < 50 ? 'ok' : utilPct < 100 ? 'borderline' : 'weak';
 
+  // Nodal-average the recovered element von Mises onto the global node table.
+  const nodeVm = new Float32Array(totalNodes).fill(NaN);
+  for (let g = 0; g < totalNodes; g++) {
+    if (gVmCnt[g] > 0) nodeVm[g] = gVmSum[g] / gVmCnt[g];
+  }
+
   return {
     ok: true, panels: panelResults, maxDisp, maxPanelId, maxAt, spanMm: span, verdict,
     maxVm, maxVmPanelId, maxVmAt, utilPct, stressVerdict,
     totalDof: nDof, totalNodes, iterations, converged,
     backend, factorMs, solveMs,
     groundedNodes: grounded.length, resolutionLog, groundPoints,
+    mesh: shellMeshView(pre), constraints: constraintView(pre),
+    nodeDisp, nodeDispMag, nodeVm,
   };
+}
+
+/**
+ * Solve the assembly with 8-node hexahedral solid elements.
+ *
+ * Reuses the shell preprocessing wholesale — the in-plane grid, the joint node
+ * pairing, the floor grounding and the load distribution are all defined on the
+ * mid-surface nodes — and lifts each of those to the through-thickness stack of
+ * solid nodes that mid-surface node owns. A shell node `g` becomes solid nodes
+ * `g·levels + l` for l = 0…layers, which is the same numbering solidMeshView
+ * draws, so results map straight onto the displayed mesh.
+ */
+function solveAssemblySolid(
+  pre: AsmPreprocess,
+  opts: AsmSolveOptions,
+  panels: AsmPanel[],
+  report: (p: SolveProgress) => void,
+  empty: (msg: string) => AsmResult,
+): AsmResult {
+  const { meshes, nodePos, totalNodes, jointPairs, grounded, F, repStiff } = pre;
+  const layers = Math.max(1, Math.round(opts.solidLayers ?? 2));
+  const levels = layers + 1;
+  const nNodes = totalNodes * levels;
+  const nDof = nNodes * 3;
+
+  const view = solidMeshView(pre, layers);
+  const resolutionLog =
+    `${panels.length} panel${panels.length === 1 ? '' : 's'} · ${view.elemCount} hex · ${nNodes} nodes · ${nDof} DOF · ${layers} layer${layers === 1 ? '' : 's'}`;
+
+  report({ stage: 'assembling', pct: 25, detail: `${nDof.toLocaleString()} DOF · hex` });
+
+  const rows: Map<number, number>[] = Array.from({ length: nDof }, () => new Map());
+  const addK = (i: number, j: number, v: number) => {
+    if (v === 0) return;
+    const r = rows[i];
+    r.set(j, (r.get(j) ?? 0) + v);
+  };
+
+  // --- Element assembly. Every hex in a panel is the same rectangular box, so
+  //     the local 24×24 is formed once and rotated per element. ---
+  let repSolid = 0;
+  for (const m of meshes) {
+    const p = m.panel;
+    const c = p.thicknessMm / layers;
+    const D = panelSolidD(p);
+    const Kl = hexKIncompatible(m.dx, m.dy, c, D);
+    repSolid = Math.max(repSolid, D[0][0] * Math.min(m.dx, m.dy, c));
+
+    // Local→global rotation: columns are the panel's world axes.
+    const R = [
+      [p.uAxis[0], p.vAxis[0], p.normal[0]],
+      [p.uAxis[1], p.vAxis[1], p.normal[1]],
+      [p.uAxis[2], p.vAxis[2], p.normal[2]],
+    ];
+    // Pre-rotate every 3×3 nodal block: Kg = R·Kl·Rᵀ.
+    const Kg: number[][] = Array.from({ length: 24 }, () => new Array(24).fill(0));
+    for (let ni = 0; ni < 8; ni++) {
+      for (let nj = 0; nj < 8; nj++) {
+        const blk = [
+          [Kl[ni * 3][nj * 3], Kl[ni * 3][nj * 3 + 1], Kl[ni * 3][nj * 3 + 2]],
+          [Kl[ni * 3 + 1][nj * 3], Kl[ni * 3 + 1][nj * 3 + 1], Kl[ni * 3 + 1][nj * 3 + 2]],
+          [Kl[ni * 3 + 2][nj * 3], Kl[ni * 3 + 2][nj * 3 + 1], Kl[ni * 3 + 2][nj * 3 + 2]],
+        ];
+        const rot = mat3mul(mat3mul(R, blk), transpose3(R));
+        for (let r = 0; r < 3; r++) for (let cc = 0; cc < 3; cc++) Kg[ni * 3 + r][nj * 3 + cc] = rot[r][cc];
+      }
+    }
+
+    const nodeIdx = (ix: number, iy: number) => iy * m.nx + ix;
+    for (const [ix, iy] of m.activeCells) {
+      const q = [
+        m.gnode[nodeIdx(ix, iy)], m.gnode[nodeIdx(ix + 1, iy)],
+        m.gnode[nodeIdx(ix + 1, iy + 1)], m.gnode[nodeIdx(ix, iy + 1)],
+      ];
+      if (q.some((g) => g < 0)) continue;
+      for (let l = 0; l < layers; l++) {
+        const en = [
+          q[0] * levels + l, q[1] * levels + l, q[2] * levels + l, q[3] * levels + l,
+          q[0] * levels + l + 1, q[1] * levels + l + 1, q[2] * levels + l + 1, q[3] * levels + l + 1,
+        ];
+        for (let ni = 0; ni < 8; ni++) {
+          for (let nj = 0; nj < 8; nj++) {
+            const gi = en[ni] * 3, gj = en[nj] * 3;
+            for (let r = 0; r < 3; r++)
+              for (let cc = 0; cc < 3; cc++)
+                addK(gi + r, gj + cc, Kg[ni * 3 + r][nj * 3 + cc]);
+          }
+        }
+      }
+    }
+  }
+  if (repSolid <= 0 || !Number.isFinite(repSolid)) repSolid = repStiff;
+
+  // --- Joint coupling. A shell node pair becomes one translational penalty
+  //     spring per through-thickness level, so the joined stacks move together
+  //     — rotational continuity across the seam emerges from the stack rather
+  //     than needing rotational DOF the solid doesn't have. A hinged joint
+  //     couples only the mid level, leaving the seam free to rotate. ---
+  const addSpring = (a: number, b: number, dof: number, k: number) => {
+    const i = a * 3 + dof, j = b * 3 + dof;
+    addK(i, i, k); addK(j, j, k);
+    addK(i, j, -k); addK(j, i, -k);
+  };
+  const midLevel = Math.floor(layers / 2);
+  for (const jp of jointPairs) {
+    const k = jp.kTrans;
+    const lvls = jp.stiffness === 'hinged'
+      ? [midLevel]
+      : Array.from({ length: levels }, (_, l) => l);
+    const scale = jp.stiffness === 'semi-rigid' ? 0.05 : 1;
+    for (const l of lvls) {
+      const a = jp.gi * levels + l, b = jp.gj * levels + l;
+      for (let d = 0; d < 3; d++) addSpring(a, b, d, k * scale);
+    }
+  }
+
+  // --- Grounding: a grounded mid-surface node fixes its whole stack. ---
+  const fixed = new Uint8Array(nDof);
+  for (const g of grounded) {
+    for (let l = 0; l < levels; l++) {
+      const s = (g * levels + l) * 3;
+      fixed[s] = 1; fixed[s + 1] = 1; fixed[s + 2] = 1;
+    }
+  }
+
+  // --- Loads: the mid-surface nodal force is shared across the stack. Which
+  //     face a patch presses on is below the resolution of an 18 mm panel with
+  //     2-3 elements through it, and spreading avoids a spurious contact spike
+  //     at a single surface node. ---
+  const Fs = new Float64Array(nDof);
+  for (let g = 0; g < totalNodes; g++) {
+    const fx = F[g * 6], fy = F[g * 6 + 1], fz = F[g * 6 + 2];
+    if (fx === 0 && fy === 0 && fz === 0) continue;
+    for (let l = 0; l < levels; l++) {
+      const s = (g * levels + l) * 3;
+      Fs[s] += fx / levels; Fs[s + 1] += fy / levels; Fs[s + 2] += fz / levels;
+    }
+  }
+
+  // Soft regularization on free DOF, then homogeneous Dirichlet BCs.
+  const kSoft = repSolid * 1e-6;
+  for (let i = 0; i < nDof; i++) {
+    if (fixed[i]) continue;
+    rows[i].set(i, (rows[i].get(i) ?? 0) + kSoft);
+  }
+  for (let i = 0; i < nDof; i++) {
+    if (fixed[i]) { Fs[i] = 0; rows[i] = new Map([[i, 1]]); }
+  }
+  for (let i = 0; i < nDof; i++) {
+    if (fixed[i]) continue;
+    const r = rows[i];
+    for (const cj of r.keys()) if (fixed[cj]) r.delete(cj);
+  }
+
+  // CSR.
+  const rowPtr = new Int32Array(nDof + 1);
+  let nnz = 0;
+  for (let i = 0; i < nDof; i++) { rowPtr[i] = nnz; nnz += rows[i].size; }
+  rowPtr[nDof] = nnz;
+  const colIdx = new Int32Array(nnz);
+  const val = new Float64Array(nnz);
+  const diag = new Float64Array(nDof);
+  {
+    let k = 0;
+    for (let i = 0; i < nDof; i++) {
+      const entries = [...rows[i].entries()].sort((p, q) => p[0] - q[0]);
+      for (const [cc, v] of entries) {
+        colIdx[k] = cc; val[k] = v;
+        if (cc === i) diag[i] = v;
+        k++;
+      }
+      if (diag[i] === 0) diag[i] = 1;
+      rows[i] = new Map();   // release as we go — solid rows are memory-heavy
+    }
+  }
+
+  // --- Linear solve: same two backends as the shell path. ---
+  const x = new Float64Array(nDof);
+  let iterations = 0, converged = false, factorMs = 0, solveMs = 0;
+  let backend: SolveBackend = 'PCG';
+  let usedDirect = false;
+  if (opts.backend) {
+    report({ stage: 'factorizing', pct: 55, detail: opts.backend.name });
+    const t0 = nowMs();
+    const okFac = opts.backend.factorize(nDof, rowPtr, colIdx, val);
+    factorMs = nowMs() - t0;
+    if (okFac) {
+      report({ stage: 'solving', pct: 75, detail: opts.backend.name });
+      const t1 = nowMs();
+      const sol = opts.backend.solve(Fs);
+      solveMs = nowMs() - t1;
+      if (sol && sol.length === nDof) {
+        x.set(sol); usedDirect = true; converged = true;
+        backend = 'Eigen LDLT (wasm)';
+      }
+    }
+    opts.backend.dispose();
+  }
+  if (!usedDirect) {
+    report({ stage: 'solving', pct: 60, detail: 'PCG' });
+    const t0 = nowMs();
+    const r = pcg(rowPtr, colIdx, val, diag, Fs, x, 1e-7, 20000,
+      (it, rel) => report({
+        stage: 'solving', pct: Math.min(90, 60 + (it / 20000) * 30),
+        detail: `PCG iter ${it} · res ${rel.toExponential(1)}`,
+      }));
+    solveMs = nowMs() - t0;
+    iterations = r.iterations; converged = r.converged;
+  }
+
+  return finishSolid(pre, view, x, panels, layers, {
+    backend, factorMs, solveMs, iterations, converged, resolutionLog,
+  }, report, empty);
+}
+
+/**
+ * Stress recovery + result packaging for the solid path.
+ *
+ * Per hex, evaluate the strain at the element centre from the SAME B-matrix the
+ * stiffness used, take σ = D·ε in the panel's local (and therefore material)
+ * axes, and reduce to a von Mises value scattered to the element's 8 nodes.
+ * Because the material axes ARE the local axes, σ11 and σ22 are directly the
+ * along- and across-grain fibre stresses the utilization check wants — no
+ * membrane/bending split is needed, the solid carries the real gradient.
+ */
+function finishSolid(
+  pre: AsmPreprocess,
+  view: CaeMeshView,
+  x: Float64Array,
+  panels: AsmPanel[],
+  layers: number,
+  info: {
+    backend: SolveBackend; factorMs: number; solveMs: number;
+    iterations: number; converged: boolean; resolutionLog: string;
+  },
+  report: (p: SolveProgress) => void,
+  empty: (msg: string) => AsmResult,
+): AsmResult {
+  const { meshes, totalNodes, grounded, groundPoints } = pre;
+  const levels = layers + 1;
+  const nNodes = totalNodes * levels;
+
+  report({ stage: 'recovering', pct: 92 });
+
+  const nodeDisp = new Float32Array(nNodes * 3);
+  const nodeDispMag = new Float32Array(nNodes);
+  for (let i = 0; i < nNodes; i++) {
+    const dx = x[i * 3], dy = x[i * 3 + 1], dz = x[i * 3 + 2];
+    nodeDisp[i * 3] = dx; nodeDisp[i * 3 + 1] = dy; nodeDisp[i * 3 + 2] = dz;
+    nodeDispMag[i] = Math.hypot(dx, dy, dz);
+  }
+
+  const vmSum = new Float64Array(nNodes);
+  const vmCnt = new Int32Array(nNodes);
+  let peakAlong = 0, peakAcross = 0;
+  let maxDisp = 0, maxPanelId = -1;
+  let maxAt: Vec2 = [0, 0];
+  let maxVm = 0, maxVmPanelId = -1;
+  let maxVmAt: Vec2 = [0, 0];
+
+  const panelResults: AsmPanelResult[] = [];
+
+  for (const m of meshes) {
+    const p = m.panel;
+    const c = p.thicknessMm / layers;
+    const D = panelSolidD(p);
+    // Centre-point B (ξ=η=ζ=0) for a rectangular box.
+    const jx = 2 / m.dx, jy = 2 / m.dy, jz = 2 / c;
+    const Bc: number[][] = Array.from({ length: 6 }, () => new Array(24).fill(0));
+    for (let i = 0; i < 8; i++) {
+      const [xi, eta, zeta] = HEX_NAT[i];
+      const dNdx = 0.125 * xi * jx, dNdy = 0.125 * eta * jy, dNdz = 0.125 * zeta * jz;
+      const cu = i * 3, cv = cu + 1, cw = cu + 2;
+      Bc[0][cu] = dNdx; Bc[1][cv] = dNdy; Bc[2][cw] = dNdz;
+      Bc[3][cv] = dNdz; Bc[3][cw] = dNdy;
+      Bc[4][cu] = dNdz; Bc[4][cw] = dNdx;
+      Bc[5][cu] = dNdy; Bc[5][cv] = dNdx;
+    }
+    // World→local rotation (rows are the panel axes).
+    const toLocal = (gx: number, gy: number, gz: number): [number, number, number] => [
+      p.uAxis[0] * gx + p.uAxis[1] * gy + p.uAxis[2] * gz,
+      p.vAxis[0] * gx + p.vAxis[1] * gy + p.vAxis[2] * gz,
+      p.normal[0] * gx + p.normal[1] * gy + p.normal[2] * gz,
+    ];
+
+    const gridNodes = m.nx * m.ny;
+    const disp = new Float32Array(gridNodes).fill(NaN);
+    const vmGrid = new Float32Array(gridNodes).fill(NaN);
+    let pMax = 0, pVm = 0;
+
+    const nodeIdx = (ix: number, iy: number) => iy * m.nx + ix;
+    for (const [ix, iy] of m.activeCells) {
+      const q = [
+        m.gnode[nodeIdx(ix, iy)], m.gnode[nodeIdx(ix + 1, iy)],
+        m.gnode[nodeIdx(ix + 1, iy + 1)], m.gnode[nodeIdx(ix, iy + 1)],
+      ];
+      if (q.some((g) => g < 0)) continue;
+      for (let l = 0; l < layers; l++) {
+        const en = [
+          q[0] * levels + l, q[1] * levels + l, q[2] * levels + l, q[3] * levels + l,
+          q[0] * levels + l + 1, q[1] * levels + l + 1, q[2] * levels + l + 1, q[3] * levels + l + 1,
+        ];
+        // Local displacement vector for the element.
+        const ue = new Array(24).fill(0);
+        for (let i = 0; i < 8; i++) {
+          const n = en[i];
+          const [lu, lv, lw] = toLocal(x[n * 3], x[n * 3 + 1], x[n * 3 + 2]);
+          ue[i * 3] = lu; ue[i * 3 + 1] = lv; ue[i * 3 + 2] = lw;
+        }
+        const eps = new Array(6).fill(0);
+        for (let r = 0; r < 6; r++) {
+          let s = 0;
+          for (let k = 0; k < 24; k++) s += Bc[r][k] * ue[k];
+          eps[r] = s;
+        }
+        const sig = new Array(6).fill(0);
+        for (let r = 0; r < 6; r++) {
+          let s = 0;
+          for (let k = 0; k < 6; k++) s += D[r][k] * eps[k];
+          sig[r] = s;
+        }
+        const vm = Math.sqrt(Math.max(0,
+          0.5 * ((sig[0] - sig[1]) ** 2 + (sig[1] - sig[2]) ** 2 + (sig[2] - sig[0]) ** 2)
+          + 3 * (sig[3] ** 2 + sig[4] ** 2 + sig[5] ** 2)));
+        // Local axis 1 is the grain axis when grainAlongLength, else axis 2.
+        const along = Math.abs(p.grainAlongLength ? sig[0] : sig[1]);
+        const across = Math.abs(p.grainAlongLength ? sig[1] : sig[0]);
+        if (along > peakAlong) peakAlong = along;
+        if (across > peakAcross) peakAcross = across;
+        for (const n of en) { vmSum[n] += vm; vmCnt[n] += 1; }
+      }
+    }
+
+    // Collapse the through-thickness stack back onto the in-plane grid so the
+    // per-panel texture overlay + PDF pages keep working unchanged: each
+    // mid-surface node takes the worst value over its stack.
+    for (let iy = 0; iy < m.ny; iy++) {
+      for (let ix = 0; ix < m.nx; ix++) {
+        const gi = nodeIdx(ix, iy);
+        const g = m.gnode[gi];
+        if (g < 0) continue;
+        let dMax = 0, vMax = 0, sawVm = false;
+        for (let l = 0; l < levels; l++) {
+          const n = g * levels + l;
+          if (nodeDispMag[n] > dMax) dMax = nodeDispMag[n];
+          if (vmCnt[n] > 0) {
+            const v = vmSum[n] / vmCnt[n];
+            if (v > vMax) vMax = v;
+            sawVm = true;
+          }
+        }
+        disp[gi] = dMax;
+        if (sawVm) vmGrid[gi] = vMax;
+        if (dMax > pMax) pMax = dMax;
+        if (vMax > pVm) pVm = vMax;
+        if (dMax > maxDisp) { maxDisp = dMax; maxPanelId = p.id; maxAt = [ix * m.dx, iy * m.dy]; }
+        if (sawVm && vMax > maxVm) { maxVm = vMax; maxVmPanelId = p.id; maxVmAt = [ix * m.dx, iy * m.dy]; }
+      }
+    }
+
+    panelResults.push({
+      id: p.id, nx: m.nx, ny: m.ny, dx: m.dx, dy: m.dy,
+      disp, vm: vmGrid, active: m.active, maxAbs: pMax, maxVm: pVm,
+    });
+  }
+
+  const nodeVm = new Float32Array(nNodes).fill(NaN);
+  for (let n = 0; n < nNodes; n++) if (vmCnt[n] > 0) nodeVm[n] = vmSum[n] / vmCnt[n];
+
+  const governing = panels.find((p) => p.id === maxPanelId) ?? panels[0];
+  const span = Math.max(governing.outline.bbox.w, governing.outline.bbox.h);
+  if (!Number.isFinite(maxDisp) || maxDisp > span * 2) {
+    return { ...empty('Solid solve produced a non-physical result — check the joints and grounding.'), resolutionLog: info.resolutionLog };
+  }
+
+  report({ stage: 'done', pct: 100 });
+
+  const verdict: 'ok' | 'borderline' | 'weak' =
+    maxDisp < span / 300 ? 'ok' : maxDisp < span / 200 ? 'borderline' : 'weak';
+  const govVm = panels.find((p) => p.id === maxVmPanelId) ?? governing;
+  const utilPct = Math.max(peakAlong / (govVm.material.fbAlong || 1), peakAcross / (govVm.material.fbAcross || 1)) * 100;
+  const stressVerdict: 'ok' | 'borderline' | 'weak' =
+    utilPct < 50 ? 'ok' : utilPct < 100 ? 'borderline' : 'weak';
+
+  return {
+    ok: true, panels: panelResults, maxDisp, maxPanelId, maxAt, spanMm: span, verdict,
+    maxVm, maxVmPanelId, maxVmAt, utilPct, stressVerdict,
+    totalDof: nNodes * 3, totalNodes: nNodes,
+    iterations: info.iterations, converged: info.converged,
+    backend: info.backend, factorMs: info.factorMs, solveMs: info.solveMs,
+    groundedNodes: grounded.length, resolutionLog: info.resolutionLog, groundPoints,
+    mesh: view, constraints: constraintView(pre),
+    nodeDisp, nodeDispMag, nodeVm,
+  };
+}
+
+/** Transpose of a 3×3. */
+function transpose3(M: number[][]): number[][] {
+  return [
+    [M[0][0], M[1][0], M[2][0]],
+    [M[0][1], M[1][1], M[2][1]],
+    [M[0][2], M[1][2], M[2][2]],
+  ];
+}
+
+// ===========================================================================
+// SOLID (HEXAHEDRAL) ELEMENT PATH
+//
+// The shell path models each panel as a surface with a bending stiffness. The
+// solid path models the actual VOLUME: every in-plane cell is extruded through
+// the panel thickness into `layers` 8-node hexahedra with 3 translational DOF
+// per node, so through-thickness effects the plate theory cannot express —
+// rolling shear, local crushing under a load patch, the real stress gradient
+// across the plies — come out of the solve instead of being assumed away.
+//
+// TWO things make this work on plywood panels:
+//
+//  1. INCOMPATIBLE MODES. A plain trilinear hex in bending suffers shear
+//     locking: its edges must stay straight, so pure bending generates
+//     spurious shear energy and the element comes out wildly over-stiff —
+//     unusable at the 2-3 elements through an 18 mm panel we can afford.
+//     Adding Wilson's three quadratic bubble modes per direction (9 internal
+//     DOF, statically condensed out per element) restores the linear strain
+//     field bending needs. On a rectangular box the Jacobian is constant, so
+//     ∫Ba dV = 0 holds exactly and the element passes the patch test.
+//
+//  2. FULL ORTHOTROPY. Wood is far weaker through the panel than in it, and
+//     its rolling-shear modulus is a fraction of the in-plane one. A 3D
+//     isotropic solid would hide exactly the failure modes a solid model is
+//     worth running for.
+//
+// Every hex in a panel is the same rectangular box (dx × dy × t/layers), so
+// the 24×24 element stiffness is formed ONCE per panel and reused.
+// ===========================================================================
+
+/**
+ * Orthotropic 3D constitutive matrix (6×6) in material axes, ordered
+ * σ = [σ11, σ22, σ33, σ23, σ13, σ12].
+ *
+ * Built by inverting the compliance matrix, which is the form the elastic
+ * constants are actually measured in and keeps the Maxwell symmetry
+ * νij/Ei = νji/Ej exact.
+ */
+function orthotropic3D(
+  e1: number, e2: number, e3: number,
+  g12: number, g13: number, g23: number,
+  nu12: number, nu13: number, nu23: number,
+): number[][] {
+  // Minor Poisson ratios follow from symmetry.
+  const nu21 = nu12 * e2 / e1;
+  const nu31 = nu13 * e3 / e1;
+  const nu32 = nu23 * e3 / e2;
+
+  // Normal-strain compliance block, then invert it (3×3, closed form).
+  const S = [
+    [1 / e1, -nu21 / e2, -nu31 / e3],
+    [-nu12 / e1, 1 / e2, -nu32 / e3],
+    [-nu13 / e1, -nu23 / e2, 1 / e3],
+  ];
+  const det =
+    S[0][0] * (S[1][1] * S[2][2] - S[1][2] * S[2][1])
+    - S[0][1] * (S[1][0] * S[2][2] - S[1][2] * S[2][0])
+    + S[0][2] * (S[1][0] * S[2][1] - S[1][1] * S[2][0]);
+  const inv = (r: number, c: number) => {
+    const m = [0, 1, 2].filter((i) => i !== c).map((i) => [0, 1, 2].filter((j) => j !== r).map((j) => S[i][j]));
+    const cof = m[0][0] * m[1][1] - m[0][1] * m[1][0];
+    return ((r + c) % 2 === 0 ? cof : -cof) / det;
+  };
+
+  const D: number[][] = Array.from({ length: 6 }, () => new Array(6).fill(0));
+  for (let r = 0; r < 3; r++) for (let c = 0; c < 3; c++) D[r][c] = inv(r, c);
+  D[3][3] = g23;
+  D[4][4] = g13;
+  D[5][5] = g12;
+  return D;
+}
+
+/**
+ * Through-thickness and rolling-shear properties, derived from the card's
+ * in-plane numbers. Plywood is dramatically softer perpendicular to the panel
+ * than within it, and its rolling-shear modulus (shear in a plane containing
+ * the panel normal, which rolls the cross-plies) is a fraction of the in-plane
+ * value — the ratios below are the standard engineering estimates for
+ * cross-laminated veneer, and they are what makes a solid model of a panel
+ * behave like plywood instead of like a plastic slab.
+ */
+const E_THROUGH_RATIO = 0.15;   // E3 / E_across
+const ROLLING_SHEAR_RATIO = 0.2; // G13, G23 / G12
+const NU_THROUGH = 0.35;
+
+/** The 6×6 D-matrix for a panel, in its LOCAL (uAxis, vAxis, normal) axes. */
+function panelSolidD(p: AsmPanel): number[][] {
+  const m = p.material;
+  if (m.isotropic) {
+    const e = m.eAlong, nu = NU;
+    const g = e / (2 * (1 + nu));
+    return orthotropic3D(e, e, e, g, g, g, nu, nu, nu);
+  }
+  // Local X is the outline length axis; the grain runs along it unless the
+  // body's grain is set across.
+  const e1 = p.grainAlongLength ? m.eAlong : m.eAcross;
+  const e2 = p.grainAlongLength ? m.eAcross : m.eAlong;
+  const e3 = Math.max(50, Math.min(e1, e2) * E_THROUGH_RATIO);
+  const g12 = m.gShear;
+  const gRoll = g12 * ROLLING_SHEAR_RATIO;
+  return orthotropic3D(e1, e2, e3, g12, gRoll, gRoll, NU, NU_THROUGH, NU_THROUGH);
+}
+
+/** Exposed for tests/cae_check.ts — the hex element is validated directly
+ *  against beam theory, since an element that shear-locks still reports
+ *  roughly correct stresses (equilibrium fixes those) and only gives itself
+ *  away in the displacements. */
+export const hexKForTest = hexKIncompatible;
+export const orthotropic3DForTest = orthotropic3D;
+
+/** Natural coordinates of the 8 hex nodes, in the order solidMeshView emits. */
+const HEX_NAT: [number, number, number][] = [
+  [-1, -1, -1], [1, -1, -1], [1, 1, -1], [-1, 1, -1],
+  [-1, -1, 1], [1, -1, 1], [1, 1, 1], [-1, 1, 1],
+];
+const GAUSS2 = [-1 / Math.sqrt(3), 1 / Math.sqrt(3)];
+
+/**
+ * 24×24 stiffness of a rectangular hexahedron a×b×c with the 9 Wilson
+ * incompatible modes statically condensed out.
+ *
+ * K = Kuu − Kua · Kaa⁻¹ · Kuaᵀ
+ */
+function hexKIncompatible(a: number, b: number, c: number, D: number[][]): number[][] {
+  const Kuu: number[][] = Array.from({ length: 24 }, () => new Array(24).fill(0));
+  const Kua: number[][] = Array.from({ length: 24 }, () => new Array(9).fill(0));
+  const Kaa: number[][] = Array.from({ length: 9 }, () => new Array(9).fill(0));
+  const detJ = (a * b * c) / 8;
+  // Constant Jacobian: ∂/∂x = (2/a)·∂/∂ξ and so on.
+  const jx = 2 / a, jy = 2 / b, jz = 2 / c;
+
+  for (const gx of GAUSS2) {
+    for (const gy of GAUSS2) {
+      for (const gz of GAUSS2) {
+        // --- compatible (nodal) B, 6×24 ---
+        const Bu: number[][] = Array.from({ length: 6 }, () => new Array(24).fill(0));
+        for (let i = 0; i < 8; i++) {
+          const [xi, eta, zeta] = HEX_NAT[i];
+          const dNdx = 0.125 * xi * (1 + eta * gy) * (1 + zeta * gz) * jx;
+          const dNdy = 0.125 * eta * (1 + xi * gx) * (1 + zeta * gz) * jy;
+          const dNdz = 0.125 * zeta * (1 + xi * gx) * (1 + eta * gy) * jz;
+          const cu = i * 3, cv = cu + 1, cw = cu + 2;
+          Bu[0][cu] = dNdx;
+          Bu[1][cv] = dNdy;
+          Bu[2][cw] = dNdz;
+          Bu[3][cv] = dNdz; Bu[3][cw] = dNdy;   // γyz
+          Bu[4][cu] = dNdz; Bu[4][cw] = dNdx;   // γxz
+          Bu[5][cu] = dNdy; Bu[5][cv] = dNdx;   // γxy
+        }
+
+        // --- incompatible B, 6×9. Modes M1 = 1−ξ², M2 = 1−η², M3 = 1−ζ²,
+        //     each applied to all three displacement components. Only one
+        //     derivative of each mode is non-zero. ---
+        const dM = [-2 * gx * jx, -2 * gy * jy, -2 * gz * jz]; // dM_k / d(x_k)
+        const Ba: number[][] = Array.from({ length: 6 }, () => new Array(9).fill(0));
+        for (let k = 0; k < 3; k++) {
+          const g = [0, 0, 0];
+          g[k] = dM[k];                      // ∇M_k
+          for (let d = 0; d < 3; d++) {
+            const col = k * 3 + d;
+            if (d === 0) { Ba[0][col] = g[0]; Ba[4][col] = g[2]; Ba[5][col] = g[1]; }
+            if (d === 1) { Ba[1][col] = g[1]; Ba[3][col] = g[2]; Ba[5][col] = g[0]; }
+            if (d === 2) { Ba[2][col] = g[2]; Ba[3][col] = g[1]; Ba[4][col] = g[0]; }
+          }
+        }
+
+        // D·Bu and D·Ba once, then the three products.
+        const DBu = matMul6(D, Bu, 24);
+        const DBa = matMul6(D, Ba, 9);
+        accumulate(Kuu, Bu, DBu, 24, 24, detJ);
+        accumulate(Kua, Bu, DBa, 24, 9, detJ);
+        accumulate(Kaa, Ba, DBa, 9, 9, detJ);
+      }
+    }
+  }
+
+  // Static condensation of the internal modes.
+  const KaaInv = invertSquare(Kaa);
+  if (!KaaInv) return Kuu;   // degenerate: fall back to the locking element
+  const KuaInv: number[][] = Array.from({ length: 24 }, () => new Array(9).fill(0));
+  for (let r = 0; r < 24; r++)
+    for (let c = 0; c < 9; c++) {
+      let s = 0;
+      for (let k = 0; k < 9; k++) s += Kua[r][k] * KaaInv[k][c];
+      KuaInv[r][c] = s;
+    }
+  for (let r = 0; r < 24; r++)
+    for (let c = 0; c < 24; c++) {
+      let s = 0;
+      for (let k = 0; k < 9; k++) s += KuaInv[r][k] * Kua[c][k];
+      Kuu[r][c] -= s;
+    }
+  return Kuu;
+}
+
+/** D (6×6) · B (6×n) → 6×n. */
+function matMul6(D: number[][], B: number[][], n: number): number[][] {
+  const out: number[][] = Array.from({ length: 6 }, () => new Array(n).fill(0));
+  for (let r = 0; r < 6; r++)
+    for (let c = 0; c < n; c++) {
+      let s = 0;
+      for (let k = 0; k < 6; k++) s += D[r][k] * B[k][c];
+      out[r][c] = s;
+    }
+  return out;
+}
+
+/** K += Aᵀ·B · w, with A (6×rows) and B (6×cols). */
+function accumulate(K: number[][], A: number[][], B: number[][], rows: number, cols: number, w: number) {
+  for (let r = 0; r < rows; r++)
+    for (let c = 0; c < cols; c++) {
+      let s = 0;
+      for (let k = 0; k < 6; k++) s += A[k][r] * B[k][c];
+      K[r][c] += s * w;
+    }
+}
+
+/** Gauss-Jordan inverse of a small dense matrix; null if singular. */
+function invertSquare(M: number[][]): number[][] | null {
+  const n = M.length;
+  const a = M.map((row, i) => [...row, ...Array.from({ length: n }, (_, j) => (i === j ? 1 : 0))]);
+  for (let col = 0; col < n; col++) {
+    let piv = col;
+    for (let r = col + 1; r < n; r++) if (Math.abs(a[r][col]) > Math.abs(a[piv][col])) piv = r;
+    if (Math.abs(a[piv][col]) < 1e-14) return null;
+    if (piv !== col) { const t = a[piv]; a[piv] = a[col]; a[col] = t; }
+    const d = a[col][col];
+    for (let c = 0; c < 2 * n; c++) a[col][c] /= d;
+    for (let r = 0; r < n; r++) {
+      if (r === col) continue;
+      const f = a[r][col];
+      if (f === 0) continue;
+      for (let c = 0; c < 2 * n; c++) a[r][c] -= f * a[col][c];
+    }
+  }
+  return a.map((row) => row.slice(n));
 }
 
 /** Rotate a 6×6 local block (translation triple + rotation triple) to global

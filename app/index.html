@@ -263,6 +263,42 @@
             <div class="asm-hint">Detect joints to list touching panel edges.</div>
           </div>
 
+          <div class="asm-subtitle">Mesh</div>
+          <div class="asm-mesh-row">
+            <label>Elements
+              <select id="asmMeshKind">
+                <option value="shell" selected>Shell (plate)</option>
+                <option value="solid">Solid (hex)</option>
+              </select>
+            </label>
+            <label>Density
+              <select id="asmMeshDensity">
+                <option value="250">Coarse</option>
+                <option value="600" selected>Medium</option>
+                <option value="1400">Fine</option>
+                <option value="3000">Very fine</option>
+              </select>
+            </label>
+            <label id="asmSolidLayersRow" hidden>Layers
+              <select id="asmSolidLayers">
+                <option value="1">1</option>
+                <option value="2" selected>2</option>
+                <option value="3">3</option>
+                <option value="4">4</option>
+              </select>
+            </label>
+          </div>
+          <div class="asm-mesh-toggles">
+            <label class="check-row"><input type="checkbox" id="asmShowMesh" checked /><span>Mesh</span></label>
+            <label class="check-row"><input type="checkbox" id="asmShowNodes" /><span>Nodes</span></label>
+            <label class="check-row"><input type="checkbox" id="asmShowSupports" checked /><span>Supports</span></label>
+            <label class="check-row"><input type="checkbox" id="asmShowCouplings" checked /><span>Joints</span></label>
+            <label class="check-row"><input type="checkbox" id="asmShowLoads" checked /><span>Loads</span></label>
+          </div>
+          <div id="asmMeshStats" class="asm-mesh-stats">
+            <span class="asm-hint">Detect joints to build the mesh.</span>
+          </div>
+
           <div class="asm-subtitle">Loads</div>
           <div class="asm-presets">
             <button id="asmPreset50" class="ghost" type="button">50 kg on top</button>
@@ -280,6 +316,21 @@
           <div id="asmFieldToggle" class="asm-field-toggle" role="tablist" aria-label="Heatmap field" hidden>
             <button id="asmFieldDefl" class="asm-field-tab" role="tab" type="button" aria-selected="true">Deflection</button>
             <button id="asmFieldStress" class="asm-field-tab" role="tab" type="button" aria-selected="false">Stress</button>
+          </div>
+          <div id="asmDeformRow" class="asm-deform-row" hidden>
+            <label>Deform ×
+              <select id="asmDeformScale">
+                <option value="0">off</option>
+                <option value="auto" selected>auto</option>
+                <option value="1">1</option>
+                <option value="5">5</option>
+                <option value="10">10</option>
+                <option value="25">25</option>
+                <option value="50">50</option>
+                <option value="100">100</option>
+              </select>
+            </label>
+            <div id="asmLegend" class="asm-legend" aria-hidden="true"></div>
           </div>
           <div id="asmResult" class="asm-result">
             <span class="asm-hint">Detect joints, add loads, then Solve assembly.</span>

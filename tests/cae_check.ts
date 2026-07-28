@@ -21,6 +21,8 @@ import {
   solvePlate,
   rectOutline,
   bendingDForTest,
+  hexKForTest,
+  orthotropic3DForTest,
   detectJoints,
   solveAssembly,
   serializeAssembly,
@@ -359,6 +361,165 @@ async function caseG(solve: AsmSolveFn, label: string, tolPct: number) {
   );
 }
 
+// ---------------------------------------------------------------------------
+// (h) HEX ELEMENT — cantilever tip deflection.
+//
+// The decisive test for the solid element. A trilinear hex without incompatible
+// modes SHEAR-LOCKS in bending: its edges stay straight, so pure bending
+// manufactures spurious shear energy and the element comes out several times
+// too stiff. Stress checks do NOT catch this (equilibrium fixes the stress
+// regardless), so the element has to be checked on DISPLACEMENT.
+//
+// Built directly from hexKForTest — no assembly, no penalty joints, no
+// grounding regularization — so a failure here is the element and nothing else.
+//
+//   cantilever L × b × h, tip load P, ν = 0
+//   Euler-Bernoulli  δ = PL³/(3EI),  I = b·h³/12
+//   Timoshenko shear  + PL/(k·G·A),  k = 5/6
+// ---------------------------------------------------------------------------
+function caseH() {
+  const L = 480, b = 40, h = 24;      // mm — L/h = 20, a slender beam
+  const nx = 12, ny = 1, nz = 2;      // elements; 2 through the thickness
+  const E = 10000, nu = 0;            // ν=0 so full end-clamping adds no Poisson restraint
+  const P = 200;                      // N, total tip load
+
+  const G = E / (2 * (1 + nu));
+  const I = (b * h ** 3) / 12;
+  const theory = (P * L ** 3) / (3 * E * I) + (P * L) / ((5 / 6) * G * b * h);
+
+  const a = L / nx, bb = b / ny, c = h / nz;
+  const D = orthotropic3DForTest(E, E, E, G, G, G, nu, nu, nu);
+  const Ke = hexKForTest(a, bb, c, D);
+
+  // Node grid (nx+1) × (ny+1) × (nz+1), index = ((i·(ny+1)) + j)·(nz+1) + k.
+  const NI = nx + 1, NJ = ny + 1, NK = nz + 1;
+  const nid = (i: number, j: number, k: number) => (i * NJ + j) * NK + k;
+  const nNodes = NI * NJ * NK;
+  const n = nNodes * 3;
+
+  const K: Float64Array = new Float64Array(n * n);
+  // Element node order must match HEX_NAT: bottom face (k) CCW, then top (k+1).
+  for (let i = 0; i < nx; i++) {
+    for (let j = 0; j < ny; j++) {
+      for (let k = 0; k < nz; k++) {
+        const en = [
+          nid(i, j, k), nid(i + 1, j, k), nid(i + 1, j + 1, k), nid(i, j + 1, k),
+          nid(i, j, k + 1), nid(i + 1, j, k + 1), nid(i + 1, j + 1, k + 1), nid(i, j + 1, k + 1),
+        ];
+        for (let p = 0; p < 8; p++)
+          for (let q = 0; q < 8; q++)
+            for (let r = 0; r < 3; r++)
+              for (let s = 0; s < 3; s++)
+                K[(en[p] * 3 + r) * n + (en[q] * 3 + s)] += Ke[p * 3 + r][q * 3 + s];
+      }
+    }
+  }
+
+  // Clamp the i=0 face; total tip load P shared over the i=nx face nodes, +z.
+  const F = new Float64Array(n);
+  const tipNodes: number[] = [];
+  for (let j = 0; j < NJ; j++) for (let k = 0; k < NK; k++) tipNodes.push(nid(nx, j, k));
+  for (const t of tipNodes) F[t * 3 + 2] += P / tipNodes.length;
+
+  const fixed = new Uint8Array(n);
+  for (let j = 0; j < NJ; j++)
+    for (let k = 0; k < NK; k++)
+      for (let d = 0; d < 3; d++) fixed[nid(0, j, k) * 3 + d] = 1;
+  for (let r = 0; r < n; r++) {
+    if (!fixed[r]) continue;
+    for (let cc = 0; cc < n; cc++) { K[r * n + cc] = 0; K[cc * n + r] = 0; }
+    K[r * n + r] = 1;
+    F[r] = 0;
+  }
+
+  // Dense Gaussian elimination with partial pivoting (n ≈ 234 — instant).
+  const A = K, x = F;
+  for (let col = 0; col < n; col++) {
+    let piv = col;
+    for (let r = col + 1; r < n; r++) if (Math.abs(A[r * n + col]) > Math.abs(A[piv * n + col])) piv = r;
+    if (piv !== col) {
+      for (let cc = 0; cc < n; cc++) { const t = A[col * n + cc]; A[col * n + cc] = A[piv * n + cc]; A[piv * n + cc] = t; }
+      const t = x[col]; x[col] = x[piv]; x[piv] = t;
+    }
+    const d = A[col * n + col];
+    if (Math.abs(d) < 1e-14) continue;
+    for (let r = col + 1; r < n; r++) {
+      const f = A[r * n + col] / d;
+      if (f === 0) continue;
+      for (let cc = col; cc < n; cc++) A[r * n + cc] -= f * A[col * n + cc];
+      x[r] -= f * x[col];
+    }
+  }
+  for (let r = n - 1; r >= 0; r--) {
+    let s = x[r];
+    for (let cc = r + 1; cc < n; cc++) s -= A[r * n + cc] * x[cc];
+    x[r] = Math.abs(A[r * n + r]) < 1e-14 ? 0 : s / A[r * n + r];
+  }
+
+  let tip = 0;
+  for (const t of tipNodes) tip += x[t * 3 + 2];
+  tip /= tipNodes.length;
+
+  report(
+    `(h) hex cantilever tip deflection — no shear locking  [${nx}×${ny}×${nz} hex, ${nNodes} nodes]`,
+    tip, theory, 8,
+    `a plain (locking) H8 lands near ${(theory / 5).toFixed(2)} mm here`,
+  );
+}
+
+// ---------------------------------------------------------------------------
+// (i) SOLID vs SHELL — the same assembly solved both ways must agree.
+//
+// Case (g)'s simply-supported strip on hinged legs, run through the shell path
+// and the solid path. A 3D solid of a slender panel is slightly SOFTER than
+// Kirchhoff/Mindlin plate theory (it carries real transverse shear and local
+// contact flexibility), so it should land a little above the shell number —
+// but the same order, not 5× off in either direction.
+// ---------------------------------------------------------------------------
+async function caseI(solve: AsmSolveFn, label: string) {
+  const L = 240, w = 120, t = 20, H = 80, ov = 20;
+  const E = 8000, P = 600;
+  const mat = iso(E, 0.3);
+
+  const build = (): AsmSolveOptions => {
+    const strip = mkPanel(1, 'S', L + 2 * ov, w, t, mat, [-ov, 0, H], [1, 0, 0], [0, 1, 0], [0, 0, 1]);
+    const legL = mkPanel(2, 'L', w, H, t, mat, [0, 0, 0], [0, 1, 0], [0, 0, 1], [1, 0, 0]);
+    const legR = mkPanel(3, 'R', w, H, t, mat, [L, 0, 0], [0, 1, 0], [0, 0, 1], [1, 0, 0]);
+    const panels = [strip, legL, legR];
+    const joints = detectJoints(panels, 3).map((j) => ({ ...j, stiffness: 'hinged' as JointStiffness }));
+    return {
+      panels, joints, tolMm: 3,
+      loads: [{ panelId: 1, x: L / 2 + ov, y: w / 2, N: P, shape: 'round', size: 0 }],
+    };
+  };
+
+  const shell = await solve({ ...build(), meshKind: 'shell' });
+  const solid = await solve({ ...build(), meshKind: 'solid', solidLayers: 2 });
+
+  if (!shell.ok || !solid.ok) {
+    anyFail = true;
+    console.log(`[FAIL] (i)[${label}] solid-vs-shell setup — shell.ok=${shell.ok} solid.ok=${solid.ok} ` +
+      `shellMsg=${shell.message ?? ''} solidMsg=${solid.message ?? ''}`);
+    return;
+  }
+  if (solid.mesh?.kind !== 'solid' || solid.mesh.nodesPerElem !== 8) {
+    anyFail = true;
+    console.log(`[FAIL] (i)[${label}] solid solve did not return a hex mesh (kind=${solid.mesh?.kind})`);
+    return;
+  }
+
+  const ratio = solid.maxDisp / (shell.maxDisp || 1);
+  const ok = ratio > 0.7 && ratio < 2.2;
+  if (!ok) anyFail = true;
+  console.log(
+    `[${ok ? 'PASS' : 'FAIL'}] (i)[${label}] solid hex vs shell — same structure, same order  ` +
+    `[${solid.mesh.elemCount} hex / ${solid.totalDof} DOF vs ${shell.totalDof} DOF]\n` +
+    `        shell maxDisp = ${shell.maxDisp.toExponential(5)} mm\n` +
+    `        solid maxDisp = ${solid.maxDisp.toExponential(5)} mm\n` +
+    `        ratio = ${ratio.toFixed(3)}  (require 0.7 … 2.2; solid should be mildly softer)`,
+  );
+}
+
 async function main() {
   console.log('=== plate + assembly solver validation ===');
   void bendingDForTest; // keep the import referenced
@@ -368,6 +529,9 @@ async function main() {
   caseB();
   caseC();
   caseD();
+
+  // Solid element, standalone — independent of the assembly machinery.
+  caseH();
 
   // Try to load the sparse-direct WASM backend. null → only the PCG pass runs.
   const wasm = await getDirectSolver();
@@ -401,6 +565,9 @@ async function main() {
     caseE_disp[label] = await caseE(solve, label, eTol);
     await caseF(solve, label);
     await caseG(solve, label, gTol);
+    // The solid path is in-process only — the PyNite sidecar solves plate
+    // elements and has no hex model to compare against.
+    if (label !== 'PyNite') await caseI(solve, label);
   }
 
   // Cross-backend numerical agreement on case (e): the direct LDLT solve and
