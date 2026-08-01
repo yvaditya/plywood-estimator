@@ -913,8 +913,13 @@ export interface AsmSolveOptions {
   loads: AsmLoad[];
   /** Join tolerance (mm) — also the floor-contact threshold. */
   tolMm: number;
-  /** Target active nodes per panel (mesh auto-coarsens to hold the DOF cap). */
+  /** Target active nodes per panel (mesh auto-coarsens to hold the DOF cap).
+   *  Ignored when `elementSizeMm` is set. */
   targetNodesPerPanel?: number;
+  /** Absolute target element edge length (mm) — the preferred way to specify
+   *  the mesh, since it means the same thing on every panel regardless of size.
+   *  Still auto-coarsened to hold `maxDof`. */
+  elementSizeMm?: number;
   /** Hard cap on total assembly DOF. */
   maxDof?: number;
   /** Optional sparse-direct backend (Eigen LDLT wasm). When present AND its
@@ -1039,6 +1044,12 @@ export interface CaeMeshView {
   maxEdgeMm: number;
   /** Solid only: element layers through the panel thickness. */
   throughLayers: number;
+  /** The element size requested (mm), when the mesh was specified by size. */
+  requestedSizeMm?: number;
+  /** True when the DOF ceiling forced a coarser mesh than requested. */
+  coarsened: boolean;
+  /** DOF the requested size would have needed — what the ceiling refused. */
+  uncappedDof: number;
 }
 
 /** One node-pair coupling the solver created for a detected joint. */
@@ -1063,19 +1074,86 @@ export type AsmPreview =
   | { ok: true; mesh: CaeMeshView; constraints: CaeConstraintView; resolutionLog: string }
   | { ok: false; message: string };
 
-/**
- * The single fringe-plot colour ramp for every CAE display: blue → green →
- * yellow → red for t ∈ [0,1]. Lives here (not in a renderer) so the 3D mesh
- * contour, the panel texture overlay and the PDF legend can't drift apart.
- */
-export function heatColor(t: number): [number, number, number] {
-  t = Math.max(0, Math.min(1, t));
-  const stops: [number, [number, number, number]][] = [
-    [0.0, [40, 90, 220]],
-    [0.34, [40, 190, 120]],
-    [0.67, [235, 205, 50]],
-    [1.0, [220, 55, 45]],
-  ];
+// ---------------------------------------------------------------------------
+// FRINGE-PLOT COLOUR MAPS + LEGEND SPEC
+//
+// One place for every CAE display — the 3D mesh contour, the per-panel texture
+// overlay, the on-canvas legend and the PDF — so a legend can never describe a
+// scale the geometry isn't actually painted with.
+// ---------------------------------------------------------------------------
+
+export type ColorMapId = 'rainbow' | 'jet' | 'turbo' | 'viridis' | 'coolwarm' | 'grayscale';
+
+type Stop = [number, [number, number, number]];
+
+const COLOR_MAPS: Record<ColorMapId, { label: string; stops: Stop[] }> = {
+  rainbow: {
+    label: 'Rainbow',
+    stops: [
+      [0.0, [40, 90, 220]], [0.34, [40, 190, 120]],
+      [0.67, [235, 205, 50]], [1.0, [220, 55, 45]],
+    ],
+  },
+  jet: {
+    label: 'Jet',
+    stops: [
+      [0.0, [0, 0, 127]], [0.125, [0, 0, 255]], [0.375, [0, 255, 255]],
+      [0.625, [255, 255, 0]], [0.875, [255, 0, 0]], [1.0, [127, 0, 0]],
+    ],
+  },
+  turbo: {
+    label: 'Turbo',
+    stops: [
+      [0.0, [48, 18, 59]], [0.125, [68, 88, 203]], [0.25, [62, 155, 254]],
+      [0.375, [24, 214, 203]], [0.5, [70, 248, 132]], [0.625, [162, 252, 60]],
+      [0.75, [225, 221, 55]], [0.875, [253, 165, 49]], [1.0, [122, 4, 3]],
+    ],
+  },
+  viridis: {
+    label: 'Viridis',
+    stops: [
+      [0.0, [68, 1, 84]], [0.25, [59, 82, 139]], [0.5, [33, 145, 140]],
+      [0.75, [94, 201, 98]], [1.0, [253, 231, 37]],
+    ],
+  },
+  coolwarm: {
+    label: 'Cool → warm',
+    stops: [[0.0, [59, 76, 192]], [0.5, [221, 221, 221]], [1.0, [180, 4, 38]]],
+  },
+  grayscale: {
+    label: 'Grayscale',
+    stops: [[0.0, [26, 26, 26]], [1.0, [245, 245, 245]]],
+  },
+};
+
+export function colorMapOptions(): { id: ColorMapId; label: string }[] {
+  return (Object.keys(COLOR_MAPS) as ColorMapId[]).map((id) => ({ id, label: COLOR_MAPS[id].label }));
+}
+
+/** How a result field is mapped onto colour. Everything the legend shows and
+ *  everything the contour paints comes from this one object. */
+export interface LegendSpec {
+  map: ColorMapId;
+  /** Flip the ramp (red at the low end). */
+  reverse: boolean;
+  /** 0 = smooth/continuous; otherwise the number of discrete contour bands. */
+  bands: number;
+  /** Manual range. null on either end = take it from the data. */
+  min: number | null;
+  max: number | null;
+  /** Decimal places in the legend labels. */
+  decimals: number;
+  /** Force scientific notation instead of picking per magnitude. */
+  scientific: boolean;
+}
+
+export const DEFAULT_LEGEND: LegendSpec = {
+  map: 'rainbow', reverse: false, bands: 12, min: null, max: null,
+  decimals: 2, scientific: false,
+};
+
+function rampAt(stops: Stop[], t: number): [number, number, number] {
+  if (t <= stops[0][0]) return stops[0][1];
   for (let i = 0; i < stops.length - 1; i++) {
     const [t0, c0] = stops[i];
     const [t1, c1] = stops[i + 1];
@@ -1089,6 +1167,77 @@ export function heatColor(t: number): [number, number, number] {
     }
   }
   return stops[stops.length - 1][1];
+}
+
+/**
+ * Colour for a normalised position t ∈ [0,1] under a legend spec.
+ *
+ * Banding quantises to the BAND CENTRE, so every value inside a band gets
+ * exactly the colour the legend's swatch for that band shows — which is the
+ * whole point of a banded contour plot, and would be lost if it quantised to
+ * the band edge.
+ */
+export function sampleColorMap(spec: LegendSpec, t: number): [number, number, number] {
+  let u = Math.max(0, Math.min(1, Number.isFinite(t) ? t : 0));
+  if (spec.bands > 0) {
+    const b = Math.min(spec.bands - 1, Math.floor(u * spec.bands));
+    u = (b + 0.5) / spec.bands;
+  }
+  if (spec.reverse) u = 1 - u;
+  return rampAt(COLOR_MAPS[spec.map]?.stops ?? COLOR_MAPS.rainbow.stops, u);
+}
+
+/** Normalise a field value into [0,1] across the legend's resolved range. */
+export function legendT(v: number, lo: number, hi: number): number {
+  const span = hi - lo;
+  if (!(span > 0)) return 0;
+  return (v - lo) / span;
+}
+
+/**
+ * The range the legend and the contour both use: the manual bounds where the
+ * user set them, otherwise the ACTUAL data min/max. Auto-scaling between the
+ * real extremes — rather than 0…max — is what makes small variations in a field
+ * that never approaches zero readable at all.
+ */
+export function resolveLegendRange(
+  spec: LegendSpec, dataMin: number, dataMax: number,
+): { lo: number; hi: number } {
+  let lo = spec.min ?? dataMin;
+  let hi = spec.max ?? dataMax;
+  if (!Number.isFinite(lo)) lo = 0;
+  if (!Number.isFinite(hi)) hi = lo + 1;
+  if (hi <= lo) hi = lo + Math.max(Math.abs(lo) * 1e-6, 1e-9);
+  return { lo, hi };
+}
+
+/** Min/max of a per-node field, skipping the NaN holes. */
+export function fieldExtent(field: Float32Array): { min: number; max: number } {
+  let min = Infinity, max = -Infinity;
+  for (let i = 0; i < field.length; i++) {
+    const v = field[i];
+    if (!Number.isFinite(v)) continue;
+    if (v < min) min = v;
+    if (v > max) max = v;
+  }
+  if (!Number.isFinite(min)) return { min: 0, max: 0 };
+  return { min, max };
+}
+
+/** Legend tick label, respecting the spec's decimals + notation choice. */
+export function formatLegendValue(v: number, spec: LegendSpec): string {
+  if (spec.scientific) return v.toExponential(spec.decimals);
+  const a = Math.abs(v);
+  if (a !== 0 && (a < 1e-3 || a >= 1e6)) return v.toExponential(spec.decimals);
+  return v.toFixed(spec.decimals);
+}
+
+/**
+ * The default rainbow ramp for t ∈ [0,1]. Kept as a thin wrapper over the
+ * colour-map table for callers that don't carry a LegendSpec (the PDF pages).
+ */
+export function heatColor(t: number): [number, number, number] {
+  return rampAt(COLOR_MAPS.rainbow.stops, Math.max(0, Math.min(1, t)));
 }
 
 // ---------------------------------------------------------------------------
@@ -1377,17 +1526,36 @@ interface PanelMesh {
   gnode: Int32Array;
 }
 
-/** Rasterise one panel into a grid sized to ~target active nodes. */
-function meshPanel(p: AsmPanel, target: number): {
+/**
+ * Rasterise one panel into a grid.
+ *
+ * `elementSizeMm`, when given, is the ABSOLUTE target element edge — the way a
+ * mesh size is normally specified, and the only way an element size means the
+ * same thing on a 2.4 m top as on a 300 mm shelf. Falling back to `target`
+ * active nodes per panel gives every panel the same node COUNT regardless of
+ * size, which silently under-resolves the big ones.
+ */
+function meshPanel(p: AsmPanel, target: number, elementSizeMm?: number): {
   nx: number; ny: number; dx: number; dy: number;
   active: Uint8Array; activeCells: [number, number][]; activeCount: number;
 } {
   const bboxW = p.outline.bbox.w;
   const bboxH = p.outline.bbox.h;
-  const areaFrac = Math.max(0.15, outlineArea(p.outline) / (bboxW * bboxH || 1));
-  const aspect = bboxW / (bboxH || 1);
-  let ny = Math.round(Math.sqrt((target / areaFrac) / aspect)) + 1;
-  let nx = Math.round(ny * aspect) + 1;
+  let nx: number, ny: number;
+  if (elementSizeMm && elementSizeMm > 0) {
+    // CEIL, not round: the requested size is a MAXIMUM edge length. Rounding
+    // lets a panel whose length doesn't divide evenly come out coarser than
+    // asked for (a 101 mm rail at "20 mm" rounds to 5 divisions → 20.3 mm
+    // elements). Ceiling guarantees every element is ≤ the requested size on
+    // both axes, which is what selecting a mesh size is supposed to promise.
+    nx = Math.ceil(bboxW / elementSizeMm) + 1;
+    ny = Math.ceil(bboxH / elementSizeMm) + 1;
+  } else {
+    const areaFrac = Math.max(0.15, outlineArea(p.outline) / (bboxW * bboxH || 1));
+    const aspect = bboxW / (bboxH || 1);
+    ny = Math.round(Math.sqrt((target / areaFrac) / aspect)) + 1;
+    nx = Math.round(ny * aspect) + 1;
+  }
   nx = Math.max(nx, 4); ny = Math.max(ny, 4);
   const dx = bboxW / (nx - 1);
   const dy = bboxH / (ny - 1);
@@ -1508,6 +1676,14 @@ interface AsmPreprocess {
   groundPoints: Vec3World[];
   /** World load vector (6 DOF/node), before Dirichlet BCs are applied. */
   F: Float64Array;
+  /** The element size the caller asked for (mm), if it asked by size. */
+  requestedSizeMm?: number;
+  /** The element size actually meshed at, after any DOF-cap coarsening. */
+  achievedSizeMm?: number;
+  /** DOF the requested size would have produced — what the cap refused. */
+  uncappedDof: number;
+  /** True when the DOF cap forced a coarser mesh than requested. */
+  coarsened: boolean;
 }
 
 /** Refusal marker when preprocessing can't produce a solvable model. */
@@ -1517,19 +1693,51 @@ function preprocessAssembly(opts: AsmSolveOptions, report: (p: SolveProgress) =>
   const { panels, joints, loads, tolMm } = opts;
   const maxDof = opts.maxDof ?? 60000;
   let target = opts.targetNodesPerPanel ?? 600;
+  let elementSize = opts.elementSizeMm;
 
   // --- STAGE: preprocessing (meshing) — OUR TypeScript. ---
   report({ stage: 'meshing', pct: 5, detail: `${panels.length} panel${panels.length === 1 ? '' : 's'}` });
 
-  // Auto-coarsen so total DOF ≈ 6 · Σ activeNodes ≤ maxDof.
+  // Auto-coarsen so total DOF ≈ 6 · Σ activeNodes ≤ maxDof. In element-size
+  // mode the coarsening grows the SIZE in gentle steps rather than jumping, so
+  // a job that only just exceeds the cap ends up near the size that was asked
+  // for instead of several times coarser than it.
   let meshes: PanelMesh[] = [];
   let totalNodes = 0;
-  for (let attempt = 0; attempt < 8; attempt++) {
+  let coarsened = false;
+  const requestedSizeMm = elementSize;
+  let uncappedDof = 0;
+
+  // PRE-ESTIMATE the node count analytically and coarsen the size BEFORE
+  // building anything. A 5 mm request on a 2.4 m cabinet is several hundred
+  // thousand nodes; discovering that by materialising the mesh and then
+  // throwing it away blocks the main thread for tens of seconds (and can run
+  // the tab out of memory) before the cap ever gets a chance to apply.
+  if (elementSize && elementSize > 0) {
+    const estNodes = (s: number) => {
+      let n = 0;
+      for (const p of panels) {
+        const w = p.outline.bbox.w, h = p.outline.bbox.h;
+        const areaFrac = Math.max(0.15, outlineArea(p.outline) / (w * h || 1));
+        n += (Math.ceil(w / s) + 1) * (Math.ceil(h / s) + 1) * areaFrac;
+      }
+      return n;
+    };
+    uncappedDof = Math.round(estNodes(elementSize) * 6);
+    let guard = 0;
+    while (estNodes(elementSize) * 6 > maxDof && guard++ < 60) {
+      const need = Math.sqrt((estNodes(elementSize) * 6) / maxDof);
+      elementSize *= Math.max(1.08, need);
+      coarsened = true;
+    }
+  }
+
+  for (let attempt = 0; attempt < 12; attempt++) {
     meshes = [];
     totalNodes = 0;
     const nodeTable: Vec3World[] = [];
     for (const p of panels) {
-      const m = meshPanel(p, target);
+      const m = meshPanel(p, target, elementSize);
       const gnode = new Int32Array(m.nx * m.ny).fill(-1);
       for (let iy = 0; iy < m.ny; iy++) {
         for (let ix = 0; ix < m.nx; ix++) {
@@ -1543,14 +1751,26 @@ function preprocessAssembly(opts: AsmSolveOptions, report: (p: SolveProgress) =>
       meshes.push({ panel: p, nx: m.nx, ny: m.ny, dx: m.dx, dy: m.dy, active: m.active, activeCells: m.activeCells, gnode });
       totalNodes += m.activeCount;
     }
+    if (attempt === 0 && !uncappedDof) uncappedDof = totalNodes * 6;
     if (totalNodes * 6 <= maxDof) break;
-    // Shrink target proportionally (a little aggressive to converge fast).
-    target = Math.max(120, Math.floor(target * (maxDof / (totalNodes * 6)) * 0.9));
+    coarsened = true;
+    if (elementSize && elementSize > 0) {
+      // Node count scales ~1/size², so this is the step that just clears the
+      // cap, floored at +15% so it always makes progress.
+      const need = Math.sqrt((totalNodes * 6) / maxDof);
+      elementSize *= Math.max(1.15, need);
+    } else {
+      target = Math.max(120, Math.floor(target * (maxDof / (totalNodes * 6)) * 0.9));
+    }
   }
 
   const nDof = totalNodes * 6;
+  const sizeNote = elementSize && elementSize > 0
+    ? `${elementSize.toFixed(1)} mm elements`
+      + (coarsened ? ` (asked ${requestedSizeMm?.toFixed(0)} mm → ${uncappedDof.toLocaleString()} DOF, over the cap)` : '')
+    : `target ${target}/panel`;
   const resolutionLog =
-    `${panels.length} panel${panels.length === 1 ? '' : 's'} · ${totalNodes} nodes · ${nDof} DOF · target ${target}/panel`;
+    `${panels.length} panel${panels.length === 1 ? '' : 's'} · ${totalNodes} nodes · ${nDof} DOF · ${sizeNote}`;
 
   // --- STAGE: assembling the global stiffness — OUR TypeScript. ---
   report({ stage: 'assembling', pct: 25, detail: `${nDof.toLocaleString()} DOF` });
@@ -1697,6 +1917,7 @@ function preprocessAssembly(opts: AsmSolveOptions, report: (p: SolveProgress) =>
   return {
     meshes, panelById, nodePos, totalNodes, nDof, resolutionLog,
     panelD, panelStiff, repStiff, jointPairs, grounded, groundPoints, F,
+    requestedSizeMm, achievedSizeMm: elementSize, uncappedDof, coarsened,
   };
 }
 
@@ -1751,6 +1972,9 @@ function shellMeshView(pre: AsmPreprocess): CaeMeshView {
     minEdgeMm: Number.isFinite(minEdge) ? minEdge : 0,
     maxEdgeMm: maxEdge,
     throughLayers: 1,
+    requestedSizeMm: pre.requestedSizeMm,
+    coarsened: pre.coarsened,
+    uncappedDof: pre.uncappedDof,
   };
 }
 
@@ -1840,6 +2064,9 @@ function solidMeshView(pre: AsmPreprocess, layersIn = 2): CaeMeshView {
     minEdgeMm: Number.isFinite(minEdge) ? minEdge : 0,
     maxEdgeMm: maxEdge,
     throughLayers: layers,
+    requestedSizeMm: pre.requestedSizeMm,
+    coarsened: pre.coarsened,
+    uncappedDof: pre.uncappedDof,
   };
 }
 

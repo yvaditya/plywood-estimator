@@ -41,6 +41,7 @@ import {
 } from './shoppingList';
 import { assignPartLabels, type PartLabel, type KerfRef, type SequenceStyle } from './instructions';
 import { openCutEditor, loadAllOverrides } from './cutEditor';
+import { mountCaeLegend } from './caeLegend';
 import { splitOversizeParts, type SegmentGeo } from './splitParts';
 import { toRoman } from './nest';
 import type { SplitJoinGroup } from './pdf';
@@ -57,10 +58,15 @@ import {
   recoverAssembly,
   previewAssembly,
   heatColor,
+  fieldExtent,
+  resolveLegendRange,
+  formatLegendValue,
+  DEFAULT_LEGEND,
   type Verdict,
   type CaeMeshView,
   type CaeConstraintView,
   type MeshKind,
+  type LegendSpec,
   type AsmPanel,
   type AsmJoint,
   type AsmLoad,
@@ -176,8 +182,8 @@ interface AsmState {
   /** Element family the mesh is built from — 'shell' (fast, 6 DOF/node) or
    *  'solid' (hexes through the thickness, 3 DOF/node). */
   meshKind: MeshKind;
-  /** Target active nodes per panel handed to the mesher. Drives density. */
-  targetNodes: number;
+  /** Target element edge length (mm) handed to the mesher. */
+  elementSizeMm: number;
   /** Hex layers through the thickness (solid only). */
   solidLayers: number;
   /** The un-solved mesh + constraints from previewAssembly, so the mesh can be
@@ -188,6 +194,9 @@ interface AsmState {
   /** Deformed-shape exaggeration; 0 = undeformed. 'auto' picks a factor that
    *  makes the peak deflection ≈ 6% of the model diagonal. */
   deformScale: number | 'auto';
+  /** Colour map / banding / range for the fringe plot. Shared by the on-canvas
+   *  legend and the mesh contour so they can't describe different scales. */
+  legend: LegendSpec;
 }
 
 const state: {
@@ -254,9 +263,10 @@ const state: {
   asm: {
     cabinet: null, tolMm: 2, joints: [], loads: [], solveMsg: '', analysis: null,
     detected: false, field: 'deflection', lastSolve: null,
-    meshKind: 'shell', targetNodes: 600, solidLayers: 2, preview: null,
+    meshKind: 'shell', elementSizeMm: 20, solidLayers: 2, preview: null,
     show: { mesh: true, nodes: false, supports: true, couplings: true, loads: true },
     deformScale: 'auto',
+    legend: { ...DEFAULT_LEGEND },
   },
 };
 
@@ -1187,7 +1197,14 @@ const asmSolidLayersRow = $('asmSolidLayersRow');
 const asmMeshStats = $('asmMeshStats');
 const asmDeformRow = $('asmDeformRow');
 const asmDeformScale = $<HTMLSelectElement>('asmDeformScale');
-const asmLegend = $('asmLegend');
+
+/** The floating CAE legend over the 3D viewer. Editing it repaints the contour
+ *  — the legend and the geometry share one LegendSpec. */
+const caeLegend = mountCaeLegend($('viewerWrap'), (spec) => {
+  state.asm.legend = spec;
+  paintCaeMesh();
+  renderCaeLegend();
+});
 const asmShowMesh = $<HTMLInputElement>('asmShowMesh');
 const asmShowNodes = $<HTMLInputElement>('asmShowNodes');
 const asmShowSupports = $<HTMLInputElement>('asmShowSupports');
@@ -1221,10 +1238,10 @@ function currentAsmOptions(): { opts: AsmSolveOptions; panels: BodyState[] } | n
   return {
     opts: {
       panels: asmPanels, joints, loads, tolMm: state.asm.tolMm,
-      targetNodesPerPanel: state.asm.targetNodes,
-      // The DOF cap has to track the density choice. Left at the 60k default,
-      // the mesher's auto-coarsen loop pulls "Fine" straight back down to the
-      // same mesh as "Medium" — the setting silently does nothing.
+      elementSizeMm: state.asm.elementSizeMm,
+      // Only a safety ceiling now — the element size sets the density, and the
+      // mesher coarsens off it only when a job would blow past what the direct
+      // factorization can carry.
       maxDof: asmMaxDof(),
       meshKind: state.asm.meshKind,
       solidLayers: state.asm.solidLayers,
@@ -1234,26 +1251,28 @@ function currentAsmOptions(): { opts: AsmSolveOptions; panels: BodyState[] } | n
 }
 
 /**
- * The `maxDof` handed to the mesher for the current density choice.
+ * Safety ceiling handed to the mesher, expressed in the mesher's own currency
+ * (shell nodes × 6). The element size sets the density; this only stops a
+ * 5 mm mesh on a whole kitchen from producing a system the direct
+ * factorization can't carry.
  *
- * The mesher's own budget is expressed in SHELL nodes × 6, so this converts a
- * "nodes per panel" request into that currency, with ×1.6 headroom so the
- * auto-coarsen loop lands near the requested density instead of clipping it.
- * A solid mesh multiplies each in-plane node by (layers+1)×3 DOF, so its
- * in-plane grid gets pulled back to keep the assembled system the same size.
+ * Solid gets a much lower ceiling than shell: a hex couples 8 nodes over 24
+ * DOF (vs a quad's 4 × 6), so both the assembly scatter and the factorization
+ * fill grow far faster per DOF — 60k solid DOF costs about the same wall-clock
+ * as 150k shell DOF.
  */
-// Solid gets a much lower ceiling than shell: a hex has 8 nodes coupling 24
-// DOF (vs a quad's 4 × 6), so both the assembly scatter and the factorization
-// fill grow far faster per DOF. 60k solid DOF factorizes in about the same
-// wall-clock as 150k shell DOF.
-const CAE_DOF_CEILING = { shell: 150_000, solid: 60_000 } as const;
+// Measured on the workbench sample (14 panels, ~2.4 m top), Eigen LDLT in
+// WASM: 58k DOF ≈ 0.3 s to factor, 117k ≈ 6.6 s. Fill grows steeply, so these
+// ceilings sit where a solve is still worth waiting through. A finer element
+// size than the ceiling allows is honoured as far as it goes and the stats line
+// says it was capped — silently meshing at 20 mm when 5 mm was picked would be
+// worse than the wait.
+const CAE_DOF_CEILING = { shell: 200_000, solid: 90_000 } as const;
 
 function asmMaxDof(): number {
-  const panels = Math.max(1, cabinetPanels().length);
   const solid = state.asm.meshKind === 'solid';
-  let shellNodes = state.asm.targetNodes * panels * 1.6;
   const dofPerShellNode = solid ? 3 * (state.asm.solidLayers + 1) : 6;
-  shellNodes = Math.min(shellNodes, CAE_DOF_CEILING[solid ? 'solid' : 'shell'] / dofPerShellNode);
+  const shellNodes = CAE_DOF_CEILING[solid ? 'solid' : 'shell'] / dofPerShellNode;
   return Math.ceil(shellNodes * 6);
 }
 
@@ -1278,7 +1297,7 @@ asmMeshKind.addEventListener('change', () => {
   onMeshSettingsChanged();
 });
 asmMeshDensity.addEventListener('change', () => {
-  state.asm.targetNodes = Number(asmMeshDensity.value) || 600;
+  state.asm.elementSizeMm = Number(asmMeshDensity.value) || 20;
   onMeshSettingsChanged();
 });
 asmSolidLayers.addEventListener('change', () => {
@@ -1720,7 +1739,7 @@ function paintAsmField(field: 'deflection' | 'stress') {
 /** Every mesh-affecting setting, as a comparison key. */
 function meshSettingsKey(): string {
   const s = state.asm;
-  return `${s.meshKind}:${s.targetNodes}:${s.solidLayers}`;
+  return `${s.meshKind}:${s.elementSizeMm}:${s.solidLayers}`;
 }
 
 /** Build (or rebuild) the un-solved mesh + constraint preview. Cheap enough to
@@ -1755,8 +1774,37 @@ function solveMatchesMesh(): boolean {
   return !!ls && ls.res.ok && !!ls.res.mesh && ls.meshKey === meshSettingsKey();
 }
 
+/**
+ * The per-node field currently being contoured, with its true extent.
+ *
+ * `scale` converts the field's storage unit into the unit the legend LABELS
+ * are in (deflection is stored in mm but shown in inches when the job is
+ * imperial; stress is MPa either way). The legend's manual min/max are
+ * therefore in DISPLAY units, and `caeContourRange` divides back out — without
+ * that, typing a manual range on an inch job would clip the contour at 1/25th
+ * of the value the user asked for.
+ */
+function currentCaeField():
+  | { field: Float32Array; min: number; max: number; scale: number }
+  | null {
+  if (!solveMatchesMesh()) return null;
+  const res = state.asm.lastSolve!.res;
+  const stress = state.asm.field === 'stress';
+  const field = stress ? res.nodeVm : res.nodeDispMag;
+  if (!field || field.length === 0) return null;
+  const { min, max } = fieldExtent(field);
+  const scale = stress ? 1 : fromMm(1, state.units);
+  return { field, min, max, scale };
+}
+
+/** The contour's low/high bounds in the FIELD's own storage unit. */
+function caeContourRange(fld: { min: number; max: number; scale: number }): { lo: number; hi: number } {
+  const r = resolveLegendRange(state.asm.legend, fld.min * fld.scale, fld.max * fld.scale);
+  return { lo: r.lo / fld.scale, hi: r.hi / fld.scale };
+}
+
 /** Draw the FE mesh — contoured + deformed when a matching solve is cached,
- *  plain translucent gray otherwise. */
+ *  plain gray otherwise. */
 function paintCaeMesh() {
   const st = state.asm;
   const solved = solveMatchesMesh() ? st.lastSolve!.res : null;
@@ -1766,18 +1814,83 @@ function paintCaeMesh() {
     viewer.setCaeMeshFocus(false);
     return;
   }
-  const contoured = !!solved;
+  const fld = currentCaeField();
+  // The contour spans exactly what the legend says it spans.
+  const range = fld ? caeContourRange(fld) : null;
   viewer.setCaeMeshFocus(true);
   viewer.showCaeMesh(mesh, {
     faces: true,
     edges: true,
     points: st.show.nodes,
-    field: contoured ? (st.field === 'stress' ? solved!.nodeVm : solved!.nodeDispMag) : null,
-    fieldMax: contoured ? (st.field === 'stress' ? solved!.maxVm : solved!.maxDisp) : 0,
-    disp: contoured ? solved!.nodeDisp : null,
-    dispScale: contoured ? resolveDeformScale(solved!.maxDisp) : 0,
+    field: fld?.field ?? null,
+    fieldMin: range?.lo ?? 0,
+    fieldMax: range?.hi ?? 0,
+    legend: st.legend,
+    disp: solved?.nodeDisp ?? null,
+    dispScale: solved ? resolveDeformScale(solved.maxDisp) : 0,
     opacity: 1,
   });
+}
+
+/**
+ * MAX / MIN callouts on the contoured mesh.
+ *
+ * The extreme node is found on the FIELD ITSELF rather than taken from the
+ * result summary, so the marker lands on the exact node the colour scale peaks
+ * at — including on the solid mesh, where the summary's location is the
+ * collapsed mid-surface grid point and not a solid node. The marker sits on the
+ * DEFORMED position so it stays on the geometry when the shape is exaggerated.
+ */
+function paintCaeCallouts() {
+  const st = state.asm;
+  const solved = solveMatchesMesh() ? st.lastSolve!.res : null;
+  const fld = currentCaeField();
+  if (!solved || !fld || !st.show.mesh || !solved.mesh) { viewer.clearCaeCallouts(); return; }
+
+  const mesh = solved.mesh;
+  let iMax = -1, iMin = -1;
+  let vMax = -Infinity, vMin = Infinity;
+  for (let i = 0; i < mesh.nodeCount && i < fld.field.length; i++) {
+    const v = fld.field[i];
+    if (!Number.isFinite(v)) continue;
+    if (v > vMax) { vMax = v; iMax = i; }
+    if (v < vMin) { vMin = v; iMin = i; }
+  }
+  if (iMax < 0) { viewer.clearCaeCallouts(); return; }
+
+  const scale = resolveDeformScale(solved.maxDisp);
+  const at = (i: number): [number, number, number] => [
+    mesh.nodes[i * 3] + (solved.nodeDisp[i * 3] ?? 0) * scale,
+    mesh.nodes[i * 3 + 1] + (solved.nodeDisp[i * 3 + 1] ?? 0) * scale,
+    mesh.nodes[i * 3 + 2] + (solved.nodeDisp[i * 3 + 2] ?? 0) * scale,
+  ];
+
+  const stress = state.asm.field === 'stress';
+  const unit = stress ? 'MPa' : (state.units === 'in' ? 'in' : 'mm');
+  const fmt = (v: number) => `${formatLegendValue(v * fld.scale, st.legend)} ${unit}`;
+  const govBody = state.bodies.find((b) => b.id === (stress ? solved.maxVmPanelId : solved.maxPanelId));
+
+  const marks = [{
+    at: at(iMax),
+    dir: [0, 0, 1] as [number, number, number],
+    tag: 'MAX',
+    value: fmt(vMax),
+    sub: govBody ? `panel ${panelLabel(govBody)}` : undefined,
+    color: '#c92a2a',
+  }];
+  // A min callout only says something when the field doesn't simply bottom out
+  // at zero everywhere the structure is held (which it does for deflection).
+  if (iMin >= 0 && iMin !== iMax && vMin > vMax * 0.02) {
+    marks.push({
+      at: at(iMin),
+      dir: [0, 0, -1] as [number, number, number],
+      tag: 'MIN',
+      value: fmt(vMin),
+      sub: undefined,
+      color: '#1c5fb0',
+    });
+  }
+  viewer.showCaeCallouts(marks);
 }
 
 /** Draw the boundary conditions: fixed nodes, joint couplings, load vectors. */
@@ -1811,6 +1924,7 @@ function paintCaeVisuals() {
     paintAsmField(st.field);
   }
   paintCaeConstraints();
+  paintCaeCallouts();
   renderMeshStats();
   renderCaeLegend();
 }
@@ -1826,13 +1940,24 @@ function renderMeshStats() {
     return;
   }
   const elemWord = mesh.nodesPerElem === 8 ? 'hex' : 'quad';
+  // Report what was ACHIEVED against what was asked for — the mesher coarsens
+  // off the request when a job would exceed the DOF ceiling, and silently
+  // meshing at 40 mm when 5 mm was selected would be misleading.
+  const asked = mesh.requestedSizeMm ?? state.asm.elementSizeMm;
   const size = Math.abs(mesh.maxEdgeMm - mesh.minEdgeMm) < 0.05
-    ? fmtSag(mesh.minEdgeMm, state.units)
-    : `${fmtSag(mesh.minEdgeMm, state.units)}–${fmtSag(mesh.maxEdgeMm, state.units)}`;
+    ? `${mesh.minEdgeMm.toFixed(1)} mm`
+    : `≤ ${mesh.maxEdgeMm.toFixed(1)} mm`;
   const rows = [
     `<b>${mesh.elemCount.toLocaleString()}</b> ${elemWord} · <b>${mesh.nodeCount.toLocaleString()}</b> nodes · <b>${mesh.dofCount.toLocaleString()}</b> DOF`,
-    `element size ${size}${mesh.kind === 'solid' ? ` · ${mesh.throughLayers} layer${mesh.throughLayers === 1 ? '' : 's'} through t` : ''}`,
+    `element ${size}`
+    + `${mesh.kind === 'solid' ? ` · ${mesh.throughLayers} layer${mesh.throughLayers === 1 ? '' : 's'} through t` : ''}`,
   ];
+  if (mesh.coarsened) {
+    rows.push(
+      `<span class="asm-mesh-warn">coarsened from ${asked} mm — that needed `
+      + `${mesh.uncappedDof.toLocaleString()} DOF, over the ${CAE_DOF_CEILING[mesh.kind].toLocaleString()} cap</span>`,
+    );
+  }
   if (cv) {
     rows.push(
       `<b>${cv.groundedCount.toLocaleString()}</b> fixed nodes · <b>${cv.jointLinks.length.toLocaleString()}</b> couplings · <b>${cv.loads.length.toLocaleString()}</b> loaded nodes (${cv.totalLoadN.toFixed(0)} N)`,
@@ -1841,20 +1966,36 @@ function renderMeshStats() {
   asmMeshStats.innerHTML = rows.map((r) => `<div class="asm-mesh-stat">${r}</div>`).join('');
 }
 
-/** Colour-ramp legend for the contoured mesh (min → max of the shown field). */
+/**
+ * Refresh the on-canvas CAE legend. It describes whatever the contour is
+ * currently painting, and its auto range is the field's REAL extent (not
+ * 0 → max) so a field that never approaches zero still uses the whole ramp.
+ */
 function renderCaeLegend() {
   const solved = solveMatchesMesh() ? state.asm.lastSolve!.res : null;
-  if (!solved) { asmLegend.innerHTML = ''; return; }
+  const fld = currentCaeField();
+  if (!solved || !fld || !state.asm.show.mesh) { caeLegend.update(null); return; }
+
   const stress = state.asm.field === 'stress';
-  const hi = stress ? `${solved.maxVm.toFixed(2)} MPa` : fmtSag(solved.maxDisp, state.units);
-  const stops = [0, 0.25, 0.5, 0.75, 1]
-    .map((t) => `rgb(${heatColor(t).join(',')}) ${t * 100}%`)
-    .join(', ');
-  asmLegend.innerHTML =
-    `<span class="asm-legend-cap">${stress ? 'von Mises' : 'deflection'}</span>`
-    + `<span class="asm-legend-lo">0</span>`
-    + `<span class="asm-legend-bar" style="background:linear-gradient(90deg, ${stops})"></span>`
-    + `<span class="asm-legend-hi">${hi}</span>`;
+  const mesh = solved.mesh;
+  const info: string[] = [];
+  if (mesh) {
+    info.push(`${mesh.elemCount.toLocaleString()} ${mesh.nodesPerElem === 8 ? 'hex' : 'quad'} · ${mesh.dofCount.toLocaleString()} DOF`);
+  }
+  const scale = resolveDeformScale(solved.maxDisp);
+  info.push(scale > 0 ? `deformed ×${scale < 10 ? scale.toFixed(1) : Math.round(scale)}` : 'undeformed');
+
+  const govId = stress ? solved.maxVmPanelId : solved.maxPanelId;
+  const govBody = state.bodies.find((b) => b.id === govId);
+
+  caeLegend.update({
+    title: stress ? 'von Mises stress' : 'Deflection',
+    unit: stress ? 'MPa' : (state.units === 'in' ? 'in' : 'mm'),
+    dataMin: fld.min * fld.scale,
+    dataMax: fld.max * fld.scale,
+    maxAt: govBody ? `panel ${panelLabel(govBody)}` : undefined,
+    info,
+  });
 }
 
 /** Snapshot the solved cabinet with BOTH field overlays (deflection + stress)
@@ -2218,6 +2359,12 @@ function applySidebarMode(mode: SidebarMode) {
   modeAnalysisBtn.classList.toggle('active', mode === 'analysis');
   modeCutBtn.setAttribute('aria-selected', String(mode === 'cut'));
   modeAnalysisBtn.setAttribute('aria-selected', String(mode === 'analysis'));
+  // Analysis mode has nothing to say about cut sheets, so the layout half goes
+  // away and the 3D view — which is the entire output of this mode — takes the
+  // full pane. `#workArea` drives it in CSS; the viewer needs a resize because
+  // its canvas dimensions changed.
+  workArea.classList.toggle('analysis-full', mode === 'analysis');
+  requestAnimationFrame(() => viewer.resize(viewerEl));
   try { localStorage.setItem(MODE_KEY, mode); } catch {}
 }
 

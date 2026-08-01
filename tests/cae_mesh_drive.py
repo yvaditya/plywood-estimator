@@ -35,6 +35,19 @@ def stats_text(page) -> str:
     return " ".join((page.inner_text("#asmMeshStats") or "").split())
 
 
+def shot_viewer(page, path: Path):
+    """Capture the 3D pane.
+
+    Locator.screenshot() waits for the element to be "stable", which a viewer
+    driving a requestAnimationFrame render loop never is — the canvas is
+    repainting every frame by design. Clip the page instead.
+    """
+    box = page.locator("#viewerWrap").bounding_box()
+    if not box:
+        raise RuntimeError("#viewerWrap has no bounding box")
+    page.screenshot(path=str(path), clip=box)
+
+
 def parse_counts(txt: str) -> dict:
     """Pull the numbers out of the mesh stats line."""
     out = {}
@@ -102,15 +115,15 @@ def main() -> int:
                 problems.append(f"shell DOF should be 6/node: {pre['dof']} vs {pre['nodes']}*6")
 
             page.screenshot(path=str(OUT / "01_mesh_presolve.png"))
-            page.locator("#viewerWrap").screenshot(path=str(OUT / "01_mesh_presolve_3d.png"))
+            shot_viewer(page, OUT / "01_mesh_presolve_3d.png")
 
             # Toggle nodes on, mesh off → constraint glyphs only.
             page.check("#asmShowNodes")
             page.wait_for_timeout(600)
-            page.locator("#viewerWrap").screenshot(path=str(OUT / "02_mesh_with_nodes.png"))
+            shot_viewer(page, OUT / "02_mesh_with_nodes.png")
             page.uncheck("#asmShowMesh")
             page.wait_for_timeout(600)
-            page.locator("#viewerWrap").screenshot(path=str(OUT / "03_constraints_only.png"))
+            shot_viewer(page, OUT / "03_constraints_only.png")
             page.check("#asmShowMesh")
             page.uncheck("#asmShowNodes")
             page.wait_for_timeout(400)
@@ -118,16 +131,47 @@ def main() -> int:
             # ---------------------------------------------------------------
             # 2. Density + element-family changes rebuild the mesh
             # ---------------------------------------------------------------
-            page.select_option("#asmMeshDensity", "1400")
-            page.wait_for_timeout(2500)
-            fine = parse_counts(stats_text(page))
-            print(f"[fine] mesh stats = {fine}")
-            if not (fine.get("nodes", 0) > pre.get("nodes", 0)):
-                problems.append(f"Fine density did not increase node count: {pre.get('nodes')} → {fine.get('nodes')}")
-            page.locator("#viewerWrap").screenshot(path=str(OUT / "04_mesh_fine.png"))
+            # The achieved element size must land close to the requested one —
+            # that's the whole point of specifying a size instead of a density.
+            # A request finer than the DOF ceiling allows may be coarsened, but
+            # ONLY if the stats line says so; silent coarsening is the bug.
+            sizes = {}
+            for want in (30, 20, 15):
+                page.select_option("#asmMeshDensity", str(want))
+                page.wait_for_timeout(3500)
+                txt = stats_text(page)
+                got = parse_counts(txt)
+                m = re.search(r"element (?:≤ )?([\d.]+)(?:–([\d.]+))? mm", txt)
+                if not m:
+                    problems.append(f"no element size reported at {want} mm: {txt!r}")
+                    continue
+                lo, hi = float(m.group(1)), float(m.group(2) or m.group(1))
+                capped = "coarsened" in txt
+                sizes[want] = got.get("nodes", 0)
+                print(f"[size {want} mm] achieved {lo}–{hi} mm, {got.get('nodes')} nodes, capped={capped}")
+                # Only the UPPER bound matters. Small panels are clamped to a
+                # minimum of 4 nodes per side, so they legitimately come out
+                # FINER than the request — that's the mesher refusing to model a
+                # rail with two elements, not a failure to honour the size.
+                if not capped and hi > want * 1.35:
+                    problems.append(f"requested {want} mm elements but got up to {hi} mm (not reported as capped)")
 
-            page.select_option("#asmMeshDensity", "600")
-            page.wait_for_timeout(2000)
+            # Finer request => strictly more nodes, as long as it wasn't capped.
+            if sizes.get(15, 0) <= sizes.get(30, 0):
+                problems.append(f"15 mm mesh not finer than 30 mm: {sizes}")
+            shot_viewer(page, OUT / "04_mesh_fine.png")
+
+            # A request the ceiling cannot honour must SAY it was coarsened.
+            page.select_option("#asmMeshDensity", "5")
+            page.wait_for_timeout(4000)
+            txt5 = stats_text(page)
+            print(f"[size 5 mm] {txt5}")
+            m5 = re.search(r"element (?:≤ )?([\d.]+)(?:–([\d.]+))? mm", txt5)
+            if m5 and float(m5.group(2) or m5.group(1)) > 5 * 1.35 and "coarsened" not in txt5:
+                problems.append(f"5 mm request silently coarsened without a notice: {txt5!r}")
+
+            page.select_option("#asmMeshDensity", "20")
+            page.wait_for_timeout(3000)
 
             # Solid (hex) elements: family changes, DOF becomes 3/node.
             page.select_option("#asmMeshKind", "solid")
@@ -143,7 +187,7 @@ def main() -> int:
             )
             if not layers_visible:
                 problems.append("through-thickness Layers control not shown in solid mode")
-            page.locator("#viewerWrap").screenshot(path=str(OUT / "05_mesh_solid.png"))
+            shot_viewer(page, OUT / "05_mesh_solid.png")
 
             page.select_option("#asmMeshKind", "shell")
             page.wait_for_timeout(2500)
@@ -169,39 +213,79 @@ def main() -> int:
             result = " ".join((page.inner_text("#asmResult") or "").split())
             print(f"[solve] {result}")
 
-            legend = " ".join((page.inner_text("#asmLegend") or "").split())
+            legend = " ".join((page.inner_text(".cae-legend3d") or "").split())
             print(f"[legend] {legend!r}")
             if "deflection" not in legend.lower():
                 problems.append(f"legend missing deflection caption: {legend!r}")
             if not re.search(r"\d", legend):
                 problems.append(f"legend missing a numeric max: {legend!r}")
+            if "max" not in legend.lower() or "min" not in legend.lower():
+                problems.append(f"legend missing max/min extremes: {legend!r}")
+
+            # The on-canvas legend must be over the 3D view, and the cut-layout
+            # half must be gone in Analysis mode.
+            layout_visible = page.evaluate(
+                "() => document.getElementById('layoutPane')?.offsetParent !== null"
+            )
+            if layout_visible:
+                problems.append("Cut layout pane still visible in Analysis mode")
+            callouts = page.locator(".cae-callout").count()
+            print(f"[callouts] {callouts}")
+            if callouts < 1:
+                problems.append("no MAX/MIN callout rendered on the solved mesh")
+
+            # Legend customisation: open the gear, switch map + banding, and
+            # confirm the legend re-renders with the new band count.
+            page.click(".cae-legend3d-gear")
+            page.wait_for_timeout(400)
+            if page.locator(".cae-legend3d-pop").count() < 1:
+                problems.append("legend settings popover did not open")
+            else:
+                page.select_option('.cae-legend3d-pop [data-lg="map"]', "viridis")
+                page.wait_for_timeout(500)
+                page.select_option('.cae-legend3d-pop [data-lg="bands"]', "5")
+                page.wait_for_timeout(600)
+                bands = page.locator(".cae-legend3d-row").count()
+                print(f"[legend] rows after 5-band select = {bands}")
+                if bands != 6:   # 5 bands + the lower-edge row
+                    problems.append(f"5-band legend should show 6 rows, got {bands}")
+                page.screenshot(path=str(OUT / "06b_legend_popover.png"))
+                page.select_option('.cae-legend3d-pop [data-lg="bands"]', "0")
+                page.wait_for_timeout(500)
+                if page.locator(".cae-legend3d-grad").count() < 1:
+                    problems.append("smooth legend did not render a gradient bar")
+                page.select_option('.cae-legend3d-pop [data-lg="bands"]', "12")
+                page.select_option('.cae-legend3d-pop [data-lg="map"]', "rainbow")
+                page.wait_for_timeout(500)
+                page.mouse.click(700, 950)   # dismiss the popover
+                page.wait_for_timeout(300)
             deform_visible = page.evaluate(
                 "() => document.getElementById('asmDeformRow')?.offsetParent !== null"
             )
             if not deform_visible:
                 problems.append("deformed-shape scale row not shown after solve")
 
-            page.locator("#viewerWrap").screenshot(path=str(OUT / "06_solved_mesh_deflection.png"))
+            shot_viewer(page, OUT / "06_solved_mesh_deflection.png")
             page.screenshot(path=str(OUT / "06_solved_full.png"))
 
             # Stress field → legend caption + max must follow.
             page.click("#asmFieldStress")
             page.wait_for_timeout(1200)
-            legend_s = " ".join((page.inner_text("#asmLegend") or "").split())
+            legend_s = " ".join((page.inner_text(".cae-legend3d") or "").split())
             print(f"[legend:stress] {legend_s!r}")
             if "mises" not in legend_s.lower() or "MPa" not in legend_s:
                 problems.append(f"stress legend wrong: {legend_s!r}")
-            page.locator("#viewerWrap").screenshot(path=str(OUT / "07_solved_mesh_stress.png"))
+            shot_viewer(page, OUT / "07_solved_mesh_stress.png")
 
             # Deformed shape off vs exaggerated.
             page.click("#asmFieldDefl")
             page.wait_for_timeout(600)
             page.select_option("#asmDeformScale", "0")
             page.wait_for_timeout(900)
-            page.locator("#viewerWrap").screenshot(path=str(OUT / "08_deform_off.png"))
+            shot_viewer(page, OUT / "08_deform_off.png")
             page.select_option("#asmDeformScale", "auto")
             page.wait_for_timeout(900)
-            page.locator("#viewerWrap").screenshot(path=str(OUT / "09_deform_auto.png"))
+            shot_viewer(page, OUT / "09_deform_auto.png")
 
             # ---------------------------------------------------------------
             # 4. SOLID solve — the hex path has to run end-to-end in the browser
@@ -236,7 +320,7 @@ def main() -> int:
                     )
             if solid_stats.get("kind") != "hex":
                 problems.append(f"solved solid mesh should report hex, got {solid_stats.get('kind')}")
-            page.locator("#viewerWrap").screenshot(path=str(OUT / "11_solid_solved.png"))
+            shot_viewer(page, OUT / "11_solid_solved.png")
             page.screenshot(path=str(OUT / "12_solid_full.png"))
 
             page.screenshot(path=str(OUT / "10_sidebar_final.png"))

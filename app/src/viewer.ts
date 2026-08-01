@@ -32,7 +32,7 @@ import { SMAAPass } from 'three/examples/jsm/postprocessing/SMAAPass.js';
 import { OutputPass } from 'three/examples/jsm/postprocessing/OutputPass.js';
 import { RoomEnvironment } from 'three/examples/jsm/environments/RoomEnvironment.js';
 import type { OcctResult, OcctMesh } from './stepLoader';
-import { heatColor } from './cae';
+import { DEFAULT_LEGEND, legendT, sampleColorMap, type LegendSpec } from './cae';
 
 export type GrainLock = 'free' | 'length' | 'width';
 
@@ -80,8 +80,13 @@ export interface CaeMeshStyle {
   points?: boolean;
   /** Per-node scalar field for the contour; NaN entries render neutral gray. */
   field?: Float32Array | null;
-  /** Field value mapped to the top of the ramp. 0 disables contouring. */
+  /** Bottom of the colour scale (the legend's resolved low end). */
+  fieldMin?: number;
+  /** Top of the colour scale. Leave equal to fieldMin to disable contouring. */
   fieldMax?: number;
+  /** Colour map / banding / reverse — the SAME spec the legend renders from,
+   *  so the bar and the geometry can never disagree. */
+  legend?: LegendSpec | null;
   /** Per-node displacement (3 floats/node) for the deformed shape. */
   disp?: Float32Array | null;
   /** Displacement exaggeration factor (0 = undeformed). */
@@ -101,6 +106,21 @@ export interface CaeCouplingLine {
 export interface CaeLoadArrow {
   at: [number, number, number];
   f: [number, number, number];
+}
+
+/** An extreme-value annotation: marker at `at`, leader out along `dir`. */
+export interface CaeCallout {
+  at: [number, number, number];
+  /** Leader direction (world). Defaults to +Z. */
+  dir?: [number, number, number];
+  /** Short tag, e.g. "MAX". */
+  tag: string;
+  /** Formatted value, e.g. "3.88 mm". */
+  value: string;
+  /** Optional second line, e.g. "panel 1p". */
+  sub?: string;
+  /** CSS colour for the marker, leader and label accent. */
+  color: string;
 }
 
 /**
@@ -164,6 +184,13 @@ export class Viewer {
    *  glyph set (supports / joint couplings / load arrows). */
   private caeMeshGroup: THREE.Group | null = null;
   private caeConstraintGroup: THREE.Group | null = null;
+  private caeCalloutGroup: THREE.Group | null = null;
+  /** Callout labels + the last screen position written for each, so the
+   *  per-frame tracker can skip untouched DOM writes. */
+  private caeCallouts: {
+    el: HTMLElement; anchor: THREE.Vector3;
+    x: number; y: number; hidden: boolean;
+  }[] = [];
   private caeMeshFocus = false;
   /** Assembly floor-support glyphs (one group for the whole cabinet). */
   private asmFloorGroup: THREE.Object3D | null = null;
@@ -651,6 +678,7 @@ export class Viewer {
     this.clearFloorGlyphs();
     this.clearCaeMesh();
     this.clearCaeConstraints();
+    this.clearCaeCallouts();
     this.setCaeMeshFocus(false);
     for (const o of this.caeOverlays.values()) { this.caeGroup.remove(o); disposeObject3D(o); }
     this.caeOverlays.clear();
@@ -738,7 +766,8 @@ export class Viewer {
 
     const {
       faces = true, edges = true, points = false,
-      field = null, fieldMax = 0, disp = null, dispScale = 0, opacity = 1,
+      field = null, fieldMin = 0, fieldMax = 0, legend = null,
+      disp = null, dispScale = 0, opacity = 1,
     } = style;
 
     // Display positions = undeformed + scaled displacement.
@@ -755,13 +784,16 @@ export class Viewer {
 
     // Per-node contour colors (NaN / no field → neutral gray).
     let colors: Float32Array | null = null;
-    if (field && fieldMax > 0) {
+    if (field && fieldMax > fieldMin) {
+      const spec = legend ?? DEFAULT_LEGEND;
       colors = new Float32Array(data.nodeCount * 3);
       for (let i = 0; i < data.nodeCount; i++) {
         const v = field[i];
-        if (Number.isNaN(v)) { colors[i * 3] = 0.65; colors[i * 3 + 1] = 0.65; colors[i * 3 + 2] = 0.66; continue; }
-        const [r, g, b] = heatColor(Math.abs(v) / fieldMax);
-        // Vertex colors feed a MeshBasicMaterial in linear space.
+        if (!Number.isFinite(v)) { colors[i * 3] = 0.65; colors[i * 3 + 1] = 0.65; colors[i * 3 + 2] = 0.66; continue; }
+        // Values outside a manually-narrowed range clamp to the end colours,
+        // which is what the legend's "range clipped" note is warning about.
+        const [r, g, b] = sampleColorMap(spec, legendT(v, fieldMin, fieldMax));
+        // Vertex colors feed the material in linear space.
         colors[i * 3] = srgbToLinear(r / 255);
         colors[i * 3 + 1] = srgbToLinear(g / 255);
         colors[i * 3 + 2] = srgbToLinear(b / 255);
@@ -793,6 +825,11 @@ export class Viewer {
         side: THREE.DoubleSide,
         transparent: opacity < 1,
         opacity,
+        // FLAT shading, always. Averaged vertex normals round a hex mesh off
+        // into a blob — the through-thickness faces of a solid have to read as
+        // discrete facets with hard edges, which is the whole point of looking
+        // at a solid mesh. Planar shell panels are unaffected.
+        flatShading: true,
         // Push faces back so the wireframe on top never z-fights with them.
         polygonOffset: true,
         polygonOffsetFactor: 1,
@@ -808,10 +845,13 @@ export class Viewer {
       const eGeom = new THREE.BufferGeometry();
       eGeom.setAttribute('position', new THREE.BufferAttribute(pos, 3));
       eGeom.setIndex(new THREE.BufferAttribute(segs, 1));
+      // Solid hull edges carry the element facets, so they sit darker/stronger
+      // than the shell's in-plane grid.
+      const solid = data.nodesPerElem === 8;
       const eMat = new THREE.LineBasicMaterial({
-        color: faces ? 0x1b2733 : 0x37414f,
+        color: faces ? (solid ? 0x0f1720 : 0x1b2733) : 0x37414f,
         transparent: true,
-        opacity: faces ? 0.6 : 0.9,
+        opacity: faces ? (solid ? 0.8 : 0.6) : 0.9,
       });
       const lines = new THREE.LineSegments(eGeom, eMat);
       lines.renderOrder = 6;
@@ -907,8 +947,19 @@ export class Viewer {
     }
 
     // --- Loads: arrows along the applied force. ---
-    const loads = data.loads;
+    let loads = data.loads;
     if (loads && loads.length) {
+      // A patch load spreads over every node under it — on a fine mesh that's
+      // hundreds of identical arrows, which reads as a solid thicket and hides
+      // the geometry. Draw an evenly-spaced subset; the stats line carries the
+      // true loaded-node count and total force.
+      const MAX_ARROWS = 140;
+      if (loads.length > MAX_ARROWS) {
+        const step = loads.length / MAX_ARROWS;
+        const thinned: CaeLoadArrow[] = [];
+        for (let i = 0; i < MAX_ARROWS; i++) thinned.push(loads[Math.floor(i * step)]);
+        loads = thinned;
+      }
       let maxF = 0;
       for (const l of loads) maxF = Math.max(maxF, Math.hypot(l.f[0], l.f[1], l.f[2]));
       if (maxF > 0) {
@@ -952,6 +1003,105 @@ export class Viewer {
       this.caeGroup.remove(this.caeConstraintGroup);
       disposeObject3D(this.caeConstraintGroup);
       this.caeConstraintGroup = null;
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // MAX / MIN CALLOUTS
+  //
+  // The MX/MN annotation every FE post-processor puts on a fringe plot: a
+  // marker on the extreme node, a leader line out to clear air, and a label at
+  // the end of it. The label is an HTML element tracked against the projected
+  // 3D point each frame (crisp text at any zoom, and it can carry the same
+  // typography as the rest of the UI), while the marker and leader are real
+  // geometry so they occlude correctly against the model.
+  // -------------------------------------------------------------------------
+
+  /** Place the extreme-value callouts. Pass an empty array to clear them. */
+  showCaeCallouts(marks: CaeCallout[]) {
+    this.clearCaeCallouts();
+    if (marks.length === 0) return;
+
+    const group = new THREE.Group();
+    const diag = this.modelDiagonal() || 1000;
+    const lead = diag * 0.11;      // leader length
+    const r = diag * 0.008;        // marker radius
+
+    for (const mk of marks) {
+      const at = new THREE.Vector3(...mk.at);
+      // Lead up-and-out along the marker's own direction so the two callouts
+      // on one model don't stack on top of each other.
+      const dir = new THREE.Vector3(...(mk.dir ?? [0, 0, 1])).normalize();
+      const tip = at.clone().addScaledVector(dir, lead);
+
+      const color = new THREE.Color(mk.color);
+      const line = new THREE.Line(
+        new THREE.BufferGeometry().setFromPoints([at, tip]),
+        new THREE.LineBasicMaterial({ color, depthTest: false, transparent: true, opacity: 0.95 }),
+      );
+      line.renderOrder = 20;
+      group.add(line);
+
+      const dot = new THREE.Mesh(
+        new THREE.SphereGeometry(r, 16, 12),
+        new THREE.MeshBasicMaterial({ color, depthTest: false }),
+      );
+      dot.position.copy(at);
+      dot.renderOrder = 21;
+      group.add(dot);
+
+      const el = document.createElement('div');
+      el.className = 'cae-callout';
+      el.style.setProperty('--cae-callout-color', mk.color);
+      el.innerHTML =
+        `<span class="cae-callout-tag">${escapeCalloutText(mk.tag)}</span>`
+        + `<span class="cae-callout-val">${escapeCalloutText(mk.value)}</span>`
+        + (mk.sub ? `<span class="cae-callout-sub">${escapeCalloutText(mk.sub)}</span>` : '');
+      this.renderer.domElement.parentElement?.appendChild(el);
+      this.caeCallouts.push({ el, anchor: tip, x: NaN, y: NaN, hidden: false });
+    }
+
+    this.caeGroup.add(group);
+    this.caeCalloutGroup = group;
+    this.updateCalloutPositions();
+  }
+
+  clearCaeCallouts() {
+    if (this.caeCalloutGroup) {
+      this.caeGroup.remove(this.caeCalloutGroup);
+      disposeObject3D(this.caeCalloutGroup);
+      this.caeCalloutGroup = null;
+    }
+    for (const c of this.caeCallouts) c.el.remove();
+    this.caeCallouts = [];
+  }
+
+  /**
+   * Project each callout anchor to screen space. Runs every frame, so it only
+   * TOUCHES the DOM when a label has actually moved by a visible amount —
+   * writing the same style values every frame keeps the subtree permanently
+   * "unstable", which stalls anything waiting on it (screenshot capture, and
+   * the browser's own layout work).
+   */
+  private updateCalloutPositions() {
+    if (this.caeCallouts.length === 0) return;
+    const canvas = this.renderer.domElement;
+    const w = canvas.clientWidth, h = canvas.clientHeight;
+    const v = new THREE.Vector3();
+    for (const c of this.caeCallouts) {
+      v.copy(c.anchor).project(this.camera);
+      const behind = v.z > 1;
+      if (behind !== c.hidden) {
+        c.el.style.display = behind ? 'none' : '';
+        c.hidden = behind;
+      }
+      if (behind) continue;
+      const x = (v.x * 0.5 + 0.5) * w;
+      const y = (-v.y * 0.5 + 0.5) * h;
+      if (Math.abs(x - c.x) < 0.25 && Math.abs(y - c.y) < 0.25) continue;
+      c.x = x; c.y = y;
+      c.el.style.left = `${x.toFixed(1)}px`;
+      c.el.style.top = `${y.toFixed(1)}px`;
     }
   }
 
@@ -1741,6 +1891,8 @@ export class Viewer {
     requestAnimationFrame(this.tick);
     this.controls.update();
     this.composer.render();
+    // Callout labels are DOM, so they have to follow the camera every frame.
+    this.updateCalloutPositions();
   };
 }
 
@@ -2018,6 +2170,12 @@ function buildArrowShape(
 // ---------------------------------------------------------------------------
 // FE mesh geometry helpers
 // ---------------------------------------------------------------------------
+
+function escapeCalloutText(s: string): string {
+  return s.replace(/[&<>"']/g, (c) => (
+    { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c] ?? c
+  ));
+}
 
 /** sRGB → linear, for vertex colors fed to a three.js material. */
 function srgbToLinear(c: number): number {

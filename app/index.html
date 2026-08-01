@@ -271,12 +271,14 @@
                 <option value="solid">Solid (hex)</option>
               </select>
             </label>
-            <label>Density
+            <label>Element size
               <select id="asmMeshDensity">
-                <option value="250">Coarse</option>
-                <option value="600" selected>Medium</option>
-                <option value="1400">Fine</option>
-                <option value="3000">Very fine</option>
+                <option value="5">5 mm</option>
+                <option value="10">10 mm</option>
+                <option value="15">15 mm</option>
+                <option value="20" selected>20 mm</option>
+                <option value="30">30 mm</option>
+                <option value="50">50 mm</option>
               </select>
             </label>
             <label id="asmSolidLayersRow" hidden>Layers
@@ -330,7 +332,7 @@
                 <option value="100">100</option>
               </select>
             </label>
-            <div id="asmLegend" class="asm-legend" aria-hidden="true"></div>
+            <span class="asm-deform-hint">Legend + colour map: gear on the 3D view</span>
           </div>
           <div id="asmResult" class="asm-result">
             <span class="asm-hint">Detect joints, add loads, then Solve assembly.</span>

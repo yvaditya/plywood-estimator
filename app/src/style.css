@@ -856,6 +856,14 @@ button.primary:disabled {
   font-size: 10.5px; color: var(--muted); line-height: 1.5;
 }
 .asm-mesh-stat b { color: var(--text-2); font-weight: 600; }
+.asm-mesh-warn { color: var(--warn); }
+
+/* Analysis mode gives the 3D view the whole work area — there is no cut sheet
+   to look at while you're reading a fringe plot. #workArea is a GRID, so this
+   has to collapse the track (matching .viewer-max), not touch flex. */
+#workArea.analysis-full { grid-template-columns: 1fr 0 0; }
+#workArea.analysis-full #paneDivider,
+#workArea.analysis-full #layoutPane { display: none; }
 
 /* ---- Deformed-shape scale + fringe colour bar (post-solve) ---- */
 .asm-deform-row { display: flex; align-items: flex-end; gap: 10px; margin-top: 8px; }
@@ -865,21 +873,123 @@ button.primary:disabled {
   font-size: 10px; text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted); font-weight: 600;
 }
 .asm-deform-row select { padding: 3px 4px; font-size: 11px; }
-.asm-legend {
-  flex: 1 1 auto; display: grid; grid-template-columns: auto 1fr auto;
-  grid-template-areas: "cap cap cap" "lo bar hi";
-  align-items: center; gap: 2px 5px;
+.asm-deform-hint { flex: 1 1 auto; font-size: 10px; color: var(--faint); line-height: 1.3; }
+
+/* ==========================================================================
+   On-canvas CAE fringe legend — the floating bar over the 3D viewer.
+   ========================================================================== */
+.cae-legend3d {
+  position: absolute; top: 12px; right: 12px; z-index: 6;
+  min-width: 116px; max-width: 200px;
+  background: rgba(255, 255, 255, 0.92);
+  backdrop-filter: blur(8px);
+  border: 1px solid var(--line); border-radius: 8px;
+  box-shadow: var(--shadow-sm);
+  padding: 8px 9px 7px;
   font-family: var(--font-mono); font-variant-numeric: tabular-nums;
-  font-size: 9.5px; color: var(--muted);
+  font-size: 10px; color: var(--text-2);
 }
-.asm-legend:empty { display: none; }
-.asm-legend-cap {
-  grid-area: cap; font-family: var(--font-sans, inherit);
-  text-transform: uppercase; letter-spacing: 0.05em; font-weight: 600; font-size: 9px;
+.cae-legend3d[hidden] { display: none; }
+.cae-legend3d-head { display: flex; align-items: flex-start; gap: 6px; margin-bottom: 6px; }
+.cae-legend3d-titles { flex: 1 1 auto; min-width: 0; }
+.cae-legend3d-title {
+  font-family: var(--font-sans, inherit); font-size: 10.5px; font-weight: 700;
+  letter-spacing: 0.03em; color: var(--text); line-height: 1.2;
 }
-.asm-legend-lo { grid-area: lo; }
-.asm-legend-hi { grid-area: hi; color: var(--text-2); font-weight: 600; }
-.asm-legend-bar { grid-area: bar; height: 8px; border-radius: 2px; border: 1px solid var(--line); }
+.cae-legend3d-unit { font-size: 9.5px; color: var(--muted); }
+.cae-legend3d-gear {
+  flex: 0 0 auto; border: 1px solid var(--line); background: var(--bg);
+  border-radius: 5px; padding: 3px; color: var(--muted); cursor: pointer;
+  display: inline-flex; line-height: 0;
+}
+.cae-legend3d-gear:hover { color: var(--text); border-color: var(--muted); }
+
+/* Banded (discrete contour) mode: one swatch row per band. */
+.cae-legend3d-bands { display: flex; flex-direction: column; }
+.cae-legend3d-row { display: flex; align-items: center; gap: 6px; height: 13px; }
+.cae-legend3d-sw {
+  width: 22px; height: 13px; flex: 0 0 auto;
+  border-left: 1px solid rgba(0, 0, 0, 0.18); border-right: 1px solid rgba(0, 0, 0, 0.18);
+}
+.cae-legend3d-row:first-child .cae-legend3d-sw { border-top: 1px solid rgba(0, 0, 0, 0.18); }
+.cae-legend3d-sw--none { background: none; border: none; border-top: 1px solid rgba(0, 0, 0, 0.18); height: 0; }
+.cae-legend3d-row--edge { height: 8px; align-items: flex-start; }
+.cae-legend3d-val { font-size: 9.5px; line-height: 1; color: var(--text-2); }
+
+/* Continuous mode: a gradient column with evenly spaced ticks. */
+.cae-legend3d-cont { display: flex; gap: 6px; height: 132px; }
+.cae-legend3d-grad {
+  width: 22px; flex: 0 0 auto; border: 1px solid rgba(0, 0, 0, 0.18); border-radius: 2px;
+}
+.cae-legend3d-ticks { display: flex; flex-direction: column; justify-content: space-between; }
+
+.cae-legend3d-foot {
+  margin-top: 7px; padding-top: 6px; border-top: 1px solid var(--line);
+  display: flex; flex-direction: column; gap: 2px;
+}
+.cae-legend3d-ext { font-size: 9.5px; color: var(--text-2); }
+.cae-legend3d-ext b {
+  font-family: var(--font-sans, inherit); font-size: 8.5px; font-weight: 700;
+  text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); margin-right: 3px;
+}
+.cae-legend3d-at { color: var(--muted); }
+.cae-legend3d-info { font-size: 9px; color: var(--faint); }
+.cae-legend3d-warn { font-size: 9px; color: var(--warn); line-height: 1.3; }
+
+/* Settings popover, anchored under the gear. */
+.cae-legend3d-pop {
+  position: absolute; top: 100%; right: 0; margin-top: 6px; width: 208px;
+  background: var(--bg); border: 1px solid var(--line); border-radius: 8px;
+  box-shadow: var(--shadow-md, var(--shadow-sm)); padding: 9px;
+  display: flex; flex-direction: column; gap: 7px;
+  font-family: var(--font-sans, inherit); font-size: 10px;
+}
+.cae-legend3d-pop label {
+  display: flex; flex-direction: column; gap: 3px;
+  font-size: 9px; text-transform: uppercase; letter-spacing: 0.05em;
+  color: var(--muted); font-weight: 600;
+}
+.cae-legend3d-pop select,
+.cae-legend3d-pop input[type="number"] {
+  padding: 3px 4px; font-size: 11px; text-transform: none; letter-spacing: 0;
+  font-weight: 400; color: var(--text);
+}
+.cae-legend3d-check {
+  flex-direction: row !important; align-items: center; gap: 5px !important;
+  text-transform: none !important; letter-spacing: 0 !important;
+  font-size: 10.5px !important; color: var(--text-2) !important; font-weight: 400 !important;
+}
+.cae-legend3d-check input { margin: 0; }
+.cae-legend3d-range { display: flex; gap: 6px; align-items: flex-end; }
+.cae-legend3d-range > label { flex: 1 1 0; min-width: 0; }
+.cae-legend3d-range input { width: 100%; }
+.cae-legend3d-reset {
+  border: 1px solid var(--line); background: var(--bg-input-2); border-radius: 5px;
+  padding: 4px 8px; font-size: 10.5px; color: var(--text-2); cursor: pointer;
+}
+.cae-legend3d-reset:hover { color: var(--text); border-color: var(--muted); }
+
+/* ==========================================================================
+   MAX / MIN callouts — DOM labels tracked to a projected 3D anchor.
+   ========================================================================== */
+.cae-callout {
+  position: absolute; z-index: 7; pointer-events: none;
+  transform: translate(-50%, -50%);
+  background: rgba(255, 255, 255, 0.94);
+  border: 1px solid var(--cae-callout-color, var(--line));
+  border-left-width: 3px;
+  border-radius: 5px; padding: 3px 6px;
+  box-shadow: var(--shadow-sm);
+  font-family: var(--font-mono); font-variant-numeric: tabular-nums;
+  font-size: 10px; line-height: 1.25; white-space: nowrap;
+  display: flex; flex-direction: column;
+}
+.cae-callout-tag {
+  font-family: var(--font-sans, inherit); font-size: 8.5px; font-weight: 700;
+  letter-spacing: 0.08em; color: var(--cae-callout-color, var(--muted));
+}
+.cae-callout-val { font-size: 11px; font-weight: 600; color: var(--text); }
+.cae-callout-sub { font-size: 9px; color: var(--muted); }
 
 .asm-result {
   margin-top: 10px; font-family: var(--font-mono); font-variant-numeric: tabular-nums;
