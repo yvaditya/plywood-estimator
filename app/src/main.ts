@@ -197,6 +197,9 @@ interface AsmState {
   /** Colour map / banding / range for the fringe plot. Shared by the on-canvas
    *  legend and the mesh contour so they can't describe different scales. */
   legend: LegendSpec;
+  /** Is the per-joint list expanded? Collapsed by default — a cabinet detects
+   *  70+ contacts and the list buries everything below it. */
+  jointsOpen: boolean;
 }
 
 const state: {
@@ -263,10 +266,11 @@ const state: {
   asm: {
     cabinet: null, tolMm: 2, joints: [], loads: [], solveMsg: '', analysis: null,
     detected: false, field: 'deflection', lastSolve: null,
-    meshKind: 'shell', elementSizeMm: 20, solidLayers: 2, preview: null,
+    meshKind: 'shell', elementSizeMm: 30, solidLayers: 2, preview: null,
     show: { mesh: true, nodes: false, supports: true, couplings: true, loads: true },
     deformScale: 'auto',
     legend: { ...DEFAULT_LEGEND },
+    jointsOpen: false,
   },
 };
 
@@ -1178,6 +1182,27 @@ const asmCabinetSelect = $<HTMLSelectElement>('asmCabinet');
 const asmDetectBtn = $<HTMLButtonElement>('asmDetectBtn');
 const asmTolInput = $<HTMLInputElement>('asmTol');
 const asmJointsList = $('asmJointsList');
+const asmJointsToggle = $<HTMLButtonElement>('asmJointsToggle');
+const asmJointsSetAll = $<HTMLSelectElement>('asmJointsSetAll');
+const asmJointsSummary = $('asmJointsSummary');
+const asmJointCount = $('asmJointCount');
+const asmTiles = $('asmTiles');
+
+asmJointsToggle.addEventListener('click', () => {
+  state.asm.jointsOpen = !state.asm.jointsOpen;
+  renderAnalysisSection();
+});
+asmJointsSetAll.addEventListener('change', () => {
+  const v = asmJointsSetAll.value as JointStiffness | '';
+  asmJointsSetAll.value = '';
+  if (!v) return;
+  for (const j of state.asm.joints) j.stiffness = v;
+  // Joint stiffness is part of the model, so a cached solve no longer applies.
+  state.asm.lastSolve = null;
+  state.asm.analysis = null;
+  paintAssemblyPreview();
+  renderAnalysisSection();
+});
 const asmLoadsList = $('asmLoadsList');
 const asmAddLoadBtn = $<HTMLButtonElement>('asmAddLoad');
 const asmPreset50 = $<HTMLButtonElement>('asmPreset50');
@@ -1297,7 +1322,7 @@ asmMeshKind.addEventListener('change', () => {
   onMeshSettingsChanged();
 });
 asmMeshDensity.addEventListener('change', () => {
-  state.asm.elementSizeMm = Number(asmMeshDensity.value) || 20;
+  state.asm.elementSizeMm = Number(asmMeshDensity.value) || 30;
   onMeshSettingsChanged();
 });
 asmSolidLayers.addEventListener('change', () => {
@@ -2111,7 +2136,31 @@ function renderAnalysisSection() {
     ? String(Number(fromMm(state.asm.tolMm, 'in').toFixed(3)))
     : String(Number(fromMm(state.asm.tolMm, 'mm').toFixed(1)));
 
-  // Joints list.
+  // --- Joints: a summary line by default. A cabinet routinely detects 70+
+  //     contacts, and an un-collapsed list of them pushes the mesh controls,
+  //     the loads and the Solve button off the bottom of the sidebar. ---
+  const joints = state.asm.joints;
+  asmJointCount.textContent = String(joints.length);
+  asmJointsToggle.setAttribute('aria-expanded', String(state.asm.jointsOpen));
+  asmJointsToggle.classList.toggle('open', state.asm.jointsOpen);
+  asmJointsList.hidden = !state.asm.jointsOpen || joints.length === 0;
+  asmJointsSetAll.disabled = joints.length === 0;
+
+  if (!state.asm.detected) {
+    asmJointsSummary.innerHTML = '<span class="asm-hint">Detect joints to find touching panel edges.</span>';
+  } else if (joints.length === 0) {
+    asmJointsSummary.innerHTML = '<span class="asm-hint">No joints found. Raise the tolerance if panels should touch.</span>';
+  } else {
+    const byStiff = { rigid: 0, 'semi-rigid': 0, hinged: 0 } as Record<JointStiffness, number>;
+    for (const j of joints) byStiff[j.stiffness]++;
+    const parts = (Object.keys(byStiff) as JointStiffness[])
+      .filter((k) => byStiff[k] > 0)
+      .map((k) => `<b>${byStiff[k]}</b> ${k}`);
+    const total = joints.reduce((s, j) => s + j.length, 0);
+    asmJointsSummary.innerHTML =
+      `${parts.join(' · ')} · ${fmtLinear(total, state.units)} of seam`;
+  }
+
   if (!state.asm.detected) {
     asmJointsList.innerHTML = '<div class="asm-hint">Detect joints to list touching panel edges.</div>';
   } else if (state.asm.joints.length === 0) {
@@ -2178,7 +2227,14 @@ function renderAnalysisSection() {
   renderCaeLegend();
   renderMeshStats();
 
-  // Result line — verdict class is the WORST of deflection + stress.
+  // --- Results. A solved run gets metric TILES (the three numbers anyone
+  //     actually reads, each carrying its own verdict colour) with the solver
+  //     provenance underneath; anything else falls back to the message line. ---
+  renderAsmTiles();
+
+  // The sentence stays — it's the accessible/short-form summary, it carries the
+  // backend + timing, and the Playwright drives read the solve outcome from it.
+  // The tiles sit ABOVE it as the at-a-glance version, not a replacement.
   const verdictClass = state.asm.analysis
     ? `cae-${state.asm.analysis.combinedVerdict}` : '';
   asmResult.className = `asm-result ${verdictClass}`;
@@ -2188,6 +2244,44 @@ function renderAnalysisSection() {
 
   refreshSolvedDot();
   wireAnalysisSection();
+}
+
+/**
+ * The solved-result tiles: max deflection, max stress, utilisation — each with
+ * the limit it is judged against and its own verdict colour, then a provenance
+ * line (element type, DOF, backend, timing). Replaces a single run-on sentence
+ * that buried all three numbers in prose.
+ */
+function renderAsmTiles() {
+  const cached = state.asm.lastSolve;
+  if (!cached || !cached.res.ok) { asmTiles.hidden = true; asmTiles.innerHTML = ''; return; }
+  const res = cached.res;
+  const stale = !solveMatchesMesh();
+
+  const defLimit = res.spanMm / 200;
+  const tile = (
+    label: string, value: string, note: string, verdict: 'ok' | 'borderline' | 'weak',
+  ) => `
+    <div class="asm-tile cae-${verdict}">
+      <div class="asm-tile-label">${label}</div>
+      <div class="asm-tile-value">${escapeHtml(value)}</div>
+      <div class="asm-tile-note">${escapeHtml(note)}</div>
+    </div>`;
+
+  const maxBody = state.bodies.find((b) => b.id === res.maxPanelId);
+  const vmBody = state.bodies.find((b) => b.id === res.maxVmPanelId);
+
+  asmTiles.hidden = false;
+  asmTiles.innerHTML =
+    (stale ? '<div class="asm-tiles-stale">Mesh changed since this solve — re-run to update.</div>' : '')
+    + '<div class="asm-tiles-row">'
+    + tile('Max deflection', fmtSag(res.maxDisp, state.units),
+      `limit ${fmtSag(defLimit, state.units)}${maxBody ? ` · ${panelLabel(maxBody)}` : ''}`, res.verdict)
+    + tile('Max stress', `${res.maxVm.toFixed(2)} MPa`,
+      vmBody ? `panel ${panelLabel(vmBody)}` : 'von Mises', res.stressVerdict)
+    + tile('Utilisation', `${res.utilPct.toFixed(0)}%`,
+      'of bending strength', res.stressVerdict)
+    + '</div>';
 }
 
 /** Attach event handlers to the freshly-rendered Analysis section. */

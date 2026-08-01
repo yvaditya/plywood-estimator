@@ -138,8 +138,23 @@ def main() -> int:
                 problems.append("Parts group not visible in Analysis mode")
             page.wait_for_timeout(200)
 
+
+            def job_pdf(dest):
+                """Download the JOB pdf, which lives in the Cut layout pane.
+
+                Analysis mode hides that whole pane (the 3D fringe plot is the
+                entire output of the mode), so the cut-planning exports are only
+                reachable from Cut planning. Hop over, download, hop back.
+                """
+                page.click("#modeCutBtn")
+                page.wait_for_timeout(400)
+                out = download_to("#downloadPdfBtn", dest)
+                page.click("#modeAnalysisBtn")
+                page.wait_for_timeout(400)
+                return out
+
             # --- Job PDF BEFORE any solve: NO Structure/Assembly analysis. ---
-            pre_pdf = download_to("#downloadPdfBtn", OUT / "job_before_solve.pdf")
+            pre_pdf = job_pdf(OUT / "job_before_solve.pdf")
             n_pre, titles_pre = pdf_page_titles(pre_pdf)
             if has_section(titles_pre, "assembly analysis", "structure"):
                 problems.append("Structure/Assembly analysis present in job PDF BEFORE any solve")
@@ -298,7 +313,7 @@ def main() -> int:
                 problems.append("standalone assembly PDF missing the von-Mises/utilization stress block")
 
             # --- Job PDF AFTER solve: BOTH Structure + Assembly analysis. ---
-            post_pdf = download_to("#downloadPdfBtn", OUT / "job_after_solve.pdf")
+            post_pdf = job_pdf(OUT / "job_after_solve.pdf")
             n_post, titles_post = pdf_page_titles(post_pdf)
             render_pages(post_pdf, "after")
             has_struct = has_section(titles_post, "structure")

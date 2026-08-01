@@ -42,10 +42,13 @@ def shot_viewer(page, path: Path):
     driving a requestAnimationFrame render loop never is — the canvas is
     repainting every frame by design. Clip the page instead.
     """
-    box = page.locator("#viewerWrap").bounding_box()
+    # Generous timeouts: a 25k-node mesh with node dots renders through
+    # SwiftShader in headless, which blocks the main thread long enough that a
+    # 30 s protocol call can time out on a loaded machine.
+    box = page.locator("#viewerWrap").bounding_box(timeout=120_000)
     if not box:
         raise RuntimeError("#viewerWrap has no bounding box")
-    page.screenshot(path=str(path), clip=box)
+    page.screenshot(path=str(path), clip=box, timeout=120_000)
 
 
 def parse_counts(txt: str) -> dict:
@@ -77,12 +80,16 @@ def main() -> int:
     OUT.mkdir(parents=True, exist_ok=True)
     proc, port = boot_dev_server()
     problems = []
+    console: list[str] = []
     try:
         with sync_playwright() as p:
             browser = p.chromium.launch(headless=True)
             ctx = browser.new_context(viewport={"width": 1500, "height": 1000})
             page = ctx.new_page()
-            console = []
+            # Headless renders a 150k-DOF mesh through SwiftShader; individual
+            # frames can take seconds, so the default 30 s actionability budget
+            # is too tight for clicks that land mid-repaint.
+            page.set_default_timeout(120_000)
             page.on("console", lambda m: console.append(f"[{m.type}] {m.text}"))
 
             page.goto(f"http://localhost:{port}", wait_until="networkidle")
@@ -117,16 +124,21 @@ def main() -> int:
             page.screenshot(path=str(OUT / "01_mesh_presolve.png"))
             shot_viewer(page, OUT / "01_mesh_presolve_3d.png")
 
-            # Toggle nodes on, mesh off → constraint glyphs only.
+            # Overlay toggles: run these on a COARSE mesh. They exercise the
+            # show/hide plumbing, not the density, and 25k node dots over 24k
+            # elements renders through SwiftShader slowly enough that headless
+            # never produces a settled frame for Playwright to act on.
+            page.select_option("#asmMeshDensity", "50")
+            page.wait_for_timeout(2500)
             page.check("#asmShowNodes")
-            page.wait_for_timeout(600)
+            page.wait_for_timeout(800)
             shot_viewer(page, OUT / "02_mesh_with_nodes.png")
             page.uncheck("#asmShowMesh")
-            page.wait_for_timeout(600)
+            page.wait_for_timeout(800)
             shot_viewer(page, OUT / "03_constraints_only.png")
             page.check("#asmShowMesh")
             page.uncheck("#asmShowNodes")
-            page.wait_for_timeout(400)
+            page.wait_for_timeout(600)
 
             # ---------------------------------------------------------------
             # 2. Density + element-family changes rebuild the mesh
@@ -170,7 +182,13 @@ def main() -> int:
             if m5 and float(m5.group(2) or m5.group(1)) > 5 * 1.35 and "coarsened" not in txt5:
                 problems.append(f"5 mm request silently coarsened without a notice: {txt5!r}")
 
-            page.select_option("#asmMeshDensity", "20")
+            # From here on the test CLICKS things (legend gear, popover selects,
+            # field tabs) against a solved, contoured, deformed scene. Headless
+            # renders that through SwiftShader, and at 20 mm (154k DOF) a single
+            # frame takes long enough that Playwright can never dispatch a click.
+            # The legend/callout/popover logic is density-independent, so solve
+            # the interactive part on a light mesh.
+            page.select_option("#asmMeshDensity", "50")
             page.wait_for_timeout(3000)
 
             # Solid (hex) elements: family changes, DOF becomes 3/node.
@@ -208,10 +226,16 @@ def main() -> int:
                 "        return /Max deflection/.test(t); }",
                 timeout=300_000,
             )
+            immediate = " ".join((page.inner_text("#asmResult") or "").split())
+            print(f"[solve:immediate] {immediate}")
             page.wait_for_timeout(1500)
 
             result = " ".join((page.inner_text("#asmResult") or "").split())
             print(f"[solve] {result}")
+            if "Max deflection" not in result:
+                problems.append(
+                    f"solve result was replaced after the solve: {immediate!r} -> {result!r}"
+                )
 
             legend = " ".join((page.inner_text(".cae-legend3d") or "").split())
             print(f"[legend] {legend!r}")
@@ -257,7 +281,10 @@ def main() -> int:
                 page.select_option('.cae-legend3d-pop [data-lg="bands"]', "12")
                 page.select_option('.cae-legend3d-pop [data-lg="map"]', "rainbow")
                 page.wait_for_timeout(500)
-                page.mouse.click(700, 950)   # dismiss the popover
+                # Close via the gear. Clicking empty space in the 3D view would
+                # also close it, but a viewer click clears the body selection —
+                # which disables Solve and invalidates the whole analysis.
+                page.click(".cae-legend3d-gear")
                 page.wait_for_timeout(300)
             deform_visible = page.evaluate(
                 "() => document.getElementById('asmDeformRow')?.offsetParent !== null"
@@ -324,11 +351,21 @@ def main() -> int:
             page.screenshot(path=str(OUT / "12_solid_full.png"))
 
             page.screenshot(path=str(OUT / "10_sidebar_final.png"))
-            (OUT / "console.log").write_text("\n".join(console), encoding="utf-8")
-
             ctx.close()
             browser.close()
     finally:
+        # Always keep the browser console — when the app throws mid-run, this is
+        # the only record of why, and an exception below would otherwise lose it.
+        try:
+            OUT.mkdir(parents=True, exist_ok=True)
+            (OUT / "console.log").write_text("\n".join(console), encoding="utf-8")
+            errs = [c for c in console if c.startswith("[error]")]
+            if errs:
+                print("[console errors]")
+                for e in errs[:10]:
+                    print(f"    {e}")
+        except Exception:
+            pass
         kill_dev_server(proc)
 
     print("\n=== RESULT ===")

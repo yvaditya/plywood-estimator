@@ -1120,6 +1120,11 @@ export class Viewer {
     // Outline passes raycast against hidden meshes otherwise.
     this.outlinePass.enabled = !on;
     this.outlineDimPass.enabled = !on;
+    // Ambient occlusion contributes nothing to a flat-shaded fringe plot — it
+    // just darkens the contour — and it is by far the most expensive pass in
+    // the chain. Dropping it while the mesh view is up is what keeps a
+    // 100k-DOF mesh interactive to orbit.
+    this.ssaoPass.enabled = !on;
   }
 
   resize(container: HTMLElement) {

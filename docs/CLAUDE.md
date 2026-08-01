@@ -208,11 +208,58 @@ nodal displacement.
   that otherwise float in front of the deformed mesh as an undeformed ghost.
   `captureAssemblyAnalysis` (PDF snapshots) deliberately drops out of mesh view
   for the capture and restores through `paintCaeVisuals()`.
-- Sidebar controls: element family (shell/solid), density, through-thickness
-  layers, per-overlay checkboxes, a live stats line (elements/nodes/DOF, element
-  size, fixed nodes / couplings / loaded nodes + total N), a deform-scale select
-  ('auto' puts peak deflection at ~6% of the model diagonal) and the fringe
-  colour bar. `tests/cae_mesh_drive.py` drives all of it end to end.
+- Sidebar controls: element family (shell/solid), ELEMENT SIZE in mm, through-
+  thickness layers, per-overlay checkboxes, a live stats line (elements/nodes/
+  DOF, achieved element size, fixed nodes / couplings / loaded nodes + total N)
+  and a deform-scale select ('auto' puts peak deflection at ~6% of the model
+  diagonal). `tests/cae_mesh_drive.py` drives all of it end to end.
+- **Element size is a MAXIMUM.** `meshPanel` ceilings `bbox / size` (rounding
+  lets a 101 mm rail at "20 mm" come out at 20.3 mm). Panels are still clamped
+  to ≥4 nodes a side, so small parts legitimately come out FINER than asked —
+  only the upper bound is a promise. `preprocessAssembly` PRE-ESTIMATES the node
+  count analytically and coarsens the size before building anything: a 5 mm
+  request on a 2.4 m cabinet is hundreds of thousands of nodes, and discovering
+  that by materialising the mesh then throwing it away blocks the main thread
+  for tens of seconds. Any coarsening is reported (`coarsened`, `uncappedDof`
+  on the mesh view → the stats line says what was asked for and what it needed).
+- `CAE_DOF_CEILING` (main.ts) — shell 200k, solid 90k. Measured on the workbench
+  with Eigen LDLT in WASM: 58k DOF ≈ 0.3 s to factor, 117k ≈ 6.6 s. Fill grows
+  steeply; these sit where a solve is still worth waiting through.
+
+## CAE legend (on-canvas, customisable)
+`caeLegend.ts` mounts a floating legend into `#viewerWrap`. It renders from a
+`LegendSpec` (colour map, band count, reverse, manual min/max, decimals,
+scientific) and hands every edit back so `paintCaeMesh` repaints the CONTOUR
+from the same spec — the legend can never describe a scale the geometry isn't
+painted with. Colour maps + `sampleColorMap` / `resolveLegendRange` /
+`fieldExtent` / `formatLegendValue` all live in `cae.ts`, shared with the PDF.
+- **Auto range is the field's real min→max**, not 0→max, so a field that never
+  approaches zero still uses the whole ramp.
+- Banding quantises to the BAND CENTRE, not the edge — every value inside a band
+  gets exactly the colour the legend's swatch for it shows.
+- Deflection is stored in mm but LABELLED in the job's display unit, so the
+  spec's manual min/max are in DISPLAY units and `caeContourRange` divides the
+  scale back out. Skip that and a manual range on an inch job clips the contour
+  at 1/25th of the requested value.
+- MAX/MIN callouts (`viewer.showCaeCallouts`) find the extreme on the FIELD
+  itself, not the result summary — on a solid mesh the summary's location is a
+  collapsed mid-surface grid point, not a solid node. Labels are DOM tracked to
+  a projected anchor and only touch the DOM when they actually move; writing
+  every frame keeps the subtree permanently "unstable" and stalls screenshots.
+- Load arrows are subsampled to ≤140; a patch over a fine mesh is hundreds of
+  identical arrows that hide the geometry. The stats line carries the true count.
+
+## Analysis mode UI
+- The Cut layout half is HIDDEN in Analysis mode (`#workArea.analysis-full`,
+  which collapses the grid track — `#workArea` is a grid, so a flex rule is a
+  no-op). `pokeViewerResize()` after the switch.
+- The joints list is COLLAPSED by default behind a summary (`68 rigid · 8
+  hinged · 4.2 m of seam`) with a set-all select. A cabinet detects 70+ contacts
+  and an expanded list pushes the mesh controls, loads and Solve off-screen.
+- Solved results render as three verdict-coloured TILES (deflection / stress /
+  utilisation) plus a provenance line, not one run-on sentence.
+- Clicking empty space in the 3D view clears the body selection, which disables
+  Solve. Don't dismiss popovers with a viewer click.
 
 ## Known sharp edges
 - **The FE model is built on the panel MID-SURFACE, not its face.**
