@@ -172,9 +172,61 @@ async function probePynite(): Promise<AsyncAssemblySolver | null> {
 
 /**
  * Resolve the PyNite sidecar backend, or null if it isn't reachable. Memoized —
- * the /health probe runs at most once per session.
+ * the /health probe runs at most once per session (until launchSidecar swaps
+ * the memo for a retrying probe).
  */
 export function getPyniteBackend(): Promise<AsyncAssemblySolver | null> {
   if (!pyniteProbe) pyniteProbe = probePynite();
   return pyniteProbe;
+}
+
+/** Probe /health repeatedly — a freshly spawned uvicorn needs a few seconds to
+ *  import PyNite and bind the port. */
+async function probePyniteUntilUp(): Promise<AsyncAssemblySolver | null> {
+  const deadline = Date.now() + 15_000;
+  for (;;) {
+    const backend = await probePynite();
+    if (backend) return backend;
+    // probePynite honours __caeNoPynite by returning null — don't spend the
+    // full window polling against a deliberate disable.
+    if ((globalThis as { __caeNoPynite?: boolean }).__caeNoPynite) return null;
+    if (Date.now() >= deadline) return null;
+    await new Promise((r) => setTimeout(r, 700));
+  }
+}
+
+// In-flight launch — a second Detect click while the first is still polling
+// must join it, not spawn a second poll loop / re-POST.
+let sidecarLaunch: Promise<void> | undefined;
+
+/**
+ * Start the PyNite sidecar on demand via the dev/preview server's
+ * POST /__sidecar/start endpoint (vite.config.ts). Production static hosting
+ * has no such endpoint — the POST failing is fine; the probe below still finds
+ * an externally started sidecar. The memoized probe is REPLACED, not reused:
+ * it may already hold a resolved null from a probe that ran before the spawn,
+ * which would otherwise pin getPyniteBackend() to "no sidecar" all session.
+ */
+export function launchSidecar(): Promise<void> {
+  if (sidecarLaunch) return sidecarLaunch;
+  sidecarLaunch = (async () => {
+    let status = '';
+    try {
+      const res = await fetchTimeout('/__sidecar/start', { method: 'POST' }, 3_000);
+      const body = await res.json().catch(() => null);
+      status = typeof body?.status === 'string' ? body.status : '';
+    } catch { /* endpoint absent or unreachable — the probe decides */ }
+    // 'unavailable' = spawn failed (no python): a single plain probe, so a
+    // Solve right after doesn't block on a 15 s poll that can't succeed.
+    const probe = status === 'unavailable' ? probePynite() : probePyniteUntilUp();
+    pyniteProbe = probe;
+    try {
+      await probe;
+    } finally {
+      // Never sticky: the next click re-checks health (server answers
+      // 'already' when up) and can respawn a sidecar that died meanwhile.
+      sidecarLaunch = undefined;
+    }
+  })();
+  return sidecarLaunch;
 }

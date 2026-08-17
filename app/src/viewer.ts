@@ -494,6 +494,7 @@ export class Viewer {
       this.grainGroup.add(a);
       this.grainArrows.set(bodyId, a);
     }
+    this.invalidate();
   }
 
   // -------------------------------------------------------------------------
@@ -530,6 +531,7 @@ export class Viewer {
       this.caeGroup.add(ls);
       this.caeWeakOutlines.set(id, ls);
     }
+    this.invalidate();
   }
 
   /** Enter "place force" mode for a body — the next click on that body's face
@@ -1139,6 +1141,7 @@ export class Viewer {
     this.outlinePass.setSize(w, h);
     this.outlineDimPass.setSize(w, h);
     this.smaaPass.setSize(w * window.devicePixelRatio, h * window.devicePixelRatio);
+    this.invalidate();
   }
 
   clear() {
@@ -1160,6 +1163,7 @@ export class Viewer {
     this.clearAssemblyOverlay();
     for (const ls of this.caeWeakOutlines.values()) { this.caeGroup.remove(ls); disposeObject3D(ls); }
     this.caeWeakOutlines.clear();
+    this.invalidate();
   }
 
   /**
@@ -1193,6 +1197,7 @@ export class Viewer {
     const mesh = this.meshFromOcct(m, id, hex);
     this.root.add(mesh);
     this.bodies.push({ id, name, mesh, hexColor: hex });
+    this.invalidate();
   }
 
   /**
@@ -1245,6 +1250,7 @@ export class Viewer {
     edges.computeLineDistances();
     edges.renderOrder = 3;
     this.nonSheetGroup.add(edges);
+    this.invalidate();
   }
 
   /** Frame everything currently loaded and refresh selection colors. */
@@ -1424,7 +1430,16 @@ export class Viewer {
      *  user's window size. The renderer is resized for the snapshot and
      *  restored afterwards, transparently to the live viewer. */
     target?: { w: number; h: number },
-  ): { dataUrl: string; width: number; height: number } {
+    /** Camera direction (world, unnormalized) the shot is taken FROM.
+     *  Default is the standard front-3/4 view; pass a mirrored vector for a
+     *  back-3/4 companion view. */
+    viewDir: [number, number, number] = [1.0, -1.2, 0.9],
+  ): {
+    dataUrl: string; width: number; height: number;
+    /** Each visible body's center projected into image pixels — lets the
+     *  PDF place id balloons directly on the panels. */
+    anchors: { id: number; x: number; y: number }[];
+  } {
     // 0. (Optional) resize the renderer for a high-resolution snapshot.
     //    Inside a snapshot batch the renderer is already sized — skip the
     //    (expensive) per-call resize entirely.
@@ -1478,7 +1493,7 @@ export class Viewer {
       const dist = (maxDim / 2) / Math.tan(fov / 2) * 1.25;
       this.controls.target.copy(center);
       this.camera.position.copy(
-        center.clone().add(new THREE.Vector3(1.0, -1.2, 0.9).normalize().multiplyScalar(dist)),
+        center.clone().add(new THREE.Vector3(...viewDir).normalize().multiplyScalar(dist)),
       );
       this.camera.near = Math.max(0.1, maxDim / 1000);
       this.camera.far = maxDim * 100;
@@ -1525,7 +1540,24 @@ export class Viewer {
     // 4. Render + grab (canvas dims captured for downstream aspect-fit)
     this.composer.render();
     const c = this.renderer.domElement;
-    const out = { dataUrl: c.toDataURL('image/jpeg', 0.9), width: c.width, height: c.height };
+    // Project every visible body's center (post-explode) into image pixels
+    // so the PDF can label panels in place. NDC y is up; image y is down.
+    const anchors: { id: number; x: number; y: number }[] = [];
+    const proj = new THREE.Vector3();
+    const abox = new THREE.Box3();
+    for (const b of this.bodies) {
+      if (!visibleIds.has(b.id)) continue;
+      abox.setFromObject(b.mesh);
+      if (abox.isEmpty()) continue;
+      abox.getCenter(proj);
+      proj.project(this.camera);
+      anchors.push({
+        id: b.id,
+        x: (proj.x * 0.5 + 0.5) * c.width,
+        y: (1 - (proj.y * 0.5 + 0.5)) * c.height,
+      });
+    }
+    const out = { dataUrl: c.toDataURL('image/jpeg', 0.9), width: c.width, height: c.height, anchors };
 
     // 5. Restore EVERYTHING — remove ghosts, restore positions and visibility.
     for (const g of ghosts) {
@@ -1676,6 +1708,7 @@ export class Viewer {
     // bleed into the AO and create halos around the silhouette.
     const aoBox = box.clone().expandByScalar(maxDim * 0.05);
     this.ssaoPass.setSceneClipBox(aoBox);
+    this.invalidate();
 
     // Position the key light and its shadow camera to the model
     const r = maxDim * 0.9;
@@ -1801,6 +1834,7 @@ export class Viewer {
       mat.needsUpdate = true;
     }
     this.refreshOutlines();
+    this.invalidate();
   }
 
   /** Sync the outline-pass selection lists with current state. */
@@ -1892,12 +1926,33 @@ export class Viewer {
     }
   };
 
+  // Render-on-demand: the RenderPass→GTAO→Outline×2→SMAA chain at full
+  // devicePixelRatio costs a full GPU frame — at an unconditional 60 fps it
+  // pins integrated GPUs even for an EMPTY scene, starving the rest of the
+  // desktop (the user saw multi-second OS file-dialog delays). Idle frames
+  // are skipped: render only when the camera moved or a mutator flagged the
+  // scene dirty. A ½-second keepalive repaints anything a mutator forgot to
+  // flag, so a missed invalidate() means ≤500 ms of staleness, not a freeze.
+  private renderNeeded = true;
+  private lastRenderMs = 0;
+
+  /** Mark the scene dirty — the next tick renders one frame. */
+  invalidate() {
+    this.renderNeeded = true;
+  }
+
   private tick = () => {
     requestAnimationFrame(this.tick);
-    this.controls.update();
-    this.composer.render();
-    // Callout labels are DOM, so they have to follow the camera every frame.
-    this.updateCalloutPositions();
+    const moved = this.controls.update();
+    const now = performance.now();
+    if (moved || this.renderNeeded || now - this.lastRenderMs > 500) {
+      this.renderNeeded = false;
+      this.lastRenderMs = now;
+      this.composer.render();
+      // Callout labels are DOM following the camera — only meaningful on
+      // frames that actually rendered.
+      this.updateCalloutPositions();
+    }
   };
 }
 

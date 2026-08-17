@@ -56,6 +56,9 @@ export interface PdfOptions {
    *  DEPRECATED in favor of `cabinets` — kept for backward-compat. */
   assembledPng?: string;
   explodedPng?: string;
+  /** Cutlist assembly views — one entry per cabinet: assembled front/back
+   *  3/4 snapshots with per-panel balloon anchors in image pixels. */
+  assemblyViews?: CutlistAssemblyViews[];
   /** One entry per unique STEP file (cabinet). Each is rendered as its
    *  own assembly page so multi-cabinet jobs don't share one snapshot. */
   cabinets?: CabinetSnapshot[];
@@ -178,6 +181,21 @@ export interface SnapshotImage {
   dataUrl: string;
   width: number;
   height: number;
+}
+
+/** One assembled view for the cutlist Assembly page. */
+export interface CutlistView {
+  image: SnapshotImage;
+  /** Panel-id balloons: position in IMAGE pixels + the id text ("1a"). */
+  labels: { x: number; y: number; text: string }[];
+}
+
+/** Front + back 3/4 views of one cabinet for the cutlist Assembly page. */
+export interface CutlistAssemblyViews {
+  /** Cabinet (STEP file) tag — shown in the header on multi-cabinet jobs. */
+  name?: string;
+  front: CutlistView;
+  back: CutlistView;
 }
 
 export interface CabinetPanel {
@@ -456,6 +474,116 @@ export function buildPdf(result: NestResult, opt: PdfOptions): jsPDF {
   resolveNav(doc, nav, sectionPerPage);
 
   return doc;
+}
+
+// ---------------------------------------------------------------------------
+// CUTLIST PDF — the minimal companion to the full job PDF: ONE page per cut
+// sheet and nothing else. Each page is the sheet-overview drawing (layout
+// with every panel's id + dimensions on the full sheet, plus the overall
+// sheet dim lines). Fixed 4:3 landscape pages — PowerPoint 4:3, 10" × 7.5"
+// → 720 × 540 pt — independent of the job-PDF paper setting.
+// ---------------------------------------------------------------------------
+const CUTLIST_DIMS = { w: 720, h: 540 };
+
+export function buildCutlistPdf(result: NestResult, opt: PdfOptions): jsPDF {
+  const doc = new jsPDF({
+    orientation: 'landscape',
+    unit: 'pt',
+    format: [CUTLIST_DIMS.w, CUTLIST_DIMS.h],
+  });
+  const sheets = result.groups.flatMap((g) => g.sheets);
+  // Panel id → cabinet name (when the caller passes cabinets): renders the
+  // per-sheet cabinet cross-ref line on multi-cabinet jobs.
+  const cabinetByPanelId = new Map<string, string>();
+  for (const cab of opt.cabinets ?? []) {
+    for (const id of cab.partIds) cabinetByPanelId.set(id, cab.name);
+  }
+  sheets.forEach((sheet, i) => {
+    if (i > 0) doc.addPage([CUTLIST_DIMS.w, CUTLIST_DIMS.h], 'landscape');
+    drawSheet(doc, sheet, opt, CUTLIST_DIMS, undefined, cabinetByPanelId.size > 0 ? cabinetByPanelId : undefined, undefined, undefined, true);
+  });
+  // Assembly page(s) — assembled front + back 3/4 views with the panel-id
+  // balloons ON the panels, so the reader sees where every numbered panel
+  // goes without a legend detour. One page per cabinet.
+  for (const views of opt.assemblyViews ?? []) {
+    doc.addPage([CUTLIST_DIMS.w, CUTLIST_DIMS.h], 'landscape');
+    drawCutlistAssemblyPage(doc, views, opt);
+  }
+  // Footer on every page: job name left, page x/y right — just enough to
+  // reshuffle a printed stack, no other chrome.
+  const n = doc.getNumberOfPages();
+  for (let i = 1; i <= n; i++) {
+    doc.setPage(i);
+    doc.setFont('helvetica', 'normal');
+    doc.setFontSize(8);
+    doc.setTextColor(150);
+    if (opt.jobName) doc.text(opt.jobName, PAGE_PAD, CUTLIST_DIMS.h - 14);
+    doc.text(`${i} / ${n}`, CUTLIST_DIMS.w - PAGE_PAD, CUTLIST_DIMS.h - 14, { align: 'right' });
+    doc.setTextColor(0);
+  }
+  return doc;
+}
+
+/** Cutlist assembly page: assembled front + back 3/4 views side by side,
+ *  panel-id balloons directly on the panels. Minimal chrome, same header
+ *  style as the sheet pages. */
+function drawCutlistAssemblyPage(doc: jsPDF, views: CutlistAssemblyViews, opt: PdfOptions) {
+  const PAGE_W = CUTLIST_DIMS.w;
+  const PAGE_H = CUTLIST_DIMS.h;
+  doc.setFont('helvetica', 'bold');
+  doc.setFontSize(14);
+  doc.setTextColor(0);
+  doc.text('Assembly', PAGE_PAD, PAGE_PAD - 4);
+  const sub = views.name ?? opt.jobName;
+  if (sub) {
+    const w = doc.getTextWidth('Assembly');
+    doc.setFont('helvetica', 'normal');
+    doc.setFontSize(11);
+    doc.setTextColor(110);
+    doc.text(sub, PAGE_PAD + w + 12, PAGE_PAD - 4);
+    doc.setTextColor(0);
+  }
+  const top = PAGE_PAD + 14;
+  const bottom = PAGE_H - PAGE_PAD - 16; // caption strip under each view
+  const gap = 18;
+  const colW = (PAGE_W - 2 * PAGE_PAD - gap) / 2;
+  drawCutlistView(doc, views.front, 'Front', PAGE_PAD, top, colW, bottom - top);
+  drawCutlistView(doc, views.back, 'Back', PAGE_PAD + colW + gap, top, colW, bottom - top);
+}
+
+/** One assembled view: aspect-fit image + white-pill id balloons at each
+ *  panel's projected center, caption underneath. */
+function drawCutlistView(
+  doc: jsPDF,
+  view: CutlistView,
+  caption: string,
+  x: number, y: number, w: number, h: number,
+) {
+  const img = view.image;
+  const scale = Math.min(w / img.width, h / img.height);
+  const dw = img.width * scale;
+  const dh = img.height * scale;
+  const dx = x + (w - dw) / 2;
+  const dy = y + (h - dh) / 2;
+  doc.addImage(img.dataUrl, 'JPEG', dx, dy, dw, dh);
+  doc.setFontSize(7.5);
+  doc.setLineWidth(0.4);
+  for (const l of view.labels) {
+    const bx = dx + l.x * scale;
+    const by = dy + l.y * scale;
+    doc.setFont('helvetica', 'bold');
+    const tw = doc.getTextWidth(l.text);
+    doc.setFillColor(255, 255, 255);
+    doc.setDrawColor(...CUT_OBJ_INK);
+    doc.roundedRect(bx - tw / 2 - 3, by - 5, tw + 6, 10, 2, 2, 'FD');
+    doc.setTextColor(...CUT_OBJ_INK);
+    doc.text(l.text, bx, by + 2.6, { align: 'center' });
+  }
+  doc.setFont('helvetica', 'normal');
+  doc.setFontSize(8.5);
+  doc.setTextColor(130);
+  doc.text(caption, x + w / 2, y + h + 12, { align: 'center' });
+  doc.setTextColor(0);
 }
 
 /** First page (1-based) tagged with this section, or null. */
@@ -1361,6 +1489,8 @@ function drawSheet(
   cabinetByPanelId?: Map<string, string>,
   nav?: NavCtx,
   curPage?: () => number,
+  /** Cutlist mode: per-panel in-panel dim lines with arrows (see drawPart). */
+  detailDims = false,
 ) {
   const PAGE_W = dims.w;
   const PAGE_H = dims.h;
@@ -1373,6 +1503,22 @@ function drawSheet(
   doc.setFont('helvetica', 'bold');
   doc.setFontSize(14);
   doc.text(`Sheet ${sheet.globalIndex}`, PAGE_PAD, PAGE_PAD - 4);
+  // Cutlist pages carry the JOB TITLE in the header next to the sheet
+  // number (the job PDF has a cover page for this; the cutlist doesn't).
+  if (detailDims && opt.jobName) {
+    const shW = doc.getTextWidth(`Sheet ${sheet.globalIndex}`);
+    doc.setFont('helvetica', 'normal');
+    doc.setFontSize(11);
+    doc.setTextColor(110);
+    const budget = PAGE_W - PAGE_PAD - 330 - (PAGE_PAD + shW + 12);
+    let title = opt.jobName;
+    if (doc.getTextWidth(title) > budget) {
+      while (title.length > 3 && doc.getTextWidth(`${title}…`) > budget) title = title.slice(0, -1);
+      title += '…';
+    }
+    doc.text(title, PAGE_PAD + shW + 12, PAGE_PAD - 4);
+    doc.setTextColor(0);
+  }
   doc.setFont('helvetica', 'normal');
   doc.setFontSize(9);
   doc.setTextColor(120);
@@ -1445,10 +1591,12 @@ function drawSheet(
   const ox = drawX + dimRoom + (innerW - sheetPtW) / 2;
   const oy = drawY + (innerH - sheetPtH) / 2;
 
-  // Sheet — cream plywood fill + warm border so colored parts read clearly
+  // Sheet — cream plywood fill + warm border so colored parts read clearly.
+  // Cutlist mode: the stock boundary is a HEAVY line (drafting line-weight
+  // hierarchy — object/stock lines thick, dimension lines thin).
   doc.setFillColor(245, 239, 217);
   doc.setDrawColor(180, 162, 112);
-  doc.setLineWidth(1.0);
+  doc.setLineWidth(detailDims ? CUT_STOCK_W : 1.0);
   doc.rect(ox, oy, sheetPtW, sheetPtH, 'FD');
 
   // Margin (symmetric, so just insets the sheet on all sides — orientation
@@ -1469,17 +1617,33 @@ function drawSheet(
 
   // Parts — pass the sheet box so per-panel dim leaders can spill into
   // adjacent waste areas (between the panel and the sheet's outer edge).
+  // Cutlist mode also threads:
+  //   - labelReg: per-PAGE registry of placed dimension-label rects, so any
+  //     later dim line breaks around earlier labels (resets per drawSheet);
+  //   - each part's neighbours' bboxes, so notch dims can prefer free waste
+  //     space outside the feature and fall back inside when it's occupied.
   const sheetBox = { x: ox, y: oy, w: sheetPtW, h: sheetPtH };
-  for (const p of sheet.parts) {
-    drawPart(doc, p, ox, oy, scale, opt, `${sheet.globalIndex}${p.panelLabel}`, orient, sheetBox);
-  }
+  const labelReg: DimRegistry | undefined = detailDims ? { rects: [], segs: [] } : undefined;
+  const partRects: LabelRect[] = detailDims
+    ? sheet.parts.map((p) => {
+        const rr = orient.rect(p.x, p.y, p.w, p.h);
+        return { x: ox + rr.x * scale, y: oy + rr.y * scale, w: rr.w * scale, h: rr.h * scale };
+      })
+    : [];
+  sheet.parts.forEach((p, i) => {
+    const others = detailDims ? partRects.filter((_, j) => j !== i) : undefined;
+    drawPart(doc, p, ox, oy, scale, opt, `${sheet.globalIndex}${p.panelLabel}`, orient, sheetBox, detailDims, labelReg, others);
+  });
 
   // Overall sheet dimensions — labels show the actual (long, short) values
-  // in their display positions: long edge along the page horizontal.
+  // in their display positions: long edge along the page horizontal. On
+  // cutlist pages these go drafting-red like every other dimension.
   const longLabel = fmtDim(Math.max(swMm, slMm), opt.units);
   const shortLabel = fmtDim(Math.min(swMm, slMm), opt.units);
-  drawDimH(doc, ox, ox + sheetPtW, oy + sheetPtH + 14, longLabel);
-  drawDimV(doc, oy, oy + sheetPtH, ox - 14, shortLabel);
+  const sheetInk = detailDims ? CUT_DIM_INK : undefined;
+  const sheetDimW = detailDims ? CUT_DIM_W : undefined;
+  drawDimH(doc, ox, ox + sheetPtW, oy + sheetPtH + 14, longLabel, sheetInk, sheetDimW);
+  drawDimV(doc, oy, oy + sheetPtH, ox - 14, shortLabel, sheetInk, sheetDimW);
 }
 
 function drawPart(
@@ -1494,25 +1658,49 @@ function drawPart(
   /** Sheet bounding box in display pt — used to detect free margin around
    *  the panel so dim leaders can spill outside the panel into waste area. */
   sheetBox?: { x: number; y: number; w: number; h: number },
+  /** Cutlist detail mode: in-panel ANSI dimension lines with arrows on both
+   *  axes instead of the plain text label. Drawn for EVERY panel regardless
+   *  of size — the cutlist targets tablet viewing, so the reader zooms. */
+  detailDims = false,
+  /** Cutlist per-PAGE registry of placed label rects + drawn dim segments
+   *  (page pt). Dim lines break around every rect already in it; each label
+   *  placed here pushes its own rect. Owned and reset by drawSheet. */
+  labelReg?: DimRegistry,
+  /** Bboxes (page pt) of the OTHER parts on the sheet — used to decide
+   *  whether the waste space outside a notch edge is free for a witness-line
+   *  dim or occupied by a neighbouring panel. */
+  otherRects?: LabelRect[],
 ) {
   const [r, g, b] = hexToRgb(p.color);
   const GS = (doc as any).GState;
   doc.setFillColor(r, g, b);
-  doc.setDrawColor(Math.floor(r * 0.55), Math.floor(g * 0.55), Math.floor(b * 0.55));
-  doc.setLineWidth(0.7);
+  // Cutlist mode reads like a mechanical drawing: faint identifying tint,
+  // HEAVY near-black object lines (ASME line-weight hierarchy — the color
+  // stroke would dilute the thick/thin contrast against the red dims).
+  if (detailDims) {
+    doc.setDrawColor(...CUT_OBJ_INK);
+    doc.setLineWidth(CUT_OBJ_W);
+  } else {
+    doc.setDrawColor(Math.floor(r * 0.55), Math.floor(g * 0.55), Math.floor(b * 0.55));
+    doc.setLineWidth(0.7);
+  }
 
-  // Outer ring fill at 50% transparency so the cream sheet shows through —
-  // matches the cut-card overlay convention.
-  if (GS) (doc as any).setGState(new GS({ opacity: 0.50 }));
-  drawPolygon(doc, p.outer, p.x, p.y, ox, oy, scale, 'F', orient);
-  if (GS) (doc as any).setGState(new GS({ opacity: 1 }));
+  // Cutlist mode draws OUTLINES ONLY — no fill tint and no white hole
+  // fill (split-line slots on a body rendered as glaring white strips
+  // otherwise). The job-PDF path keeps the 50%-opacity color fill.
+  if (!detailDims) {
+    if (GS) (doc as any).setGState(new GS({ opacity: 0.50 }));
+    drawPolygon(doc, p.outer, p.x, p.y, ox, oy, scale, 'F', orient);
+    if (GS) (doc as any).setGState(new GS({ opacity: 1 }));
+  }
   drawPolygon(doc, p.outer, p.x, p.y, ox, oy, scale, 'S', orient);
 
-  // Holes: fill white then stroke
+  // Holes: white fill + stroke on the job PDF; stroke only on the cutlist.
   doc.setFillColor(255, 255, 255);
   for (const hole of p.holes) {
-    drawPolygon(doc, hole, p.x, p.y, ox, oy, scale, 'F', orient);
-    doc.setDrawColor(Math.floor(r * 0.55), Math.floor(g * 0.55), Math.floor(b * 0.55));
+    if (!detailDims) drawPolygon(doc, hole, p.x, p.y, ox, oy, scale, 'F', orient);
+    if (detailDims) doc.setDrawColor(...CUT_OBJ_INK);
+    else doc.setDrawColor(Math.floor(r * 0.55), Math.floor(g * 0.55), Math.floor(b * 0.55));
     drawPolygon(doc, hole, p.x, p.y, ox, oy, scale, 'S', orient);
   }
 
@@ -1529,6 +1717,211 @@ function drawPart(
   const longMm = Math.max(p.w, p.h);
   const shortMm = Math.min(p.w, p.h);
   doc.setTextColor(20);
+
+  if (detailDims) {
+    // Mechanical-drawing dimensioning (SolidWorks-style): thin drafting-RED
+    // dim lines INSIDE the part spanning its display extents, slender 3:1
+    // arrowheads with tips on the part edges, and the value set in a GAP
+    // broken into the line — width text unidirectional, height text aligned
+    // with its line — so nothing strikes through and it reads over any
+    // fill. Every panel gets dims regardless of size: the export targets
+    // tablet viewing, so type may go tiny and the reader zooms.
+    // Every value registers its rect in `reg`; every line goes through
+    // brokenLine(reg) — that's what makes the gaps AND breaks any line that
+    // would strike through an earlier label on the page.
+    const reg: DimRegistry = labelReg ?? { rects: [], segs: [] };
+    const wLabel = fmtDim(r0.w, opt.units);
+    const hLabel = fmtDim(r0.h, opt.units);
+    doc.setDrawColor(...CUT_DIM_INK);
+    doc.setFillColor(...CUT_DIM_INK);
+    doc.setTextColor(...CUT_DIM_INK);
+    doc.setLineWidth(CUT_DIM_W);
+    doc.setFont('helvetica', 'normal');
+    // Type scales with the part; shrink further until neither value spills
+    // past its span into a neighbouring panel.
+    let fs = clamp(partPt * 0.16, 3.5, 8);
+    doc.setFontSize(fs);
+    while (fs > 2.6 && (doc.getTextWidth(wLabel) > pwPt - 4 || doc.getTextWidth(hLabel) > phPt - 4)) {
+      fs -= 0.4;
+      doc.setFontSize(fs);
+    }
+    const aLen = Math.min(4.5, pwPt * 0.22, phPt * 0.22);
+    const aW = aLen / 3;
+    // Strips too thin for a dim band per axis get NOTE dimensioning: the
+    // id + "W × H" set together in one gap on the strip's centerline, with
+    // the arrows spanning the long way. Standard practice for features too
+    // small to dimension in place.
+    const STRIP = 22;
+    const shortStrip = phPt < STRIP && pwPt >= phPt;
+    const narrowStrip = pwPt < STRIP && phPt > pwPt;
+    if (shortStrip || narrowStrip) {
+      const note = `${wLabel} × ${hLabel}`;
+      const runPt = shortStrip ? pwPt : phPt;   // extent along the strip
+      const acrossPt = shortStrip ? phPt : pwPt; // extent across the strip
+      let sfs = clamp(acrossPt * 0.55, 3, 7.5);
+      const idText = letter ?? '';
+      const measure = () => {
+        doc.setFont('helvetica', 'bold');
+        doc.setFontSize(sfs);
+        const idW = idText ? doc.getTextWidth(idText) + 6 : 0;
+        doc.setFont('helvetica', 'normal');
+        return { idW, noteW: doc.getTextWidth(note) };
+      };
+      let m = measure();
+      while (sfs > 2.6 && m.idW + m.noteW > runPt - 2 * aLen - 6) {
+        sfs -= 0.4;
+        m = measure();
+      }
+      const total = m.idW + m.noteW;
+      if (shortStrip) {
+        // Register the combined id+note rect FIRST — brokenLine then leaves
+        // the gap and skips any earlier label the run would strike through.
+        reg.rects.push({ x: cx - total / 2, y: cy - sfs * 0.55, w: total, h: sfs * 1.1 });
+        brokenLine(doc, px, cy, px + pwPt, cy, reg);
+        drawDimTri(doc, px, cy, +1, 0, aLen, aW);
+        drawDimTri(doc, px + pwPt, cy, -1, 0, aLen, aW);
+        const startX = cx - total / 2;
+        if (idText) {
+          doc.setFont('helvetica', 'bold');
+          doc.setTextColor(...CUT_OBJ_INK);
+          doc.text(idText, startX, cy + sfs * 0.35);
+        }
+        doc.setFont('helvetica', 'normal');
+        doc.setTextColor(...CUT_DIM_INK);
+        doc.text(note, startX + m.idW, cy + sfs * 0.35);
+      } else {
+        // Rotated run reads bottom-to-top along the vertical centerline.
+        reg.rects.push({ x: cx - sfs * 0.6, y: cy - total / 2, w: sfs * 1.1, h: total });
+        brokenLine(doc, cx, py, cx, py + phPt, reg);
+        drawDimTri(doc, cx, py, 0, +1, aLen, aW);
+        drawDimTri(doc, cx, py + phPt, 0, -1, aLen, aW);
+        const startY = cy + total / 2;
+        if (idText) {
+          doc.setFont('helvetica', 'bold');
+          doc.setTextColor(...CUT_OBJ_INK);
+          doc.text(idText, cx + sfs * 0.34, startY, { angle: 90 });
+        }
+        doc.setFont('helvetica', 'normal');
+        doc.setTextColor(...CUT_DIM_INK);
+        doc.text(note, cx + sfs * 0.34, startY - m.idW, { angle: 90 });
+      }
+      doc.setTextColor(0);
+      return;
+    }
+    const narrow = pwPt < 48;
+    // Simplified outline + holes in page pt — drive the dim-line material
+    // scan, the id-in-void guard and the concave/angle extras below.
+    const ring = partRingPt(p, ox, oy, scale, orient);
+    const isRect = ringIsRect(ring);
+    const holesPt = p.holes.map((h) => ringToPt(h, p.x, p.y, ox, oy, scale, orient));
+    const inMat = (x: number, y: number) =>
+      pointInRing(ring, x, y) && !holesPt.some((hh) => pointInRing(hh, x, y));
+    let hy = py + clamp(phPt * 0.18, 8, 16);
+    // Height dim runs down the CENTER of narrow panels — there is no room
+    // for a left-inset line plus rotated text without touching the edges.
+    let vx = narrow ? cx : px + clamp(pwPt * 0.18, 8, 16);
+    // Parts with notches or holes: the fixed inset can land the dim line
+    // (and its value) inside a hinge hole or a notch void — scan for the
+    // nearest position whose whole run sits on solid material. First pass
+    // demands clearance for the VALUE's glyph band too (so the label never
+    // lies on a hole/notch edge); tight parts fall back to line-only.
+    if (!isRect || holesPt.length > 0) {
+      const bandC = fs * 0.8;
+      const hyDef = hy;
+      const vxDef = vx;
+      const scoreH = (yy: number) =>
+        segMaterialScore(px + 2, yy, px + pwPt - 2, yy, ring, holesPt);
+      const scoreHBand = (yy: number) =>
+        Math.min(scoreH(yy - bandC), scoreH(yy), scoreH(yy + bandC));
+      const scoreV = (xx: number) =>
+        segMaterialScore(xx, py + 2, xx, py + phPt - 2, ring, holesPt);
+      const scoreVBand = (xx: number) =>
+        Math.min(scoreV(xx - bandC), scoreV(xx), scoreV(xx + bandC));
+      hy = bestDimLinePos(hyDef, py + 4, py + phPt - 4, scoreHBand);
+      if (scoreHBand(hy) < DIM_SCAN_SAMPLES) hy = bestDimLinePos(hyDef, py + 4, py + phPt - 4, scoreH);
+      vx = bestDimLinePos(vxDef, px + 4, px + pwPt - 4, scoreVBand);
+      if (scoreVBand(vx) < DIM_SCAN_SAMPLES) vx = bestDimLinePos(vxDef, px + 4, px + pwPt - 4, scoreV);
+    }
+    // Width dim — value registered first, so brokenLine leaves its gap.
+    const wTw = doc.getTextWidth(wLabel);
+    reg.rects.push(labelRectAt(cx, hy, wTw, fs, 0));
+    brokenLine(doc, px, hy, px + pwPt, hy, reg);
+    drawDimTri(doc, px, hy, +1, 0, aLen, aW);
+    drawDimTri(doc, px + pwPt, hy, -1, 0, aLen, aW);
+    doc.text(wLabel, cx, hy + fs * 0.35, { align: 'center' });
+    // Height dim — vertical line broken around the rotated value.
+    const hTw = doc.getTextWidth(hLabel);
+    reg.rects.push(labelRectAt(vx, cy, hTw, fs, 90));
+    brokenLine(doc, vx, py, vx, py + phPt, reg);
+    drawDimTri(doc, vx, py, 0, +1, aLen, aW);
+    drawDimTri(doc, vx, py + phPt, 0, -1, aLen, aW);
+    // Default (left) align: with angle 90 the run starts at the anchor and
+    // reads upward, so start it at cy + textW/2 to center on the gap.
+    // NEVER pair align:'center' with angle — jsPDF shifts the rotated text
+    // by -textW/2 along the UNROTATED x-axis, dragging it off the line.
+    doc.text(hLabel, vx + fs * 0.34, cy + hTw / 2, { angle: 90 });
+    // Panel id — bold near-black (a part LABEL, not a dimension), kept clear
+    // of both dim bands: centered for wide panels; upper-middle for narrow
+    // ones (their height dim owns the vertical centerline).
+    if (letter) {
+      doc.setTextColor(...CUT_OBJ_INK);
+      doc.setFont('helvetica', 'bold');
+      const idFs = clamp(partPt * 0.2, 5, 12);
+      doc.setFontSize(idFs);
+      let idX = cx;
+      let idY = narrow
+        ? clamp(py + phPt * 0.30, hy + idFs + 2, cy - hTw / 2 - 4)
+        : cy + idFs * 0.34;
+      // Concave/holed outlines: the bbox center may fall in a notch void or
+      // a hole — move the id to the polygon centroid when it does (fail
+      // soft if the centroid is off material too, e.g. extreme L's).
+      if ((!isRect || holesPt.length > 0) && !inMat(idX, idY - idFs * 0.35)) {
+        const c = ringCentroid(ring);
+        if (inMat(c[0], c[1])) {
+          idX = c[0];
+          idY = c[1] + idFs * 0.35;
+        }
+      }
+      doc.text(letter, idX, idY, { align: 'center' });
+      reg.rects.push(labelRectAt(idX, idY - idFs * 0.35, doc.getTextWidth(letter), idFs, 0));
+      // Panel NAME under the id — tells the reader where this piece goes in
+      // the finished build ("side_left", "top", …). Skipped on narrow/short
+      // panels (no room; the panel tables carry the name there).
+      const name = (p.partName ?? '').trim();
+      if (name && !narrow && phPt >= 30) {
+        doc.setFont('helvetica', 'normal');
+        let nfs = clamp(idFs * 0.55, 3, 7);
+        doc.setFontSize(nfs);
+        const ny = () => idY + nfs + 3;
+        // Must fit the panel width AND, on concave/holed outlines, stay on
+        // material (not stretch across a notch void or a hole).
+        const fits = () => {
+          const w = doc.getTextWidth(name);
+          if (w > pwPt - 6) return false;
+          if (isRect && holesPt.length === 0) return true;
+          const yq = ny() - nfs * 0.35;
+          return inMat(idX - w / 2, yq) && inMat(idX + w / 2, yq);
+        };
+        while (nfs > 2.6 && !fits()) {
+          nfs -= 0.4;
+          doc.setFontSize(nfs);
+        }
+        if (fits()) {
+          doc.setTextColor(90);
+          doc.text(name, idX, ny(), { align: 'center' });
+          reg.rects.push(labelRectAt(idX, ny() - nfs * 0.35, doc.getTextWidth(name), nfs, 0));
+          doc.setTextColor(...CUT_OBJ_INK);
+        }
+        doc.setFont('helvetica', 'bold');
+      }
+    }
+    // Non-rectangular outlines (L-shapes, notches, bevels) additionally get
+    // per-edge dims on every edge off the bbox perimeter and angle dims at
+    // every non-square corner.
+    if (!isRect) drawOutlineDetailDims(doc, ring, scale, opt, fs, aLen, reg, otherRects, sheetBox);
+    doc.setTextColor(0);
+    return;
+  }
 
   // One label block INSIDE the part: panel id ("1a") with the dimensions
   // stacked underneath — same convention as the cut cards. No dim lines or
@@ -1553,6 +1946,272 @@ function drawPart(
     }
   }
   void sheetBox;
+}
+
+// ---------------------------------------------------------------------------
+// Cutlist extras for NON-RECTANGULAR outlines (L-shapes, notches, bevels):
+//   - every simplified outline edge NOT lying on the part's bbox perimeter
+//     gets its own aligned length dim (the bbox W/H dims stay);
+//   - every corner whose interior angle isn't square (90°, or 270° at an
+//     inside notch corner) gets a small angle arc + degree value.
+// All in the thin red dim ink. Dims prefer the free waste space just OUTSIDE
+// the feature (classic witness-line style); when a neighbouring panel sits
+// there, they fall back to a gap-in-line dim INSIDE the material.
+// ---------------------------------------------------------------------------
+function drawOutlineDetailDims(
+  doc: jsPDF,
+  ring: [number, number][],
+  scale: number,
+  opt: PdfOptions,
+  fs: number,
+  aLen: number,
+  reg: DimRegistry,
+  otherRects?: LabelRect[],
+  sheetBox?: { x: number; y: number; w: number; h: number },
+) {
+  const n = ring.length;
+  if (n < 3) return;
+  const xs = ring.map((q) => q[0]);
+  const ys = ring.map((q) => q[1]);
+  const minX = Math.min(...xs);
+  const maxX = Math.max(...xs);
+  const minY = Math.min(...ys);
+  const maxY = Math.max(...ys);
+  const EPS = 0.35;
+
+  doc.setFont('helvetica', 'normal');
+  doc.setDrawColor(...CUT_DIM_INK);
+  doc.setFillColor(...CUT_DIM_INK);
+  doc.setTextColor(...CUT_DIM_INK);
+  doc.setLineWidth(CUT_DIM_W);
+  const efs = clamp(fs, 2.8, 6.5);
+
+  // ---- Edge dims for every edge off the bbox perimeter -------------------
+  for (let i = 0; i < n; i++) {
+    const [axP, ayP] = ring[i];
+    const [bxP, byP] = ring[(i + 1) % n];
+    const onPerim =
+      (Math.abs(axP - minX) < EPS && Math.abs(bxP - minX) < EPS) ||
+      (Math.abs(axP - maxX) < EPS && Math.abs(bxP - maxX) < EPS) ||
+      (Math.abs(ayP - minY) < EPS && Math.abs(byP - minY) < EPS) ||
+      (Math.abs(ayP - maxY) < EPS && Math.abs(byP - maxY) < EPS);
+    if (onPerim) continue;
+    const ex = bxP - axP;
+    const ey = byP - ayP;
+    const eLen = Math.hypot(ex, ey);
+    if (eLen < 2.5) continue; // invisible at page scale — skip
+    const ux = ex / eLen;
+    const uy = ey / eLen;
+    const mx = (axP + bxP) / 2;
+    const my = (ayP + byP) / 2;
+    // Material side via point-in-ring probe just off the edge midpoint.
+    let inx = -uy;
+    let iny = ux;
+    const probe = Math.max(0.8, Math.min(2, eLen * 0.2));
+    if (!pointInRing(ring, mx + inx * probe, my + iny * probe)) {
+      inx = -inx;
+      iny = -iny;
+    }
+    const outx = -inx;
+    const outy = -iny;
+    const label = fmtDim(eLen / scale, opt.units);
+    let lfs = efs;
+    doc.setFontSize(lfs);
+    while (lfs > 2.6 && doc.getTextWidth(label) > eLen - 2) {
+      lfs -= 0.4;
+      doc.setFontSize(lfs);
+    }
+    // Reading angle along the edge, normalized so text is never upside-down.
+    let A = (Math.atan2(-ey, ex) * 180) / Math.PI;
+    if (A > 90) A -= 180;
+    else if (A <= -90) A += 180;
+    // Keep arrowheads legible: full size when they fit between the ends,
+    // flipped OUTSIDE (standard small-dimension practice) when they don't —
+    // never shrunk into invisibility.
+    const aE = aLen;
+    const arrW = aE / 3;
+    const arrowsInside = eLen >= 2 * aE + 4;
+    // Is the waste band just outside the edge actually free? (inside sheet,
+    // no neighbouring panel bbox in the way)
+    const OFF = clamp(eLen * 0.35, 5, 8);
+    const bandR = OFF + lfs + 3;
+    const bandPts = [
+      [axP + outx, ayP + outy],
+      [bxP + outx, byP + outy],
+      [axP + outx * bandR, ayP + outy * bandR],
+      [bxP + outx * bandR, byP + outy * bandR],
+    ];
+    const bMinX = Math.min(...bandPts.map((q) => q[0]));
+    const bMaxX = Math.max(...bandPts.map((q) => q[0]));
+    const bMinY = Math.min(...bandPts.map((q) => q[1]));
+    const bMaxY = Math.max(...bandPts.map((q) => q[1]));
+    const band: LabelRect = { x: bMinX, y: bMinY, w: bMaxX - bMinX, h: bMaxY - bMinY };
+    const inSheet =
+      !sheetBox ||
+      (band.x >= sheetBox.x && band.y >= sheetBox.y &&
+        band.x + band.w <= sheetBox.x + sheetBox.w &&
+        band.y + band.h <= sheetBox.y + sheetBox.h);
+    const free = inSheet && !(otherRects ?? []).some((rct) => rectsOverlap(band, rct));
+    if (free) {
+      // Witness-line style in the waste: short extension lines off the edge
+      // (1.5pt clear of it, 2pt past the dim line), thin red dim line with
+      // small arrows between them, value above the line.
+      doc.line(axP + outx * 1.5, ayP + outy * 1.5, axP + outx * (OFF + 2), ayP + outy * (OFF + 2));
+      doc.line(bxP + outx * 1.5, byP + outy * 1.5, bxP + outx * (OFF + 2), byP + outy * (OFF + 2));
+      reg.segs.push({ x1: axP + outx * 1.5, y1: ayP + outy * 1.5, x2: axP + outx * (OFF + 2), y2: ayP + outy * (OFF + 2) });
+      reg.segs.push({ x1: bxP + outx * 1.5, y1: byP + outy * 1.5, x2: bxP + outx * (OFF + 2), y2: byP + outy * (OFF + 2) });
+      const a2x = axP + outx * OFF;
+      const a2y = ayP + outy * OFF;
+      const b2x = bxP + outx * OFF;
+      const b2y = byP + outy * OFF;
+      // Value sits on the far side of the dim line (its ascent side),
+      // slid further along it if something already occupies the spot.
+      const rad = (A * Math.PI) / 180;
+      const defX = (a2x + b2x) / 2 - Math.sin(rad) * (lfs * 0.62 + 1);
+      const defY = (a2y + b2y) / 2 - Math.cos(rad) * (lfs * 0.62 + 1);
+      const tPos = slideLabelClear(
+        reg, defX, defY, doc.getTextWidth(label), lfs, A,
+        -Math.sin(rad), -Math.cos(rad),
+      );
+      reg.rects.push(placeAlignedText(doc, label, tPos.x, tPos.y, lfs, A));
+      // When the value had to move well away from its line, tie it back
+      // with a thin leader (clips out of the label rect automatically).
+      if (Math.hypot(tPos.x - defX, tPos.y - defY) > lfs * 2.5) {
+        brokenLine(doc, tPos.x, tPos.y, (a2x + b2x) / 2, (a2y + b2y) / 2, reg);
+      }
+      brokenLine(doc, a2x, a2y, b2x, b2y, reg);
+      // Standard drafting: arrows go between the extension lines when they
+      // fit; on small dimensions they flip OUTSIDE, pointing inward, with
+      // short tails past the extension lines.
+      if (arrowsInside) {
+        drawDimTriDir(doc, a2x, a2y, ux, uy, aE, arrW);
+        drawDimTriDir(doc, b2x, b2y, -ux, -uy, aE, arrW);
+      } else {
+        const tail = aE + 2.5;
+        doc.line(a2x, a2y, a2x - ux * tail, a2y - uy * tail);
+        doc.line(b2x, b2y, b2x + ux * tail, b2y + uy * tail);
+        reg.segs.push({ x1: a2x, y1: a2y, x2: a2x - ux * tail, y2: a2y - uy * tail });
+        reg.segs.push({ x1: b2x, y1: b2y, x2: b2x + ux * tail, y2: b2y + uy * tail });
+        drawDimTriDir(doc, a2x, a2y, -ux, -uy, aE, arrW);
+        drawDimTriDir(doc, b2x, b2y, ux, uy, aE, arrW);
+      }
+    } else {
+      // Inside fallback: aligned dim line inset into the material with the
+      // value in a gap broken into the line — same idiom as the W/H dims.
+      // If the midpoint is taken (earlier label/line), the value slides
+      // ALONG the line so the gap-in-line look survives.
+      const OFFIN = clamp(eLen * 0.18, 3.5, 7);
+      const a2x = axP + inx * OFFIN;
+      const a2y = ayP + iny * OFFIN;
+      const b2x = bxP + inx * OFFIN;
+      const b2y = byP + iny * OFFIN;
+      const tw = doc.getTextWidth(label);
+      const tPos = slideLabelClear(reg, (a2x + b2x) / 2, (a2y + b2y) / 2, tw, lfs, A, ux, uy);
+      reg.rects.push(labelRectAt(tPos.x, tPos.y, tw, lfs, A));
+      brokenLine(doc, a2x, a2y, b2x, b2y, reg);
+      if (arrowsInside) {
+        drawDimTriDir(doc, a2x, a2y, ux, uy, aE, arrW);
+        drawDimTriDir(doc, b2x, b2y, -ux, -uy, aE, arrW);
+      } else {
+        const tail = aE + 2.5;
+        doc.line(a2x, a2y, a2x - ux * tail, a2y - uy * tail);
+        doc.line(b2x, b2y, b2x + ux * tail, b2y + uy * tail);
+        reg.segs.push({ x1: a2x, y1: a2y, x2: a2x - ux * tail, y2: a2y - uy * tail });
+        reg.segs.push({ x1: b2x, y1: b2y, x2: b2x + ux * tail, y2: b2y + uy * tail });
+        drawDimTriDir(doc, a2x, a2y, -ux, -uy, aE, arrW);
+        drawDimTriDir(doc, b2x, b2y, ux, uy, aE, arrW);
+      }
+    }
+  }
+
+  // ---- Angle dims at non-square corners -----------------------------------
+  for (let i = 0; i < n; i++) {
+    const [pxP, pyP] = ring[(i - 1 + n) % n];
+    const [vx, vy] = ring[i];
+    const [nxP, nyP] = ring[(i + 1) % n];
+    const lenA = Math.hypot(pxP - vx, pyP - vy);
+    const lenB = Math.hypot(nxP - vx, nyP - vy);
+    if (Math.min(lenA, lenB) < 4) continue; // too tiny to annotate
+    const uax = (pxP - vx) / lenA;
+    const uay = (pyP - vy) / lenA;
+    const ubx = (nxP - vx) / lenB;
+    const uby = (nyP - vy) / lenB;
+    const raw = (Math.acos(clamp(uax * ubx + uay * uby, -1, 1)) * 180) / Math.PI;
+    // Bisector of the raw (≤180°) angle; interior is whichever side of the
+    // corner the material actually lies on.
+    let bx = uax + ubx;
+    let by = uay + uby;
+    const bl = Math.hypot(bx, by);
+    if (bl < 1e-6) continue; // straight edge — simplify removed these anyway
+    bx /= bl;
+    by /= bl;
+    const probe = Math.max(0.6, Math.min(1.5, Math.min(lenA, lenB) * 0.1));
+    let interior = raw;
+    if (!pointInRing(ring, vx + bx * probe, vy + by * probe)) {
+      interior = 360 - raw;
+      bx = -bx;
+      by = -by;
+    }
+    // Square corners — plain 90° or a square inside-notch corner (270°) —
+    // get nothing, per drafting convention.
+    if (Math.abs(interior - 90) <= 0.5 || Math.abs(interior - 270) <= 0.5) continue;
+    const rArc = clamp(Math.min(lenA, lenB) * 0.4, 3.5, 10);
+    // Degree value just outside the arc's midpoint, along the bisector.
+    const afs = clamp(efs * 0.9, 2.8, 6);
+    doc.setFontSize(afs);
+    const angLabel =
+      Math.abs(interior - Math.round(interior)) < 0.05
+        ? `${Math.round(interior)}°`
+        : `${interior.toFixed(1)}°`;
+    // Slide the value further along the bisector when the first spot is
+    // already taken by an earlier label or dim line.
+    const defLx = vx + bx * (rArc + afs * 0.8 + 1.5);
+    const defLy = vy + by * (rArc + afs * 0.8 + 1.5);
+    const lPos = slideLabelClear(reg, defLx, defLy, doc.getTextWidth(angLabel), afs, 0, bx, by);
+    reg.rects.push(placeAlignedText(doc, angLabel, lPos.x, lPos.y, afs, 0));
+    // Far-slid value → leader back to the arc midpoint.
+    if (Math.hypot(lPos.x - defLx, lPos.y - defLy) > afs * 2.5) {
+      brokenLine(doc, lPos.x, lPos.y, vx + bx * rArc, vy + by * rArc, reg);
+    }
+    // Arc between the two edges, swept through the interior bisector.
+    const TWO_PI = 2 * Math.PI;
+    const angA = Math.atan2(uay, uax);
+    const angB = Math.atan2(uby, ubx);
+    const angM = Math.atan2(by, bx);
+    const ccw = (angB - angA + TWO_PI) % TWO_PI;
+    const mOff = (angM - angA + TWO_PI) % TWO_PI;
+    const sweep = mOff <= ccw ? ccw : -(TWO_PI - ccw);
+    const steps = Math.max(6, Math.ceil(Math.abs((sweep * 180) / Math.PI) / 12));
+    let prevX = vx + Math.cos(angA) * rArc;
+    let prevY = vy + Math.sin(angA) * rArc;
+    for (let s = 1; s <= steps; s++) {
+      const t = angA + (sweep * s) / steps;
+      const cxA = vx + Math.cos(t) * rArc;
+      const cyA = vy + Math.sin(t) * rArc;
+      brokenLine(doc, prevX, prevY, cxA, cyA, reg);
+      prevX = cxA;
+      prevY = cyA;
+    }
+    // Arrowheads at both arc ends, tangent to the arc (standard angular
+    // dimensioning) — skipped on arcs too small to carry them.
+    const sgn = sweep >= 0 ? 1 : -1;
+    const aA = Math.min(aLen * 0.9, rArc * 0.55, Math.abs(sweep) * rArc * 0.4);
+    if (aA >= 1.6) {
+      const angE = angA + sweep;
+      drawDimTriDir(
+        doc,
+        vx + Math.cos(angA) * rArc, vy + Math.sin(angA) * rArc,
+        -Math.sin(angA) * sgn, Math.cos(angA) * sgn,
+        aA, aA / 3,
+      );
+      drawDimTriDir(
+        doc,
+        vx + Math.cos(angE) * rArc, vy + Math.sin(angE) * rArc,
+        Math.sin(angE) * sgn, -Math.cos(angE) * sgn,
+        aA, aA / 3,
+      );
+    }
+  }
 }
 
 function clamp(v: number, lo: number, hi: number): number {
@@ -1611,55 +2270,78 @@ const DIM_TEXT_PT = 8;
 const DIM_WITNESS_OVER = 5;
 const DIM_WITNESS_GAP = 1.5;
 
-function drawDimH(doc: jsPDF, x1: number, x2: number, y: number, label: string) {
-  doc.setDrawColor(...DIM_COLOR);
-  doc.setLineWidth(DIM_LINE_W);
+// Cutlist (detailDims) drawing palette — SolidWorks-style mechanical drawing:
+// every dimension element (lines, witness lines, arrowheads, arcs, values)
+// in drafting RED over near-BLACK object lines. The faint per-part fill
+// tint keeps carrying panel identity; strokes don't.
+// EXTRA-FINE line weights (user preference): the thick-thin drafting
+// hierarchy survives (object ≈ 2.8 × dim), but everything is much lighter
+// than classic print weights — the iPad reader zooms anyway.
+const CUT_DIM_INK: [number, number, number] = [200, 30, 30];
+const CUT_OBJ_INK: [number, number, number] = [25, 25, 25];
+const CUT_OBJ_W = 0.4;   // part outline (object line) weight — near-hairline
+const CUT_STOCK_W = 0.8; // sheet (stock boundary) weight
+const CUT_DIM_W = 0.25;  // dimension line weight
+
+function drawDimH(
+  doc: jsPDF, x1: number, x2: number, y: number, label: string,
+  ink: [number, number, number] = DIM_COLOR, lineW = DIM_LINE_W,
+) {
+  doc.setDrawColor(...ink);
+  doc.setLineWidth(lineW);
   // Witness lines from the object edge across the dim line
   doc.line(x1, y - DIM_WITNESS_OVER - 2, x1, y + DIM_WITNESS_GAP);
   doc.line(x2, y - DIM_WITNESS_OVER - 2, x2, y + DIM_WITNESS_GAP);
   // Dim line
   doc.line(x1, y, x2, y);
   // Inward-pointing triangular arrowheads
-  doc.setFillColor(...DIM_COLOR);
+  doc.setFillColor(...ink);
   drawDimTri(doc, x1, y, +1, 0);
   drawDimTri(doc, x2, y, -1, 0);
   // Horizontal label centered above the dim line
-  doc.setTextColor(...DIM_COLOR);
+  doc.setTextColor(...ink);
   doc.setFont('helvetica', 'normal');
   doc.setFontSize(DIM_TEXT_PT);
   doc.text(label, (x1 + x2) / 2, y - 3, { align: 'center' });
   doc.setTextColor(0);
 }
 
-function drawDimV(doc: jsPDF, y1: number, y2: number, x: number, label: string) {
-  doc.setDrawColor(...DIM_COLOR);
-  doc.setLineWidth(DIM_LINE_W);
+function drawDimV(
+  doc: jsPDF, y1: number, y2: number, x: number, label: string,
+  ink: [number, number, number] = DIM_COLOR, lineW = DIM_LINE_W,
+) {
+  doc.setDrawColor(...ink);
+  doc.setLineWidth(lineW);
   // Witness lines
   doc.line(x - DIM_WITNESS_GAP, y1, x + DIM_WITNESS_OVER + 2, y1);
   doc.line(x - DIM_WITNESS_GAP, y2, x + DIM_WITNESS_OVER + 2, y2);
   doc.line(x, y1, x, y2);
-  doc.setFillColor(...DIM_COLOR);
+  doc.setFillColor(...ink);
   drawDimTri(doc, x, y1, 0, +1);
   drawDimTri(doc, x, y2, 0, -1);
   // Vertical text: rotated 90° beside the dim line
-  doc.setTextColor(...DIM_COLOR);
+  doc.setTextColor(...ink);
   doc.setFont('helvetica', 'normal');
   doc.setFontSize(DIM_TEXT_PT);
   doc.text(label, x - 4, (y1 + y2) / 2, { align: 'center', angle: 90 });
   doc.setTextColor(0);
 }
 
-/** Small filled triangle at (x, y) pointing in (dx, dy). */
-function drawDimTri(doc: jsPDF, x: number, y: number, dx: number, dy: number) {
+/** Small filled triangle at (x, y) pointing in (dx, dy). Arrow size is
+ *  overridable so in-panel dims on tiny parts can shrink to fit. */
+function drawDimTri(
+  doc: jsPDF, x: number, y: number, dx: number, dy: number,
+  len = DIM_ARROW_LEN, w = DIM_ARROW_W,
+) {
   let p1: [number, number], p2: [number, number], p3: [number, number];
   if (dx !== 0) {
     p1 = [x, y];
-    p2 = [x + dx * DIM_ARROW_LEN, y - DIM_ARROW_W];
-    p3 = [x + dx * DIM_ARROW_LEN, y + DIM_ARROW_W];
+    p2 = [x + dx * len, y - w];
+    p3 = [x + dx * len, y + w];
   } else {
     p1 = [x, y];
-    p2 = [x - DIM_ARROW_W, y + dy * DIM_ARROW_LEN];
-    p3 = [x + DIM_ARROW_W, y + dy * DIM_ARROW_LEN];
+    p2 = [x - w, y + dy * len];
+    p3 = [x + w, y + dy * len];
   }
   // jsPDF.lines uses relative coords + close=true
   const lines: [number, number][] = [
@@ -1668,6 +2350,332 @@ function drawDimTri(doc: jsPDF, x: number, y: number, dx: number, dy: number) {
     [p1[0] - p3[0], p1[1] - p3[1]],
   ];
   doc.lines(lines, p1[0], p1[1], [1, 1], 'F', true);
+}
+
+/** Like drawDimTri but for an ARBITRARY direction: filled triangle with the
+ *  tip at (x, y), body extending along unit vector (ux, uy). Used by the
+ *  aligned edge dims on angled outline edges. */
+function drawDimTriDir(
+  doc: jsPDF, x: number, y: number, ux: number, uy: number, len: number, w: number,
+) {
+  const bx = x + ux * len;
+  const by = y + uy * len;
+  const px = -uy; // perpendicular
+  const py = ux;
+  const p2: [number, number] = [bx + px * w, by + py * w];
+  const p3: [number, number] = [bx - px * w, by - py * w];
+  const lines: [number, number][] = [
+    [p2[0] - x, p2[1] - y],
+    [p3[0] - p2[0], p3[1] - p2[1]],
+    [x - p3[0], y - p3[1]],
+  ];
+  doc.lines(lines, x, y, [1, 1], 'F', true);
+}
+
+// ---------------------------------------------------------------------------
+// Cutlist label registry + broken dimension lines.
+// Every dimension VALUE (and panel id) placed on a cutlist page registers the
+// page-pt rectangle it occupies; every dimension line is then drawn through
+// brokenLine(), which skips the stretch crossing any registered rect (plus a
+// small pad). Registering a label BEFORE drawing its own line is what creates
+// the classic gap-in-line look — and lines of later panels automatically
+// break around labels of earlier ones. The registry lives per drawSheet call,
+// i.e. resets on every cutlist page.
+// ---------------------------------------------------------------------------
+type LabelRect = { x: number; y: number; w: number; h: number };
+type DimSeg = { x1: number; y1: number; x2: number; y2: number };
+/** Per-PAGE record of what dimensioning already sits on the page: label
+ *  rects (dim values, panel ids, strip notes) and drawn dim-line segments.
+ *  Lines break around earlier rects; later labels slide clear of earlier
+ *  rects AND lines (a line already on the page can't retro-break). */
+type DimRegistry = { rects: LabelRect[]; segs: DimSeg[] };
+
+const LABEL_PAD = 2; // pt of clear space kept around each label
+
+/** Liang–Barsky: [t0, t1] parameter interval where the segment crosses the
+ *  rect inflated by pad, or null if it misses. */
+function segRectInterval(
+  x1: number, y1: number, dx: number, dy: number, r: LabelRect, pad: number,
+): [number, number] | null {
+  const q = [x1 - (r.x - pad), (r.x + r.w + pad) - x1, y1 - (r.y - pad), (r.y + r.h + pad) - y1];
+  const p = [-dx, dx, -dy, dy];
+  let t0 = 0;
+  let t1 = 1;
+  for (let i = 0; i < 4; i++) {
+    if (p[i] === 0) {
+      if (q[i] < 0) return null;
+    } else {
+      const t = q[i] / p[i];
+      if (p[i] < 0) {
+        if (t > t1) return null;
+        if (t > t0) t0 = t;
+      } else {
+        if (t < t0) return null;
+        if (t < t1) t1 = t;
+      }
+    }
+  }
+  return t1 > t0 ? [t0, t1] : null;
+}
+
+function segHitsRect(s: DimSeg, r: LabelRect, pad: number): boolean {
+  return segRectInterval(s.x1, s.y1, s.x2 - s.x1, s.y2 - s.y1, r, pad) !== null;
+}
+
+/** Slide a prospective label (centered at cx,cy, reading angle A) along
+ *  (dx, dy) until it clears every registered rect and drawn dim line. */
+function slideLabelClear(
+  reg: DimRegistry, cx: number, cy: number, tw: number, fs: number, A: number,
+  dx: number, dy: number,
+): { x: number; y: number } {
+  const step = Math.max(2, fs * 0.9);
+  for (let k = 0; k < 8; k++) {
+    const r = labelRectAt(cx, cy, tw, fs, A);
+    const hit =
+      reg.rects.some((q) => rectsOverlap(r, q)) ||
+      reg.segs.some((s) => segHitsRect(s, r, 1));
+    if (!hit) break;
+    cx += dx * step;
+    cy += dy * step;
+  }
+  return { x: cx, y: cy };
+}
+
+/** Draw segment (x1,y1)→(x2,y2) minus its intersections with the inflated
+ *  label rects (Liang–Barsky clip per rect, intervals merged), and record
+ *  the ORIGINAL segment so later labels can dodge it. */
+function brokenLine(
+  doc: jsPDF, x1: number, y1: number, x2: number, y2: number,
+  reg?: DimRegistry, pad = LABEL_PAD,
+) {
+  if (!reg) { doc.line(x1, y1, x2, y2); return; }
+  reg.segs.push({ x1, y1, x2, y2 });
+  const dx = x2 - x1;
+  const dy = y2 - y1;
+  const len = Math.hypot(dx, dy);
+  if (len < 0.01) return;
+  const cuts: [number, number][] = [];
+  for (const r of reg.rects) {
+    const iv = segRectInterval(x1, y1, dx, dy, r, pad);
+    if (iv) cuts.push(iv);
+  }
+  if (cuts.length === 0) { doc.line(x1, y1, x2, y2); return; }
+  cuts.sort((a, b) => a[0] - b[0]);
+  const merged: [number, number][] = [];
+  for (const c of cuts) {
+    const last = merged[merged.length - 1];
+    if (last && c[0] <= last[1]) last[1] = Math.max(last[1], c[1]);
+    else merged.push([c[0], c[1]]);
+  }
+  const MIN_SEG = 0.6; // pt — drop invisible slivers
+  let t = 0;
+  for (const [a, b] of merged) {
+    if ((a - t) * len > MIN_SEG) doc.line(x1 + dx * t, y1 + dy * t, x1 + dx * a, y1 + dy * a);
+    t = Math.max(t, b);
+  }
+  if ((1 - t) * len > MIN_SEG) doc.line(x1 + dx * t, y1 + dy * t, x2, y2);
+}
+
+/** AABB occupied by a label of text-width tw / font-size fs whose glyph run
+ *  is CENTERED at (cx, cy) reading at jsPDF angle A (degrees, visually CCW).
+ *  A = 0 → horizontal, A = 90 → reads bottom-to-top. */
+function labelRectAt(cx: number, cy: number, tw: number, fs: number, A: number): LabelRect {
+  const rad = (A * Math.PI) / 180;
+  // Reading direction and ascent direction in page (y-down) coords.
+  const dx = Math.cos(rad);
+  const dy = -Math.sin(rad);
+  const axx = -Math.sin(rad);
+  const axy = -Math.cos(rad);
+  const hw = tw / 2;
+  const hh = fs * 0.55;
+  const ex = Math.abs(dx) * hw + Math.abs(axx) * hh;
+  const ey = Math.abs(dy) * hw + Math.abs(axy) * hh;
+  return { x: cx - ex, y: cy - ey, w: 2 * ex, h: 2 * ey };
+}
+
+/** Set `label` so its glyph run is centered at (cx, cy) reading at angle A.
+ *  Uses DEFAULT (left) align with a hand-computed anchor — NEVER pair
+ *  align:'center' with angle: jsPDF shifts rotated text by -textW/2 along
+ *  the UNROTATED x-axis (see the vertical-dim comment in drawPart). The
+ *  baseline sits 0.35·fs on the descent side so glyphs center on the line. */
+function placeAlignedText(
+  doc: jsPDF, label: string, cx: number, cy: number, fs: number, A: number,
+): LabelRect {
+  const tw = doc.getTextWidth(label);
+  const rad = (A * Math.PI) / 180;
+  const dx = Math.cos(rad);
+  const dy = -Math.sin(rad);
+  const ax = cx - dx * (tw / 2) + Math.sin(rad) * fs * 0.35;
+  const ay = cy - dy * (tw / 2) + Math.cos(rad) * fs * 0.35;
+  if (Math.abs(A) < 0.01) doc.text(label, cx - tw / 2, cy + fs * 0.35);
+  else doc.text(label, ax, ay, { angle: A });
+  return labelRectAt(cx, cy, tw, fs, A);
+}
+
+/** Drop duplicate + collinear points from a polygon ring (page-pt coords). */
+function simplifyRing(pts: [number, number][]): [number, number][] {
+  const EPS_DUP = 0.1;
+  const EPS_COL = 0.3; // max perpendicular deviation counted as collinear
+  let out = pts.slice();
+  if (out.length > 1) {
+    const a = out[0];
+    const b = out[out.length - 1];
+    if (Math.hypot(a[0] - b[0], a[1] - b[1]) < EPS_DUP) out = out.slice(0, -1);
+  }
+  // Dedup consecutive
+  out = out.filter((p, i) => {
+    const prev = out[(i - 1 + out.length) % out.length];
+    return i === 0 || Math.hypot(p[0] - prev[0], p[1] - prev[1]) >= EPS_DUP;
+  });
+  // Drop collinear vertices (perp distance from the vertex to prev→next chord)
+  let changed = true;
+  while (changed && out.length > 3) {
+    changed = false;
+    for (let i = 0; i < out.length; i++) {
+      const p = out[(i - 1 + out.length) % out.length];
+      const v = out[i];
+      const n = out[(i + 1) % out.length];
+      const cx = n[0] - p[0];
+      const cy = n[1] - p[1];
+      const clen = Math.hypot(cx, cy);
+      if (clen < EPS_DUP) continue;
+      const d = Math.abs((v[0] - p[0]) * cy - (v[1] - p[1]) * cx) / clen;
+      if (d < EPS_COL) {
+        out.splice(i, 1);
+        changed = true;
+        break;
+      }
+    }
+  }
+  return out;
+}
+
+/** Even-odd ray-cast point-in-polygon. */
+function pointInRing(pts: [number, number][], x: number, y: number): boolean {
+  let inside = false;
+  for (let i = 0, j = pts.length - 1; i < pts.length; j = i++) {
+    const [xi, yi] = pts[i];
+    const [xj, yj] = pts[j];
+    if (yi > y !== yj > y && x < ((xj - xi) * (y - yi)) / (yj - yi) + xi) inside = !inside;
+  }
+  return inside;
+}
+
+function rectsOverlap(a: LabelRect, b: LabelRect): boolean {
+  return a.x < b.x + b.w && a.x + a.w > b.x && a.y < b.y + b.h && a.y + a.h > b.y;
+}
+
+/** A part-local ring transformed to page pt (same mapping as drawPolygon),
+ *  simplified (duplicates + collinear points dropped). */
+function ringToPt(
+  ring: [number, number][], offX: number, offY: number,
+  ox: number, oy: number, scale: number, orient: Orient,
+): [number, number][] {
+  const raw: [number, number][] = ring.map(([x, y]) => {
+    const sx = x + offX;
+    const sy = y + offY;
+    return orient.rotated
+      ? [ox + sy * scale, oy + sx * scale]
+      : [ox + sx * scale, oy + sy * scale];
+  });
+  return simplifyRing(raw);
+}
+
+function partRingPt(
+  p: PlacedPart, ox: number, oy: number, scale: number, orient: Orient,
+): [number, number][] {
+  return ringToPt(p.outer, p.x, p.y, ox, oy, scale, orient);
+}
+
+/** How much of a segment lies on solid material: -1 (unusable) when the run
+ *  crosses any hole (exact bbox test — point sampling can miss a narrow
+ *  hinge slot), else the count of sample points inside the outline. */
+const DIM_SCAN_SAMPLES = 9;
+function segMaterialScore(
+  x1: number, y1: number, x2: number, y2: number,
+  outer: [number, number][], holes: [number, number][][],
+): number {
+  const dx = x2 - x1;
+  const dy = y2 - y1;
+  for (const h of holes) {
+    const hx = h.map((q) => q[0]);
+    const hyv = h.map((q) => q[1]);
+    const r: LabelRect = {
+      x: Math.min(...hx),
+      y: Math.min(...hyv),
+      w: Math.max(...hx) - Math.min(...hx),
+      h: Math.max(...hyv) - Math.min(...hyv),
+    };
+    if (segRectInterval(x1, y1, dx, dy, r, 1) !== null) return -1;
+  }
+  let hits = 0;
+  for (let i = 0; i < DIM_SCAN_SAMPLES; i++) {
+    const t = (i + 0.5) / DIM_SCAN_SAMPLES;
+    if (pointInRing(outer, x1 + dx * t, y1 + dy * t)) hits++;
+  }
+  return hits;
+}
+
+/** Pick a dimension-line position: keep the default when its whole run is
+ *  on material; otherwise walk outward (forward first, then backward) and
+ *  return the first fully-on-material position, or the best-scoring one. */
+function bestDimLinePos(
+  def: number, lo: number, hi: number, score: (v: number) => number,
+): number {
+  let bestV = def;
+  let bestS = score(def);
+  if (bestS >= DIM_SCAN_SAMPLES) return def;
+  const STEP = 3;
+  for (let v = def + STEP; v <= hi; v += STEP) {
+    const s = score(v);
+    if (s > bestS) {
+      bestS = s;
+      bestV = v;
+      if (s >= DIM_SCAN_SAMPLES) return v;
+    }
+  }
+  for (let v = def - STEP; v >= lo; v -= STEP) {
+    const s = score(v);
+    if (s > bestS) {
+      bestS = s;
+      bestV = v;
+      if (s >= DIM_SCAN_SAMPLES) return v;
+    }
+  }
+  return bestV;
+}
+
+/** True when the simplified ring is a plain axis-aligned rectangle: exactly
+ *  4 vertices, each sitting on a corner of its own bbox (small epsilon). */
+function ringIsRect(ring: [number, number][]): boolean {
+  if (ring.length !== 4) return false;
+  const xs = ring.map((q) => q[0]);
+  const ys = ring.map((q) => q[1]);
+  const minX = Math.min(...xs);
+  const maxX = Math.max(...xs);
+  const minY = Math.min(...ys);
+  const maxY = Math.max(...ys);
+  const EPS = 0.35;
+  return ring.every(
+    (q) =>
+      Math.min(Math.abs(q[0] - minX), Math.abs(q[0] - maxX)) < EPS &&
+      Math.min(Math.abs(q[1] - minY), Math.abs(q[1] - maxY)) < EPS,
+  );
+}
+
+/** Area centroid of a polygon ring. */
+function ringCentroid(ring: [number, number][]): [number, number] {
+  let a = 0;
+  let cx = 0;
+  let cy = 0;
+  for (let i = 0, j = ring.length - 1; i < ring.length; j = i++) {
+    const w = ring[j][0] * ring[i][1] - ring[i][0] * ring[j][1];
+    a += w;
+    cx += (ring[j][0] + ring[i][0]) * w;
+    cy += (ring[j][1] + ring[i][1]) * w;
+  }
+  if (Math.abs(a) < 1e-9) return ring[0];
+  return [cx / (3 * a), cy / (3 * a)];
 }
 
 // ---------------------------------------------------------------------------

@@ -10,7 +10,7 @@
 import './style.css';
 
 import * as THREE from 'three';
-import { parseStep, type OcctResult } from './stepLoader';
+import { parseStep, preloadOcct, type OcctResult } from './stepLoader';
 import { Viewer, bodyColor } from './viewer';
 import { analyzeBody, type BodyAnalysis } from './geometry';
 import {
@@ -27,7 +27,7 @@ import {
 } from './nest';
 import { sheetToDxf, downloadDxf } from './dxf';
 import { buildStep, type StepPart } from './stepExport';
-import { buildPdf, buildAssemblyAnalysisPdf, downloadPdf, type InventoryCheck } from './pdf';
+import { buildPdf, buildAssemblyAnalysisPdf, buildCutlistPdf, downloadPdf, type InventoryCheck } from './pdf';
 import {
   buildShoppingList,
   setHave,
@@ -75,7 +75,7 @@ import {
   type JointStiffness,
   type SolveProgress,
 } from './cae';
-import { getDirectSolver, getPyniteBackend } from './solverBackend';
+import { getDirectSolver, getPyniteBackend, launchSidecar } from './solverBackend';
 
 // --------------------------------------------------------------------------
 // State
@@ -465,6 +465,7 @@ const downloadDxfBtn = $<HTMLButtonElement>('downloadDxfBtn');
 const downloadCutDxfBtn = $<HTMLButtonElement>('downloadCutDxfBtn');
 const downloadPdfBtn = $<HTMLButtonElement>('downloadPdfBtn');
 const downloadPhonePdfBtn = $<HTMLButtonElement>('downloadPhonePdfBtn');
+const downloadCutlistPdfBtn = $<HTMLButtonElement>('downloadCutlistPdfBtn');
 
 const shopList = $('shoppingList');
 const shopCount = $('shopCount');
@@ -692,6 +693,10 @@ async function handleFiles(files: FileList | File[]) {
   let totalRaw = 0;
   let totalAdded = 0;
   let totalSkippedNotSheet = 0;
+  // Phase timings, logged once at the end (same convention as the pdf log).
+  const tLoad0 = performance.now();
+  let tParse = 0, tAnalyze = 0, tMesh = 0, tYield = 0;
+  let lastYieldMs = 0;
   try {
     for (let fi = 0; fi < list.length; fi++) {
       const file = list[fi];
@@ -700,7 +705,9 @@ async function handleFiles(files: FileList | File[]) {
       showLoadProgress(fileBase, `${fileTagLabel}parsing ${file.name} …`);
       await uiYield(); // paint before the (blocking) WASM parse
       const buf = await file.arrayBuffer();
+      const tP0 = performance.now();
       const res = await parseStep(buf);
+      tParse += performance.now() - tP0;
       showLoadProgress(fileBase + PARSE_SHARE / list.length,
         `${fileTagLabel}analyzing ${res.meshes.length} bodies …`);
       await uiYield();
@@ -745,16 +752,25 @@ async function handleFiles(files: FileList | File[]) {
         // Keep the bar moving and the page responsive: analyzeBody +
         // viewer mesh construction are synchronous and can take tens of
         // ms per body on dense tessellations.
-        if (meshIdx % 4 === 0) {
+        // Time-based, not count-based: each yield lets the browser paint —
+        // which includes a full 3D frame of the growing scene — so yielding
+        // every N bodies made load time scale with body count. ~8 fps of
+        // progress is plenty.
+        if (performance.now() - lastYieldMs > 120) {
           const inFile = PARSE_SHARE + (1 - PARSE_SHARE) * (meshIdx / res.meshes.length);
           showLoadProgress(fileBase + inFile / list.length,
             `${fileTagLabel}analyzing body ${meshIdx + 1}/${res.meshes.length} …`);
+          const tY0 = performance.now();
           await uiYield();
+          tYield += performance.now() - tY0;
+          lastYieldMs = performance.now();
         }
         const indices = m.index?.array;
         if (!indices || indices.length < 3) continue;
         try {
+          const tA0 = performance.now();
           const analysis = analyzeBody(m);
+          tAnalyze += performance.now() - tA0;
           if (!analysis) {
             // Body isn't sheet-good shaped (round leg, dowel, block, …)
             // — still show it in 3D in red dashed so the user knows it
@@ -780,7 +796,9 @@ async function handleFiles(files: FileList | File[]) {
             color: hex,
             material: null,
           });
+          const tM0 = performance.now();
           viewer.addOcctMesh(m, id, hex, displayName);
+          tMesh += performance.now() - tM0;
           perFileValid++;
           totalAdded++;
         } catch (e) {
@@ -790,14 +808,25 @@ async function handleFiles(files: FileList | File[]) {
     }
 
     viewer.finishLoad();
+    console.log(
+      `load: parse ${tParse.toFixed(0)}ms · analyze ${tAnalyze.toFixed(0)}ms · mesh ${tMesh.toFixed(0)}ms · yield ${tYield.toFixed(0)}ms · total ${(performance.now() - tLoad0).toFixed(0)}ms (${totalAdded} bodies)`,
+    );
     // Auto-select all newly-loaded sheet-good bodies so the user can hit
     // "Estimate" immediately. Non-sheet bodies were already excluded.
+    const tT0 = performance.now();
     for (const b of state.bodies) b.selected = true;
     syncViewerSelectionFromState();
+    const tT1 = performance.now();
     pushAllGrainToViewer();
+    const tT2 = performance.now();
     refreshWeakBodies();
+    const tT3 = performance.now();
     renderBodyList();
+    const tT4 = performance.now();
     updateNestBtn();
+    console.log(
+      `load tail: select ${(tT1 - tT0).toFixed(0)}ms · grain ${(tT2 - tT1).toFixed(0)}ms · weak ${(tT3 - tT2).toFixed(0)}ms · list ${(tT4 - tT3).toFixed(0)}ms`,
+    );
     const dropped = totalRaw - totalAdded - totalSkippedNotSheet;
     const summary = list.length > 1
       ? `Loaded ${totalAdded} sheet-good bodies from ${list.length} files.`
@@ -846,6 +875,10 @@ dropzone.addEventListener('drop', (e) => {
   if (e.dataTransfer?.files?.length) handleFiles(e.dataTransfer.files);
 });
 pickFileBtn.addEventListener('click', () => fileInput.click());
+// Warm the OCCT WASM (~1s script fetch + compile) shortly after startup so
+// the first file open doesn't pay it inside the load path. Delayed so it
+// never competes with first paint.
+setTimeout(preloadOcct, 500);
 fileInput.addEventListener('change', () => {
   if (fileInput.files?.length) handleFiles(fileInput.files);
   // Reset so picking the SAME file(s) again re-fires change.
@@ -1416,6 +1449,10 @@ function ensureAsmCabinet() {
 
 /** Detect joints for the current cabinet and populate the list. */
 function detectAssemblyJoints() {
+  // First analysis action — bring the PyNite sidecar up in the background so
+  // it's listening by the time Solve asks for it. Detection itself is pure
+  // local geometry and must not wait on the spawn.
+  void launchSidecar();
   ensureAsmCabinet();
   const panels = cabinetPanels();
   if (panels.length < 2) {
@@ -2806,6 +2843,7 @@ async function runEstimate(opts: { seed?: number; deepSearch?: boolean } = {}) {
   downloadCutDxfBtn.disabled = true;
   downloadPdfBtn.disabled = true;
   downloadPhonePdfBtn.disabled = true;
+  downloadCutlistPdfBtn.disabled = true;
   replayBtn.disabled = true;
 
   // Capture trial frames for the replay button. We do NOT paint frames live
@@ -3115,6 +3153,7 @@ function renderResults() {
   downloadCutDxfBtn.disabled = false;
   downloadPdfBtn.disabled = false;
   downloadPhonePdfBtn.disabled = false;
+  downloadCutlistPdfBtn.disabled = false;
   const totalSheets = result.groups.reduce((a, g) => a + g.sheets.length, 0);
 
   // Stacked sheet list — every sheet rendered one below the other.
@@ -3707,6 +3746,7 @@ async function exportPdf(btn: HTMLButtonElement, paper: string) {
   const originalLabel = btn.innerHTML;
   downloadPdfBtn.disabled = true;
   downloadPhonePdfBtn.disabled = true;
+  downloadCutlistPdfBtn.disabled = true;
   btn.classList.add('busy');
   const setProgress = (label: string, pct: number) => {
     btn.innerHTML = `<span class="progress-bar"><span class="progress-fill" style="width:${pct.toFixed(0)}%"></span></span><span class="progress-label">${label}</span>`;
@@ -3928,10 +3968,83 @@ async function exportPdf(btn: HTMLButtonElement, paper: string) {
   btn.classList.remove('busy');
   downloadPdfBtn.disabled = false;
   downloadPhonePdfBtn.disabled = false;
+  downloadCutlistPdfBtn.disabled = false;
 }
 
 downloadPdfBtn.addEventListener('click', () => exportPdf(downloadPdfBtn, pdfPaperSelect.value));
 downloadPhonePdfBtn.addEventListener('click', () => exportPdf(downloadPhonePdfBtn, 'mobile'));
+
+// Cutlist PDF — one 4:3 sheet-overview page per cut sheet (layout + panel
+// dimensions only) plus a final assembly page: whole-scene EXPLODED
+// snapshot with a panel-number legend. The snapshot is a single synchronous
+// capture — none of the job PDF's per-cabinet progress plumbing.
+downloadCutlistPdfBtn.addEventListener('click', () => {
+  if (!state.lastNest || !state.lastSheet) return;
+  // Panel ids per source body — partId IS the source body id, so the
+  // balloons on the assembly views carry the same "1a" codes as the sheets.
+  const idsByPartId = new Map<string, string[]>();
+  for (const g of state.lastNest.groups) {
+    for (const s of g.sheets) {
+      for (const p of s.parts) {
+        const arr = idsByPartId.get(p.partId) ?? [];
+        arr.push(`${s.globalIndex}${p.panelLabel}`);
+        idsByPartId.set(p.partId, arr);
+      }
+    }
+  }
+  const selectedBodies = state.bodies.filter((b) => b.selected);
+  const assemblyViews: import('./pdf').CutlistAssemblyViews[] = [];
+  if (selectedBodies.length > 0) {
+    try {
+      viewer.enterPdfBg();
+      const byFile = new Map<string, BodyState[]>();
+      for (const b of selectedBodies) {
+        const arr = byFile.get(b.fileTag) ?? [];
+        arr.push(b);
+        byFile.set(b.fileTag, arr);
+      }
+      // Portrait-ish target matching the half-page column each view lands
+      // in; snapshotFiltered refits the camera and hides live-view overlays.
+      const SHOT = { w: 1000, h: 1400 };
+      for (const [tag, bodies] of byFile) {
+        const vis = new Set(bodies.map((b) => b.id));
+        const labelText = new Map<number, string>();
+        for (const b of bodies) {
+          labelText.set(b.id, (idsByPartId.get(String(b.id)) ?? []).join(','));
+        }
+        const mkView = (dir: [number, number, number]): import('./pdf').CutlistView => {
+          const shot = viewer.snapshotFiltered(vis, null, 0, undefined, SHOT, dir);
+          return {
+            image: shot,
+            labels: shot.anchors
+              .map((a) => ({ x: a.x, y: a.y, text: labelText.get(a.id) ?? '' }))
+              .filter((l) => l.text),
+          };
+        };
+        assemblyViews.push({
+          name: byFile.size > 1 ? tag : undefined,
+          front: mkView([1.0, -1.2, 0.9]),
+          back: mkView([-1.0, 1.2, 0.9]),
+        });
+      }
+    } catch (err) {
+      console.warn('Cutlist assembly snapshots failed; assembly pages skipped.', err);
+    } finally {
+      viewer.exitPdfBg();
+    }
+  }
+  const doc = buildCutlistPdf(state.lastNest, {
+    sheetW: state.lastSheet.w,
+    sheetL: state.lastSheet.l,
+    margin: state.lastSheet.margin,
+    kerf: state.lastSheet.kerf,
+    units: state.units,
+    jobName: state.jobName || 'Plywood cut estimate',
+    assemblyViews: assemblyViews.length > 0 ? assemblyViews : undefined,
+  });
+  const safe = (state.jobName || 'plywood_cut_estimate').replace(/[^a-z0-9_-]+/gi, '_').toLowerCase();
+  downloadPdf(`${safe}_cutlist.pdf`, doc);
+});
 
 // --------------------------------------------------------------------------
 // Helpers

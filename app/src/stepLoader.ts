@@ -58,8 +58,17 @@ function resolveOcct(resolve: (v: any) => void, reject: (e: Error) => void) {
     .catch(reject);
 }
 
+/** Warm the OCCT WASM (script fetch + compile, ~1s) in the background so the
+ *  first real file open doesn't pay it. Errors are swallowed — parseStep will
+ *  surface them properly if the user actually opens a file. */
+export function preloadOcct(): void {
+  void ensureOcct().catch(() => {});
+}
+
 export async function parseStep(buffer: ArrayBuffer): Promise<OcctResult> {
+  const t0 = performance.now();
   const occt = await ensureOcct();
+  const t1 = performance.now();
   const bytes = new Uint8Array(buffer);
   // Tessellation quality. occt-import-js can only hand us triangles (the
   // BREP's true B-spline/arc curves are not exposed), so curve fidelity is
@@ -80,5 +89,8 @@ export async function parseStep(buffer: ArrayBuffer): Promise<OcctResult> {
   if (!res || !res.success) {
     throw new Error('STEP parse failed.');
   }
+  console.log(
+    `step: occt boot ${(t1 - t0).toFixed(0)}ms · parse ${(performance.now() - t1).toFixed(0)}ms (${(bytes.length / 1024).toFixed(0)} KB, ${res.meshes?.length ?? 0} meshes)`,
+  );
   return res as OcctResult;
 }

@@ -24,16 +24,13 @@ if not exist "node_modules\" (
     )
 )
 
-REM --- Optional: start the PyNite structural-FE sidecar (primary assembly
-REM     CAE solver) in the background if PyNite is installed. The app works
-REM     fine without it (falls back to the built-in WASM/PCG solver), so a
-REM     missing sidecar is only a one-line hint, never a launch failure. ---
+REM --- The PyNite structural-FE sidecar (primary assembly CAE solver) starts
+REM     ON DEMAND — first "Detect joints" click — via the dev server, not
+REM     here. A missing install is only a one-line hint; the app falls back
+REM     to the built-in WASM/PCG solver. ---
 python -c "import Pynite" >nul 2>nul
 if errorlevel 1 (
     echo [i] PyNite sidecar not installed — run: python -m pip install -r server/requirements.txt
-) else (
-    echo [+] Starting PyNite sidecar on http://localhost:8642 ...
-    start "PyNite sidecar" /min /d "%~dp0" python -m uvicorn server.main:app --port 8642
 )
 
 echo [+] Starting Plywood Estimator on http://localhost:5173 ...

@@ -23,15 +23,12 @@ if [ ! -d "node_modules" ]; then
   npm install || { echo "[!] npm install failed."; read -n 1 -s -r -p "Press any key to exit..."; exit 1; }
 fi
 
-# --- Optional: start the PyNite structural-FE sidecar (primary assembly CAE
-#     solver) in the background if PyNite is installed. The app works without
-#     it (falls back to the built-in WASM/PCG solver), so a missing sidecar is
-#     only a one-line hint, never a launch failure. ---
+# --- The PyNite structural-FE sidecar (primary assembly CAE solver) starts
+#     ON DEMAND — first "Detect joints" click — via the dev server, not here.
+#     A missing install is only a one-line hint; the app falls back to the
+#     built-in WASM/PCG solver. ---
 PY="$(command -v python3 || command -v python || true)"
-if [ -n "$PY" ] && "$PY" -c "import Pynite" >/dev/null 2>&1; then
-  echo "[+] Starting PyNite sidecar on http://localhost:8642 ..."
-  ( cd "$ROOT" && "$PY" -m uvicorn server.main:app --port 8642 >/dev/null 2>&1 ) &
-else
+if [ -z "$PY" ] || ! "$PY" -c "import Pynite" >/dev/null 2>&1; then
   echo "[i] PyNite sidecar not installed — run: python -m pip install -r server/requirements.txt"
 fi
 
