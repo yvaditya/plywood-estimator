@@ -56,21 +56,49 @@ def _clip(p1, p2, rect):
     return (t1 - t0) * (dx * dx + dy * dy) ** 0.5
 
 
-def _segments(page):
-    """Every straight segment on the page, as ((x1,y1),(x2,y2)).
+# Cream stock fill, also used for the drafting text mask painted behind
+# dimension values. A mask hides whatever crosses it, so anything it covers
+# is not actually visible ink.
+SHEET_FILL = (245 / 255, 239 / 255, 217 / 255)
 
-    Filled paths count too: the dimension arrowheads are filled triangles, and
-    an arrowhead landing on a value overlaps it just as badly as a line does.
+
+def _is_sheet_fill(col) -> bool:
+    return col is not None and all(abs(a - b) < 0.01 for a, b in zip(col, SHEET_FILL))
+
+
+def _masks(page):
+    """Text-mask rectangles as (paint_order_index, rect). Cream-filled,
+    unstroked rects — the drafting text mask painted behind a value."""
+    out = []
+    for i, d in enumerate(page.get_drawings()):
+        if d["type"] != "f" or not _is_sheet_fill(d.get("fill")):
+            continue
+        for item in d["items"]:
+            if item[0] == "re":
+                out.append((i, fitz.Rect(item[1])))
+    return out
+
+
+def _segments(page):
+    """Every straight segment of visible ink, as ((x1,y1),(x2,y2)).
+
+    Filled paths count: the dimension arrowheads are filled triangles, and an
+    arrowhead landing on a value overlaps it just as badly as a line does.
+    Cream mask rectangles are NOT ink — they are the thing that hides ink —
+    so they are skipped, otherwise every mask would report as crossing the
+    value it exists to protect.
     """
     segs = []
-    for d in page.get_drawings():
+    for i, d in enumerate(page.get_drawings()):
+        if d["type"] == "f" and _is_sheet_fill(d.get("fill")):
+            continue
         for item in d["items"]:
             if item[0] == "l":
-                segs.append((tuple(item[1]), tuple(item[2])))
+                segs.append((i, tuple(item[1]), tuple(item[2])))
             elif item[0] == "re":
                 r = item[1]
                 cs = [(r.x0, r.y0), (r.x1, r.y0), (r.x1, r.y1), (r.x0, r.y1)]
-                segs += [(cs[i], cs[(i + 1) % 4]) for i in range(4)]
+                segs += [(i, cs[j], cs[(j + 1) % 4]) for j in range(4)]
     return segs
 
 
@@ -109,9 +137,20 @@ def check(path: Path) -> int:
     for pno, page in enumerate(doc, start=1):
         boxes = _text_boxes(page)
         segs = _segments(page)
+        masks = _masks(page)
         hits = []
         for rect, txt in boxes:
-            for a, b in segs:
+            # A mask painted over this value hides every stroke laid down
+            # BEFORE it. Paint order is content-stream order, so only strokes
+            # with a later index are still visible on top of the mask.
+            shield = -1
+            for idx, m in masks:
+                if m.x0 <= rect.x0 + 0.5 and m.y0 <= rect.y0 + 0.5 \
+                   and m.x1 >= rect.x1 - 0.5 and m.y1 >= rect.y1 - 0.5:
+                    shield = max(shield, idx)
+            for si, a, b in segs:
+                if si < shield:
+                    continue
                 crossed = _clip(a, b, rect)
                 if crossed > MIN_CROSS_PT:
                     hits.append((txt, round(crossed, 2), rect))

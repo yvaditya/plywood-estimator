@@ -1915,7 +1915,9 @@ function drawPart(
       if (shortStrip) {
         // Register the combined id+note rect FIRST — brokenLine then leaves
         // the gap and skips any earlier label the run would strike through.
-        reg.rects.push({ x: cx - total / 2, y: cy - sfs * 0.55, w: total, h: sfs * 1.1 });
+        const noteRect = { x: cx - total / 2, y: cy - sfs * 0.55, w: total, h: sfs * 1.1 };
+        reg.rects.push(noteRect);
+        maskDimText(doc, noteRect);
         brokenLine(doc, px, cy, px + pwPt, cy, reg);
         drawDimTri(doc, px, cy, +1, 0, aLen, aW);
         drawDimTri(doc, px + pwPt, cy, -1, 0, aLen, aW);
@@ -1930,7 +1932,9 @@ function drawPart(
         doc.text(note, startX + m.idW, cy + sfs * 0.35);
       } else {
         // Rotated run reads bottom-to-top along the vertical centerline.
-        reg.rects.push({ x: cx - sfs * 0.6, y: cy - total / 2, w: sfs * 1.1, h: total });
+        const noteRectV = { x: cx - sfs * 0.6, y: cy - total / 2, w: sfs * 1.1, h: total };
+        reg.rects.push(noteRectV);
+        maskDimText(doc, noteRectV);
         brokenLine(doc, cx, py, cx, py + phPt, reg);
         drawDimTri(doc, cx, py, 0, +1, aLen, aW);
         drawDimTri(doc, cx, py + phPt, 0, -1, aLen, aW);
@@ -1989,8 +1993,11 @@ function drawPart(
     // the width line ran straight through the rotated "63.0 mm".
     const wTw = doc.getTextWidth(wLabel);
     const hTw = doc.getTextWidth(hLabel);
-    reg.rects.push(labelRectAt(cx, hy, wTw, fs, 0));
-    reg.rects.push(labelRectAt(vx, cy, hTw, fs, 90));
+    const wRect = labelRectAt(cx, hy, wTw, fs, 0);
+    const hRect = labelRectAt(vx, cy, hTw, fs, 90);
+    reg.rects.push(wRect, hRect);
+    maskDimText(doc, wRect);
+    maskDimText(doc, hRect);
     // Width dim
     brokenLine(doc, px, hy, px + pwPt, hy, reg);
     drawDimTri(doc, px, hy, +1, 0, aLen, aW);
@@ -2218,7 +2225,12 @@ function drawOutlineDetailDims(
         reg, defX, defY, doc.getTextWidth(label), lfs, A,
         -Math.sin(rad), -Math.cos(rad),
       );
-      reg.rects.push(placeAlignedText(doc, label, tPos.x, tPos.y, lfs, A));
+      // placeAlignedText DRAWS the value, so the mask has to go down first —
+      // masking afterwards would paint over the number.
+      const edgeRect = labelRectAt(tPos.x, tPos.y, doc.getTextWidth(label), lfs, A);
+      reg.rects.push(edgeRect);
+      maskDimText(doc, edgeRect);
+      placeAlignedText(doc, label, tPos.x, tPos.y, lfs, A);
       // When the value had to move well away from its line, tie it back
       // with a thin leader (clips out of the label rect automatically).
       if (Math.hypot(tPos.x - defX, tPos.y - defY) > lfs * 2.5) {
@@ -2252,7 +2264,9 @@ function drawOutlineDetailDims(
       const b2y = byP + iny * OFFIN;
       const tw = doc.getTextWidth(label);
       const tPos = slideLabelClear(reg, (a2x + b2x) / 2, (a2y + b2y) / 2, tw, lfs, A, ux, uy);
-      reg.rects.push(labelRectAt(tPos.x, tPos.y, tw, lfs, A));
+      const insideRect = labelRectAt(tPos.x, tPos.y, tw, lfs, A);
+      reg.rects.push(insideRect);
+      maskDimText(doc, insideRect);
       brokenLine(doc, a2x, a2y, b2x, b2y, reg);
       if (arrowsInside) {
         drawDimTriDir(doc, a2x, a2y, ux, uy, aE, arrW);
@@ -2313,7 +2327,11 @@ function drawOutlineDetailDims(
     const defLx = vx + bx * (rArc + afs * 0.8 + 1.5);
     const defLy = vy + by * (rArc + afs * 0.8 + 1.5);
     const lPos = slideLabelClear(reg, defLx, defLy, doc.getTextWidth(angLabel), afs, 0, bx, by);
-    reg.rects.push(placeAlignedText(doc, angLabel, lPos.x, lPos.y, afs, 0));
+    // Mask before drawing, as above.
+    const angRect = labelRectAt(lPos.x, lPos.y, doc.getTextWidth(angLabel), afs, 0);
+    reg.rects.push(angRect);
+    maskDimText(doc, angRect);
+    placeAlignedText(doc, angLabel, lPos.x, lPos.y, afs, 0);
     // Far-slid value → leader back to the arc midpoint.
     if (Math.hypot(lPos.x - defLx, lPos.y - defLy) > afs * 2.5) {
       brokenLine(doc, lPos.x, lPos.y, vx + bx * rArc, vy + by * rArc, reg);
@@ -2427,6 +2445,32 @@ const CUT_OBJ_INK: [number, number, number] = [25, 25, 25];
 const CUT_OBJ_W = 0.4;   // part outline (object line) weight — near-hairline
 const CUT_STOCK_W = 0.8; // sheet (stock boundary) weight
 const CUT_DIM_W = 0.25;  // dimension line weight
+/** Cream plywood fill of the stock rectangle. */
+const SHEET_FILL: [number, number, number] = [245, 239, 217];
+
+/**
+ * Background mask behind a dimension value — the drafting "text mask".
+ *
+ * brokenLine keeps DIMENSION lines out of a value's box, but it cannot help
+ * with the panel OUTLINES: those are object lines, drawn per part before any
+ * dimension exists, and breaking a part boundary to let a number through
+ * would misrepresent the part. A notch or bevel value that lands on an edge
+ * therefore sat directly on top of it.
+ *
+ * Masking is what CAD does here. In cutlist mode panels are stroke-only — no
+ * fill tint — so everything behind a value is the stock rectangle's cream.
+ * Painting that colour into the value's box is invisible against the sheet
+ * and hides whatever crosses it, whichever pass drew it.
+ *
+ * Call between registering the rect and drawing the value: dimension lines
+ * are broken around the box anyway, so they are unaffected. Restores the dim
+ * ink as the fill colour, since the arrowheads that follow are filled with it.
+ */
+function maskDimText(doc: jsPDF, r: LabelRect, pad = 0.6) {
+  doc.setFillColor(...SHEET_FILL);
+  doc.rect(r.x - pad, r.y - pad, r.w + pad * 2, r.h + pad * 2, 'F');
+  doc.setFillColor(...CUT_DIM_INK);
+}
 
 function drawDimH(
   doc: jsPDF, x1: number, x2: number, y: number, label: string,
