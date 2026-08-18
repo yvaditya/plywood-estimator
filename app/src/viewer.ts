@@ -192,6 +192,16 @@ export class Viewer {
     x: number; y: number; hidden: boolean;
   }[] = [];
   private caeMeshFocus = false;
+  /** Panel-id labels pinned to each body's centre — same DOM-overlay idiom as
+   *  the CAE callouts, tracked by the same per-frame projector. */
+  private partLabels: {
+    el: HTMLElement; anchor: THREE.Vector3;
+    x: number; y: number; hidden: boolean;
+  }[] = [];
+  private partLabelsOn = false;
+  /** Last ids pushed, kept so toggling visibility can rebuild without the
+   *  caller having to re-supply them. */
+  private partLabelSource: { id: number; text: string }[] = [];
   /** Assembly floor-support glyphs (one group for the whole cabinet). */
   private asmFloorGroup: THREE.Object3D | null = null;
   /** When set, the next body-face click is captured for force placement
@@ -1068,6 +1078,53 @@ export class Viewer {
     this.updateCalloutPositions();
   }
 
+  // -------------------------------------------------------------------------
+  // Panel-id labels on bodies
+  // -------------------------------------------------------------------------
+
+  /**
+   * Supply the panel id to show on each body ("1a", or "1a,2c" when a part is
+   * cut from more than one sheet). Replaces any previous set. Labels are only
+   * materialised while the toggle is on, so the off state costs nothing.
+   */
+  setPartLabels(labels: { id: number; text: string }[]) {
+    this.partLabelSource = labels;
+    this.rebuildPartLabels();
+  }
+
+  /** Show/hide the panel-id labels. Cheap to call repeatedly. */
+  setPartLabelsVisible(on: boolean) {
+    if (this.partLabelsOn === on) return;
+    this.partLabelsOn = on;
+    this.rebuildPartLabels();
+  }
+
+  private rebuildPartLabels() {
+    for (const l of this.partLabels) l.el.remove();
+    this.partLabels = [];
+    if (this.partLabelsOn) {
+      const box = new THREE.Box3();
+      const centre = new THREE.Vector3();
+      for (const { id, text } of this.partLabelSource) {
+        if (!text) continue;
+        const body = this.bodies.find((b) => b.id === id);
+        if (!body || !body.mesh.visible) continue;
+        box.setFromObject(body.mesh);
+        if (box.isEmpty()) continue;
+        box.getCenter(centre);
+        const el = document.createElement('div');
+        // NOT "part-label" — that class is already the SVG text in the 2D cut
+        // layout diagram (main.ts / style.css); reusing it would restyle those.
+        el.className = 'body-id-label';
+        el.textContent = text;
+        this.renderer.domElement.parentElement?.appendChild(el);
+        this.partLabels.push({ el, anchor: centre.clone(), x: NaN, y: NaN, hidden: false });
+      }
+    }
+    this.updateCalloutPositions();
+    this.invalidate();
+  }
+
   clearCaeCallouts() {
     if (this.caeCalloutGroup) {
       this.caeGroup.remove(this.caeCalloutGroup);
@@ -1086,25 +1143,30 @@ export class Viewer {
    * the browser's own layout work).
    */
   private updateCalloutPositions() {
-    if (this.caeCallouts.length === 0) return;
+    if (this.caeCallouts.length === 0 && this.partLabels.length === 0) return;
     const canvas = this.renderer.domElement;
     const w = canvas.clientWidth, h = canvas.clientHeight;
     const v = new THREE.Vector3();
-    for (const c of this.caeCallouts) {
+    // Two lists, one projector. Iterated separately rather than concatenated:
+    // this runs on every rendered frame, and building a temporary array here
+    // would allocate 60×/second for no reason.
+    const place = (c: { el: HTMLElement; anchor: THREE.Vector3; x: number; y: number; hidden: boolean }) => {
       v.copy(c.anchor).project(this.camera);
       const behind = v.z > 1;
       if (behind !== c.hidden) {
         c.el.style.display = behind ? 'none' : '';
         c.hidden = behind;
       }
-      if (behind) continue;
+      if (behind) return;
       const x = (v.x * 0.5 + 0.5) * w;
       const y = (-v.y * 0.5 + 0.5) * h;
-      if (Math.abs(x - c.x) < 0.25 && Math.abs(y - c.y) < 0.25) continue;
+      if (Math.abs(x - c.x) < 0.25 && Math.abs(y - c.y) < 0.25) return;
       c.x = x; c.y = y;
       c.el.style.left = `${x.toFixed(1)}px`;
       c.el.style.top = `${y.toFixed(1)}px`;
-    }
+    };
+    for (const c of this.caeCallouts) place(c);
+    for (const c of this.partLabels) place(c);
   }
 
   /**
@@ -1163,6 +1225,9 @@ export class Viewer {
     this.clearAssemblyOverlay();
     for (const ls of this.caeWeakOutlines.values()) { this.caeGroup.remove(ls); disposeObject3D(ls); }
     this.caeWeakOutlines.clear();
+    // Panel ids belong to the nest that just got thrown away.
+    this.partLabelSource = [];
+    this.rebuildPartLabels();
     this.invalidate();
   }
 

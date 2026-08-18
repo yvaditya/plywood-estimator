@@ -27,7 +27,15 @@ import {
 } from './nest';
 import { sheetToDxf, downloadDxf } from './dxf';
 import { buildStep, type StepPart } from './stepExport';
-import { buildPdf, buildAssemblyAnalysisPdf, buildCutlistPdf, downloadPdf, type InventoryCheck } from './pdf';
+import {
+  buildPdf,
+  buildAssemblyAnalysisPdf,
+  buildCutlistPdf,
+  cutlistSnapshotTarget,
+  downloadPdf,
+  type CutlistPaper,
+  type InventoryCheck,
+} from './pdf';
 import {
   buildShoppingList,
   setHave,
@@ -475,6 +483,13 @@ const shopTotals = $('shopTotals');
 const jobNameInput = $<HTMLInputElement>('jobName');
 const currencySelect = $<HTMLSelectElement>('currency');
 const pdfPaperSelect = $<HTMLSelectElement>('pdfPaper');
+const cutlistPaperSelect = $<HTMLSelectElement>('cutlistPaper');
+// Export options menu (Cut Layout header). One set of switches drives BOTH
+// PDF exports; the 3D one is viewport-only.
+const optAssembly = $<HTMLInputElement>('optAssembly');
+const optPanelLists = $<HTMLInputElement>('optPanelLists');
+const optCutSteps = $<HTMLInputElement>('optCutSteps');
+const opt3dLabels = $<HTMLInputElement>('opt3dLabels');
 const kerfRefSelect = $<HTMLSelectElement>('kerfRef');
 const sequenceStyleSelect = $<HTMLSelectElement>('sequenceStyle');
 const kerfSelect = $<HTMLSelectElement>('kerfSelect');
@@ -3154,6 +3169,7 @@ function renderResults() {
   downloadPdfBtn.disabled = false;
   downloadPhonePdfBtn.disabled = false;
   downloadCutlistPdfBtn.disabled = false;
+  pushPartLabelsToViewer();
   const totalSheets = result.groups.reduce((a, g) => a + g.sheets.length, 0);
 
   // Stacked sheet list — every sheet rendered one below the other.
@@ -3848,85 +3864,94 @@ async function exportPdf(btn: HTMLButtonElement, paper: string) {
   // snapshots — the dark studio backdrop the live viewer uses prints
   // poorly. exitPdfBg restores the live look at the end.
   const tCapture0 = performance.now();
-  viewer.enterPdfBg();
   const cabinets: import('./pdf').CabinetSnapshot[] = [];
   let assembledPng: string | undefined;
   let explodedPng: string | undefined;
-  try {
-    // Two render targets — cover gets a near-square aspect to fill the
-    // half-page snapshot box; IKEA step cards are wide (2:1-ish) and use a
-    // 16:9 target so the cabinet fills the card horizontally. Step cards
-    // print at ~6 × 3.4in — 1280×720 is ~180 dpi there, plenty.
-    const SHOT_COVER = { w: 1200, h: 1100 };
-    const SHOT_STEP  = { w: 1280, h: 720 };
-    const fileCount = byFile.size;
-    let fileIdx = 0;
-    for (const [tag, bodies] of byFile) {
-      fileIdx++;
-      setProgress(`Capturing ${tag}…`, 10 + (70 * (fileIdx - 1) / Math.max(1, fileCount)));
-      await yieldFrame();
-      const visibleIds = new Set(bodies.map((b) => b.id));
-      viewer.beginSnapshotBatch(SHOT_COVER);
-      const assembled = viewer.snapshotFiltered(visibleIds, null, 0, undefined, SHOT_COVER);
-      const exploded = viewer.snapshotFiltered(visibleIds, directions, explodeDist, undefined, SHOT_COVER);
-      const ids: string[] = [];
-      for (const b of bodies) {
-        const arr = idByBodyPartId.get(String(b.id));
-        if (arr) ids.push(...arr);
-      }
-      const panels = ids
-        .map((id) => panelById.get(id))
-        .filter((p): p is import('./pdf').CabinetPanel => p !== undefined);
+  // Assembly pages off → skip the capture entirely rather than rendering
+  // snapshots the document will discard. This is the slow half of the export
+  // (two full composer passes per cabinet), so the toggle is also the fastest
+  // way to get a PDF out.
+  if (!optAssembly.checked) {
+    setProgress('Building PDF…', 80);
+    await yieldFrame();
+  } else {
+    viewer.enterPdfBg();
+    try {
+      // Two render targets — cover gets a near-square aspect to fill the
+      // half-page snapshot box; IKEA step cards are wide (2:1-ish) and use a
+      // 16:9 target so the cabinet fills the card horizontally. Step cards
+      // print at ~6 × 3.4in — 1280×720 is ~180 dpi there, plenty.
+      const SHOT_COVER = { w: 1200, h: 1100 };
+      const SHOT_STEP  = { w: 1280, h: 720 };
+      const fileCount = byFile.size;
+      let fileIdx = 0;
+      for (const [tag, bodies] of byFile) {
+        fileIdx++;
+        setProgress(`Capturing ${tag}…`, 10 + (70 * (fileIdx - 1) / Math.max(1, fileCount)));
+        await yieldFrame();
+        const visibleIds = new Set(bodies.map((b) => b.id));
+        viewer.beginSnapshotBatch(SHOT_COVER);
+        const assembled = viewer.snapshotFiltered(visibleIds, null, 0, undefined, SHOT_COVER);
+        const exploded = viewer.snapshotFiltered(visibleIds, directions, explodeDist, undefined, SHOT_COVER);
+        const ids: string[] = [];
+        for (const b of bodies) {
+          const arr = idByBodyPartId.get(String(b.id));
+          if (arr) ids.push(...arr);
+        }
+        const panels = ids
+          .map((id) => panelById.get(id))
+          .filter((p): p is import('./pdf').CabinetPanel => p !== undefined);
 
-      // IKEA-style per-step snapshots: install one body at a time. For step i
-      // we render bodies[0..i] visible, with body i alone floating along its
-      // face-normal so the user sees where it's being installed. All steps
-      // share one camera (frameIds = the full cabinet) so the scale doesn't
-      // jump between steps. The final step is the fully-assembled state so
-      // the user clearly sees the "done" position.
-      const stepDist = Math.max(15, explodeDist * 0.28);
-      const steps: import('./pdf').SnapshotImage[] = [];
-      const stepPanelIds: string[] = [];
-      viewer.beginSnapshotBatch(SHOT_STEP); // switch batch size once for all steps
-      for (let i = 0; i < bodies.length; i++) {
-        const installed = new Set<number>();
-        for (let j = 0; j <= i; j++) installed.add(bodies[j].id);
-        const stepDirs = new Map<number, [number, number, number]>();
-        const dir = directions.get(bodies[i].id);
-        if (dir) stepDirs.set(bodies[i].id, dir);
-        const img = viewer.snapshotFiltered(installed, stepDirs, stepDist, visibleIds, SHOT_STEP);
-        steps.push(img);
-        const arr = idByBodyPartId.get(String(bodies[i].id)) ?? [];
-        stepPanelIds.push(arr[0] ?? `body ${bodies[i].id}`);
-      }
-      // Final "done" frame — every panel back in its rest position, nothing
-      // exploded. Reuses the same camera so it visually matches the previous
-      // step but with the last panel settled.
-      if (bodies.length > 0) {
-        const doneImg = viewer.snapshotFiltered(visibleIds, null, 0, visibleIds, SHOT_STEP);
-        steps.push(doneImg);
-        stepPanelIds.push('done');
-      }
+        // IKEA-style per-step snapshots: install one body at a time. For step i
+        // we render bodies[0..i] visible, with body i alone floating along its
+        // face-normal so the user sees where it's being installed. All steps
+        // share one camera (frameIds = the full cabinet) so the scale doesn't
+        // jump between steps. The final step is the fully-assembled state so
+        // the user clearly sees the "done" position.
+        const stepDist = Math.max(15, explodeDist * 0.28);
+        const steps: import('./pdf').SnapshotImage[] = [];
+        const stepPanelIds: string[] = [];
+        viewer.beginSnapshotBatch(SHOT_STEP); // switch batch size once for all steps
+        for (let i = 0; i < bodies.length; i++) {
+          const installed = new Set<number>();
+          for (let j = 0; j <= i; j++) installed.add(bodies[j].id);
+          const stepDirs = new Map<number, [number, number, number]>();
+          const dir = directions.get(bodies[i].id);
+          if (dir) stepDirs.set(bodies[i].id, dir);
+          const img = viewer.snapshotFiltered(installed, stepDirs, stepDist, visibleIds, SHOT_STEP);
+          steps.push(img);
+          const arr = idByBodyPartId.get(String(bodies[i].id)) ?? [];
+          stepPanelIds.push(arr[0] ?? `body ${bodies[i].id}`);
+        }
+        // Final "done" frame — every panel back in its rest position, nothing
+        // exploded. Reuses the same camera so it visually matches the previous
+        // step but with the last panel settled.
+        if (bodies.length > 0) {
+          const doneImg = viewer.snapshotFiltered(visibleIds, null, 0, visibleIds, SHOT_STEP);
+          steps.push(doneImg);
+          stepPanelIds.push('done');
+        }
 
-      cabinets.push({
-        name: tag, partIds: ids, panels,
-        assembled, exploded,
-        steps, stepPanelIds,
-      });
-    }
-    // Backwards-compat fallback: combined all-cabinet snapshots — only
-    // captured when no per-cabinet snapshots exist (the PDF ignores them
-    // otherwise, so rendering them would be two wasted full-scene passes).
-    if (cabinets.length === 0) {
+        cabinets.push({
+          name: tag, partIds: ids, panels,
+          assembled, exploded,
+          steps, stepPanelIds,
+        });
+      }
+      // Backwards-compat fallback: combined all-cabinet snapshots — only
+      // captured when no per-cabinet snapshots exist (the PDF ignores them
+      // otherwise, so rendering them would be two wasted full-scene passes).
+      if (cabinets.length === 0) {
+        viewer.endSnapshotBatch();
+        assembledPng = viewer.snapshot().dataUrl;
+        explodedPng = viewer.snapshotExploded(directions, explodeDist).dataUrl;
+      }
+    } catch (err) {
+      console.warn('Per-cabinet snapshot failed; assembly pages skipped.', err);
+    } finally {
       viewer.endSnapshotBatch();
-      assembledPng = viewer.snapshot().dataUrl;
-      explodedPng = viewer.snapshotExploded(directions, explodeDist).dataUrl;
+      viewer.exitPdfBg();
     }
-  } catch (err) {
-    console.warn('Per-cabinet snapshot failed; assembly pages skipped.', err);
-  } finally {
-    viewer.endSnapshotBatch();
-    viewer.exitPdfBg();
   }
 
   const tBuild0 = performance.now();
@@ -3954,6 +3979,7 @@ async function exportPdf(btn: HTMLButtonElement, paper: string) {
     splitJoins: buildSplitJoins(),
     structure,
     assembly,
+    sections: currentSections(),
   });
   setProgress('Saving…', 98);
   await yieldFrame();
@@ -3974,10 +4000,49 @@ async function exportPdf(btn: HTMLButtonElement, paper: string) {
 downloadPdfBtn.addEventListener('click', () => exportPdf(downloadPdfBtn, pdfPaperSelect.value));
 downloadPhonePdfBtn.addEventListener('click', () => exportPdf(downloadPhonePdfBtn, 'mobile'));
 
-// Cutlist PDF — one 4:3 sheet-overview page per cut sheet (layout + panel
-// dimensions only) plus a final assembly page: whole-scene EXPLODED
-// snapshot with a panel-number legend. The snapshot is a single synchronous
-// capture — none of the job PDF's per-cabinet progress plumbing.
+/**
+ * Push each body's sheet panel id ("1a", or "1a,2c" when a part is split
+ * across sheets) to the 3D view. `partId` IS the source body id, which is
+ * what lets a body in the viewport be matched to its code on the cut sheets.
+ * Called after every estimate; the viewer only materialises the DOM labels
+ * while the toggle is on.
+ */
+function pushPartLabelsToViewer() {
+  const byBody = new Map<number, string[]>();
+  for (const g of state.lastNest?.groups ?? []) {
+    for (const s of g.sheets) {
+      for (const p of s.parts) {
+        const id = Number(p.partId);
+        if (!Number.isFinite(id)) continue;
+        const arr = byBody.get(id) ?? [];
+        arr.push(`${s.globalIndex}${p.panelLabel}`);
+        byBody.set(id, arr);
+      }
+    }
+  }
+  viewer.setPartLabels(
+    [...byBody].map(([id, ids]) => ({ id, text: [...new Set(ids)].sort().join(',') })),
+  );
+}
+
+opt3dLabels.addEventListener('change', () => {
+  viewer.setPartLabelsVisible(opt3dLabels.checked);
+});
+
+/** Current state of the export Options menu, shared by both PDF exports. */
+function currentSections(): import('./pdf').PdfSections {
+  return {
+    assembly: optAssembly.checked,
+    panelLists: optPanelLists.checked,
+    cutSteps: optCutSteps.checked,
+  };
+}
+
+// Cutlist PDF — one sheet-overview page per cut sheet (layout + panel
+// dimensions only) at the page size chosen in "Cutlist page", plus an
+// assembly page per cabinet: front + back 3/4 snapshots with panel-id
+// balloons on the panels. The snapshots are synchronous captures — none of
+// the job PDF's per-cabinet progress plumbing.
 downloadCutlistPdfBtn.addEventListener('click', () => {
   if (!state.lastNest || !state.lastSheet) return;
   // Panel ids per source body — partId IS the source body id, so the
@@ -3992,9 +4057,17 @@ downloadCutlistPdfBtn.addEventListener('click', () => {
       }
     }
   }
+  // "Match PDF paper" (the default) tracks the job-PDF paper select, so
+  // changing ONE size control changes both exports. The explicit entries
+  // below it still let the cutlist differ from the job PDF.
+  const cutlistPaper: CutlistPaper = cutlistPaperSelect.value === 'match'
+    ? ((pdfPaperSelect.value as CutlistPaper) || 'widescreen-16-9')
+    : ((cutlistPaperSelect.value as CutlistPaper) || 'cutlist-4-3');
   const selectedBodies = state.bodies.filter((b) => b.selected);
   const assemblyViews: import('./pdf').CutlistAssemblyViews[] = [];
-  if (selectedBodies.length > 0) {
+  // Same rule as the job PDF: assembly off → don't render snapshots that the
+  // document is going to drop.
+  if (selectedBodies.length > 0 && optAssembly.checked) {
     try {
       viewer.enterPdfBg();
       const byFile = new Map<string, BodyState[]>();
@@ -4003,9 +4076,11 @@ downloadCutlistPdfBtn.addEventListener('click', () => {
         arr.push(b);
         byFile.set(b.fileTag, arr);
       }
-      // Portrait-ish target matching the half-page column each view lands
-      // in; snapshotFiltered refits the camera and hides live-view overlays.
-      const SHOT = { w: 1000, h: 1400 };
+      // Portrait-ish target matching the half-page column each view lands in
+      // ON THE CHOSEN PAGE — a bigger page gets a bigger capture instead of
+      // an upscaled one. snapshotFiltered refits the camera and hides
+      // live-view overlays.
+      const SHOT = cutlistSnapshotTarget(cutlistPaper);
       for (const [tag, bodies] of byFile) {
         const vis = new Set(bodies.map((b) => b.id));
         const labelText = new Map<number, string>();
@@ -4040,6 +4115,8 @@ downloadCutlistPdfBtn.addEventListener('click', () => {
     kerf: state.lastSheet.kerf,
     units: state.units,
     jobName: state.jobName || 'Plywood cut estimate',
+    cutlistPaper,
+    sections: currentSections(),
     assemblyViews: assemblyViews.length > 0 ? assemblyViews : undefined,
   });
   const safe = (state.jobName || 'plywood_cut_estimate').replace(/[^a-z0-9_-]+/gi, '_').toLowerCase();

@@ -9,15 +9,25 @@
 //   (c) part with 45° bevel      → aligned edge dim + two 135° angle arcs
 //   (d) thin strip (60mm)        → note dimensioning on the centerline
 //
+// Emitted once per selectable page size so the chrome scaling (headers, meta
+// line, footers, assembly balloons — see cutlistScale in pdf.ts) can be
+// compared side by side: the sheet drawing should grow with the page and the
+// furniture should stay in proportion to it.
+//
 // Prereq:  npx --prefix app esbuild app/src/pdf.ts --bundle --format=esm \
 //            --platform=node --outfile=tests/_output/pdf_bundle.mjs
 // Run:     node tests/cutlist_synthetic.mjs
-// Output:  tests/_output/cutlist_synthetic.pdf
+// Output:  tests/_output/cutlist_synthetic_<paper>.pdf
 
 import { writeFileSync, mkdirSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { buildCutlistPdf } from './_output/pdf_bundle.mjs';
+
+// Bundle is overridable so the same fixture can be run against a modified
+// build (e.g. a pre-fix bundle) to prove a regression check actually catches
+// the defect it claims to.
+const BUNDLE = process.env.CUTLIST_BUNDLE ?? './_output/pdf_bundle.mjs';
+const { buildCutlistPdf, cutlistSnapshotTarget } = await import(BUNDLE);
 
 const here = dirname(fileURLToPath(import.meta.url));
 
@@ -78,6 +88,19 @@ const parts = [
     x: 560, y: 660, w: 500, h: 300, outer: rect(500, 300),
     holes: [[[40, 30], [100, 30], [100, 270], [40, 270]]],
   }),
+  // (g,h) WIDE THIN drawer-back strips, 685.9 × 63.0 — the real kitchen-job
+  // geometry where the horizontal width dim crossed the rotated height value.
+  // Above the strip-note threshold (so they take the normal two-dim path) but
+  // short enough that the width line's inset lands inside the height value's
+  // glyph run: |hy - cy| = |clamp(h*0.18, 8, 16) - h/2| < hTw/2.
+  part({
+    partId: 'strip1', partName: 'Drawer_back_panel', panelLabel: 'g', color: '#c8b8e8',
+    x: 1700, y: 30, w: 686, h: 63, outer: rect(686, 63),
+  }),
+  part({
+    partId: 'strip2', partName: 'Drawer_back_panel', panelLabel: 'h', color: '#e8c8b8',
+    x: 1700, y: 130, w: 686, h: 63, outer: rect(686, 63),
+  }),
 ];
 
 const sheet = {
@@ -95,21 +118,59 @@ const sheet = {
 
 const result = { groups: [{ thickness: 18, sheets: [sheet] }] };
 
-const opt = {
-  sheetW: 2440,
-  sheetL: 1220,
-  margin: 10,
-  kerf: 3,
-  units: 'mm',
-  jobName: 'Cutlist synthetic fixture',
-  // 1×1 PNG placeholder standing in for the viewer's exploded snapshot —
-  // exercises the assembly page (image box + panel-number legend).
-  explodedPng: 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==',
-};
+// 1×1 baseline JPEG standing in for a viewer snapshot. drawCutlistView
+// aspect-fits from the declared width/height, not the real pixels, so the
+// declared size below is what drives layout — the single pixel just gets
+// stretched over the box. Enough to check framing and balloon placement.
+const STUB_JPEG =
+  'data:image/jpeg;base64,/9j/4AAQSkZJRgABAQEAYABgAAD/2wBDAAgGBgcGBQgHBwcJCQgKDBQNDAsL' +
+  'DBkSEw8UHRofHh0aHBwgJC4nICIsIxwcKDcpLDAxNDQ0Hyc5PTgyPC4zNDL/2wBDAQkJCQwLDBgNDRgyIRwh' +
+  'MjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjL/wAARCAABAAEDASIA' +
+  'AhEBAxEB/8QAHwAAAQUBAQEBAQEAAAAAAAAAAAECAwQFBgcICQoL/8QAtRAAAgEDAwIEAwUFBAQAAAF9AQID' +
+  'AAQRBRIhMUEGE1FhByJxFDKBkaEII0KxwRVS0fAkM2JyggkKFhcYGRolJicoKSo0NTY3ODk6Q0RFRkdISUpT' +
+  'VFVWV1hZWmNkZWZnaGlqc3R1dnd4eXqDhIWGh4iJipKTlJWWl5iZmqKjpKWmp6ipqrKztLW2t7i5usLDxMXG' +
+  'x8jJytLT1NXW19jZ2uHi4+Tl5ufo6erx8vP09fb3+Pn6/8QAHwEAAwEBAQEBAQEBAQAAAAAAAAECAwQFBgcI' +
+  'CQoL/8QAtREAAgECBAQDBAcFBAQAAQJ3AAECAxEEBSExBhJBUQdhcRMiMoEIFEKRobHBCSMzUvAVYnLRChYk' +
+  'NOEl8RcYGRomJygpKjU2Nzg5OkNERUZHSElKU1RVVldYWVpjZGVmZ2hpanN0dXZ3eHl6goOEhYaHiImKkpOU' +
+  'lZaXmJmaoqOkpaanqKmqsrO0tba3uLm6wsPExcbHyMnK0tPU1dbX2Nna4uPk5ebn6Onq8vP09fb3+Pn6/9oA' +
+  'DAMBAAIRAxEAPwD3+iiigD//2Q==';
 
-const doc = buildCutlistPdf(result, opt);
+/** Assembly view whose balloons sit at fixed fractions of the capture, so
+ *  they land in the same relative spots at every page size. */
+const view = (shot, ids) => ({
+  image: { dataUrl: STUB_JPEG, width: shot.w, height: shot.h },
+  labels: ids.map(([fx, fy, text]) => ({ x: fx * shot.w, y: fy * shot.h, text })),
+});
+
+const PAPERS = ['cutlist-4-3', 'letter-landscape', 'legal-landscape', 'tabloid-landscape'];
+
 const out = join(here, '_output');
 mkdirSync(out, { recursive: true });
-const file = join(out, 'cutlist_synthetic.pdf');
-writeFileSync(file, Buffer.from(doc.output('arraybuffer')));
-console.log('wrote', file);
+
+for (const cutlistPaper of PAPERS) {
+  // The caller sizes its snapshots for the chosen page; mirror that here so
+  // the fixture exercises the same aspect the real export produces.
+  const shot = cutlistSnapshotTarget(cutlistPaper);
+  const opt = {
+    sheetW: 2440,
+    sheetL: 1220,
+    margin: 10,
+    kerf: 3,
+    units: 'mm',
+    jobName: 'Cutlist synthetic fixture',
+    cutlistPaper,
+    assemblyViews: [{
+      front: view(shot, [
+        [0.30, 0.28, '1a'], [0.62, 0.34, '1b'], [0.44, 0.55, '1c'],
+        [0.70, 0.68, '1d'], [0.26, 0.76, '1e'],
+      ]),
+      back: view(shot, [
+        [0.34, 0.30, '1f'], [0.66, 0.44, '1b'], [0.48, 0.70, '1c'],
+      ]),
+    }],
+  };
+  const doc = buildCutlistPdf(result, opt);
+  const file = join(out, `${process.env.CUTLIST_TAG ?? 'cutlist_synthetic'}_${cutlistPaper}.pdf`);
+  writeFileSync(file, Buffer.from(doc.output('arraybuffer')));
+  console.log(`wrote ${file}  (snapshot target ${shot.w}×${shot.h})`);
+}

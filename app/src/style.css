@@ -1051,6 +1051,22 @@ button.primary:disabled {
 .cae-callout-val { font-size: 11px; font-weight: 600; color: var(--text); }
 .cae-callout-sub { font-size: 9px; color: var(--muted); }
 
+/* Panel-id pills on bodies in the 3D view — same projected-anchor idiom as
+   the callouts above, but deliberately plainer: these are read at a glance
+   against a busy model, so it is a white pill and nothing else.
+   Named body-id-label, not part-label: .part-label is taken by the SVG text
+   in the 2D cut-layout diagram further down this file. */
+.body-id-label {
+  position: absolute; z-index: 6; pointer-events: none;
+  transform: translate(-50%, -50%);
+  background: rgba(255, 255, 255, 0.92);
+  border: 1px solid var(--line);
+  border-radius: 4px; padding: 1px 5px;
+  font-family: var(--font-mono); font-variant-numeric: tabular-nums;
+  font-size: 10px; font-weight: 600; line-height: 1.35;
+  color: var(--text); white-space: nowrap;
+}
+
 .asm-result {
   margin-top: 10px; font-family: var(--font-mono); font-variant-numeric: tabular-nums;
   font-size: 11px; color: var(--text-2); line-height: 1.45;
@@ -1272,6 +1288,57 @@ input[type="checkbox"]:focus-visible { box-shadow: 0 0 0 2px var(--accent-ring);
   color: var(--text);
   background: var(--hover-wash);
 }
+
+/* ==========================================================================
+   Export options — a <details> popover in the Cut Layout header, next to the
+   export buttons. Native disclosure, so no JS is needed to open/close it;
+   main.ts only reads the checkbox states at export time.
+   ========================================================================== */
+.export-opts { position: relative; }
+.export-opts > summary {
+  list-style: none;          /* kill the native disclosure triangle */
+  cursor: pointer;
+  user-select: none;
+}
+.export-opts > summary::-webkit-details-marker { display: none; }
+.export-opts[open] > summary { background: var(--hover-wash); }
+.export-opts-menu {
+  position: absolute;
+  top: calc(100% + 4px);
+  right: 0;
+  z-index: 9;
+  min-width: 190px;
+  padding: 6px;
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  box-shadow: var(--shadow-sm);
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+.export-opts-head {
+  margin: 4px 6px 2px;
+  font-size: 9.5px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+.export-opts-head:first-child { margin-top: 1px; }
+.export-opts-menu label {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 4px 6px;
+  border-radius: 4px;
+  font-size: 12px;
+  color: var(--text);
+  cursor: pointer;
+  white-space: nowrap;
+}
+.export-opts-menu label:hover { background: var(--hover-wash); }
+.export-opts-menu input[type='checkbox'] { margin: 0; cursor: pointer; }
 
 .pane-divider {
   background: var(--line);

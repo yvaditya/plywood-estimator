@@ -22,7 +22,44 @@ export type PdfPaper =
   | 'a4-landscape'
   /** Phone-portrait pages, one cut per page — for reading the cut sequence
    *  at the saw from a phone. */
-  | 'mobile';
+  | 'mobile'
+  /** PowerPoint 4:3 — the cutlist's default page. */
+  | 'cutlist-4-3';
+
+/** Page size for the cutlist export. Any job paper size is valid — the UI's
+ *  "Match PDF paper" option feeds whatever `paper` is set to straight through,
+ *  including the portrait and phone sizes. makeOrient always lays the sheet
+ *  long-edge-horizontal, so a portrait page is legal; it just yields a
+ *  smaller drawing. */
+export type CutlistPaper = PdfPaper;
+
+/**
+ * Optional export sections, driven by the "Options" menu in the Cut Layout
+ * header. One set governs BOTH exports; a flag naming a section an export
+ * doesn't have is simply inert there.
+ *
+ * Every field defaults to TRUE when absent (see `wants`) — an option object
+ * that omits a key, or no option object at all, yields today's full document.
+ * Sections that are already conditional on their data existing (Structure,
+ * Assembly analysis, Join split parts) are deliberately not switchable: they
+ * appear only when they have something to say, and the join guide is
+ * correctness-critical for dovetailed oversize parts.
+ */
+export interface PdfSections {
+  /** Job PDF: per-cabinet assembly overview + step cards, and the legacy
+   *  assembled/exploded guide. Cutlist: the front/back balloon pages. */
+  assembly?: boolean;
+  /** Tabular pages: Quick reference, the job-wide Panels table, and the
+   *  per-sheet panel dimension tables. */
+  panelLists?: boolean;
+  /** Cut-sequence cards, plus the Shopping list and Contents pages. */
+  cutSteps?: boolean;
+}
+
+/** Section flag lookup — absent means on. */
+function wants(opt: PdfOptions, key: keyof PdfSections): boolean {
+  return opt.sections?.[key] !== false;
+}
 
 export interface PdfOptions {
   sheetW: number;       // mm
@@ -49,6 +86,12 @@ export interface PdfOptions {
   inventoryCheck?: InventoryCheck[];
   jobName?: string;
   paper?: PdfPaper;
+  /** Page size for the cutlist export only (buildCutlistPdf). Independent of
+   *  `paper`, which drives the full job PDF. Defaults to 4:3. */
+  cutlistPaper?: CutlistPaper;
+  /** Which optional sections to include. Omitted = everything, so callers
+   *  that don't care are unaffected. */
+  sections?: PdfSections;
   currency?: string;
   jobCost?: number;
   edgeBandingMm?: number;
@@ -293,8 +336,35 @@ const PAPER_DIMS: Record<
   'a4-landscape':      { w: 842,  h: 595,  format: 'a4',       orient: 'landscape' },
   // 9:16 phone-portrait — fills a phone screen page-per-swipe.
   'mobile':            { w: 396,  h: 704,  format: [396, 704], orient: 'portrait'  },
+  // PowerPoint 4:3 — 10" × 7.5" → 720 × 540 pt. The cutlist's default and the
+  // page every cutlist type size was tuned against (see cutlistScale).
+  'cutlist-4-3':       { w: 720,  h: 540,  format: [720, 540], orient: 'landscape' },
 };
 const PAGE_PAD = 36; // 0.5"
+
+/**
+ * Cutlist chrome scale. The sheet drawing and its per-panel dimension text
+ * already scale off the page (drawSheet's `scale`, drawPart's `partPt`), but
+ * the page furniture — headers, the meta line, footers, assembly balloons —
+ * is set in absolute points tuned against the 4:3 baseline. Left unscaled it
+ * reads progressively smaller as the page grows: correct but lost on 11×17.
+ *
+ * Capped at 1.7 so the header doesn't start eating drawing area on large
+ * pages. The LOWER bound exists because "Match PDF paper" can hand us a page
+ * smaller than the 4:3 baseline (phone is 396 × 704): there the tuned sizes
+ * would overrun the page width, and overlap — not small type — is the thing
+ * to avoid on a doc meant to be zoomed.
+ *
+ *   phone 0.55 · portrait 0.85 · 4:3 and 16:9 1.00 · Letter 1.10 ·
+ *   A4 1.10 · Legal 1.13 · 11×17 1.47
+ *
+ * PAGE_PAD deliberately does NOT scale — it is a real 0.5" print margin at
+ * every size, so bigger pages gain proportionally more drawing area too.
+ */
+function cutlistScale(dims: { w: number; h: number }): number {
+  const base = PAPER_DIMS['cutlist-4-3'];
+  return clamp(Math.min(dims.w / base.w, dims.h / base.h), 0.5, 1.7);
+}
 
 // ---------------------------------------------------------------------------
 // Deferred navigation. Page numbers aren't known while a page is being drawn
@@ -343,18 +413,26 @@ export function buildPdf(result: NestResult, opt: PdfOptions): jsPDF {
 
   // 2. CONTENTS — reserved now, filled in the post-pass once every page
   //    number is known. Doubles as the "how to use this document" intro.
-  addPage('Contents');
-  const contentsPage = curPage();
+  //    Null when the section is switched off; the post-pass then skips it.
+  let contentsPage: number | null = null;
+  if (wants(opt, 'cutSteps')) {
+    addPage('Contents');
+    contentsPage = curPage();
+  }
 
   // 3. QUICK REFERENCE — every sheet at a glance; the shop-wall page.
-  addPage('Quick reference');
-  nav.toc.push({ title: 'Quick reference', desc: 'Every sheet at a glance — post this at the saw.', target: 'Quick reference' });
-  drawQuickReference(doc, result, opt, dims, labels, () => addPage('Quick reference'));
+  if (wants(opt, 'panelLists')) {
+    addPage('Quick reference');
+    nav.toc.push({ title: 'Quick reference', desc: 'Every sheet at a glance — post this at the saw.', target: 'Quick reference' });
+    drawQuickReference(doc, result, opt, dims, labels, () => addPage('Quick reference'));
+  }
 
   // 4. SHOPPING LIST — what to buy first
-  addPage('Shopping list');
-  nav.toc.push({ title: 'Shopping list', desc: 'Materials to buy before starting.', target: 'Shopping list' });
-  drawShoppingListPage(doc, opt, dims);
+  if (wants(opt, 'cutSteps')) {
+    addPage('Shopping list');
+    nav.toc.push({ title: 'Shopping list', desc: 'Materials to buy before starting.', target: 'Shopping list' });
+    drawShoppingListPage(doc, opt, dims);
+  }
 
   // 5. PANELS — ONE job-wide dimensions table: every placed panel across
   //    all sheets, grouped by identical (length × width × thickness). Same
@@ -362,7 +440,7 @@ export function buildPdf(result: NestResult, opt: PdfOptions): jsPDF {
   //    the sheet layouts. Skipped for CNC jobs (the machine cuts straight
   //    from the sheet contours; the saw-shop dimensions table is dead
   //    weight there).
-  if (!opt.cnc) {
+  if (!opt.cnc && wants(opt, 'panelLists')) {
     addPage('Panels');
     nav.toc.push({ title: 'Panels', desc: 'Every panel size in the job — codes point to the sheet layouts.', target: 'Panels' });
     drawPanelTable(doc, 'Panels', groupAllPanelsBySize(result), opt, dims, () => addPage('Panels'));
@@ -417,13 +495,13 @@ export function buildPdf(result: NestResult, opt: PdfOptions): jsPDF {
       addPage(sectionName);
       drawSheet(doc, sheet, opt, dims, labels, cabinetByPanelId, nav, curPage);
       // (b) Panel dimensions for THIS sheet, grouped by identical size.
-      if (sheet.parts.length > 0) {
+      if (sheet.parts.length > 0 && wants(opt, 'panelLists')) {
         drawSheetPanelTable(doc, sheet, opt, dims, () => { addPage(sectionName); });
       }
       // (c) The sheet's cuts. CNC jobs skip the cards entirely: a
       // router/waterjet follows the part contours, so a panel-saw cut
       // sequence would be fiction.
-      if (!opt.cnc) {
+      if (!opt.cnc && wants(opt, 'cutSteps')) {
         drawCutsForSingleSheet(doc, sheet, opt, dims,
           () => { addPage(sectionName); });
       }
@@ -449,7 +527,9 @@ export function buildPdf(result: NestResult, opt: PdfOptions): jsPDF {
   }
 
   // 7. ASSEMBLY — overview page per cabinet, then step-by-step panel cards
-  if (opt.cabinets && opt.cabinets.length > 0) {
+  if (!wants(opt, 'assembly')) {
+    // nothing — the caller switched the assembly pages off
+  } else if (opt.cabinets && opt.cabinets.length > 0) {
     for (const cab of opt.cabinets) {
       const sectionName = `Assembly · ${cab.name}`;
       addPage(sectionName);
@@ -468,7 +548,7 @@ export function buildPdf(result: NestResult, opt: PdfOptions): jsPDF {
 
   // Post-passes, in order: fill the Contents page (needs final page
   // numbers), sidebar bookmarks, headers/footers, then deferred notes/links.
-  drawContents(doc, contentsPage, dims, opt, nav, sectionPerPage);
+  if (contentsPage !== null) drawContents(doc, contentsPage, dims, opt, nav, sectionPerPage);
   addBookmarks(doc, nav, sectionPerPage, result);
   paginateAndDecorate(doc, dims, opt, sectionPerPage);
   resolveNav(doc, nav, sectionPerPage);
@@ -480,16 +560,16 @@ export function buildPdf(result: NestResult, opt: PdfOptions): jsPDF {
 // CUTLIST PDF — the minimal companion to the full job PDF: ONE page per cut
 // sheet and nothing else. Each page is the sheet-overview drawing (layout
 // with every panel's id + dimensions on the full sheet, plus the overall
-// sheet dim lines). Fixed 4:3 landscape pages — PowerPoint 4:3, 10" × 7.5"
-// → 720 × 540 pt — independent of the job-PDF paper setting.
+// sheet dim lines). Landscape at the caller's chosen page size (4:3 default,
+// Letter / Legal / 11×17) — independent of the job-PDF paper setting.
 // ---------------------------------------------------------------------------
-const CUTLIST_DIMS = { w: 720, h: 540 };
-
 export function buildCutlistPdf(result: NestResult, opt: PdfOptions): jsPDF {
+  const dims = PAPER_DIMS[opt.cutlistPaper ?? 'cutlist-4-3'];
+  const k = cutlistScale(dims);
   const doc = new jsPDF({
-    orientation: 'landscape',
+    orientation: dims.orient,
     unit: 'pt',
-    format: [CUTLIST_DIMS.w, CUTLIST_DIMS.h],
+    format: dims.format,
   });
   const sheets = result.groups.flatMap((g) => g.sheets);
   // Panel id → cabinet name (when the caller passes cabinets): renders the
@@ -499,15 +579,17 @@ export function buildCutlistPdf(result: NestResult, opt: PdfOptions): jsPDF {
     for (const id of cab.partIds) cabinetByPanelId.set(id, cab.name);
   }
   sheets.forEach((sheet, i) => {
-    if (i > 0) doc.addPage([CUTLIST_DIMS.w, CUTLIST_DIMS.h], 'landscape');
-    drawSheet(doc, sheet, opt, CUTLIST_DIMS, undefined, cabinetByPanelId.size > 0 ? cabinetByPanelId : undefined, undefined, undefined, true);
+    if (i > 0) doc.addPage(dims.format, dims.orient);
+    drawSheet(doc, sheet, opt, dims, undefined, cabinetByPanelId.size > 0 ? cabinetByPanelId : undefined, undefined, undefined, true);
   });
   // Assembly page(s) — assembled front + back 3/4 views with the panel-id
   // balloons ON the panels, so the reader sees where every numbered panel
   // goes without a legend detour. One page per cabinet.
-  for (const views of opt.assemblyViews ?? []) {
-    doc.addPage([CUTLIST_DIMS.w, CUTLIST_DIMS.h], 'landscape');
-    drawCutlistAssemblyPage(doc, views, opt);
+  if (wants(opt, 'assembly')) {
+    for (const views of opt.assemblyViews ?? []) {
+      doc.addPage(dims.format, dims.orient);
+      drawCutlistAssemblyPage(doc, views, opt, dims);
+    }
   }
   // Footer on every page: job name left, page x/y right — just enough to
   // reshuffle a printed stack, no other chrome.
@@ -515,40 +597,70 @@ export function buildCutlistPdf(result: NestResult, opt: PdfOptions): jsPDF {
   for (let i = 1; i <= n; i++) {
     doc.setPage(i);
     doc.setFont('helvetica', 'normal');
-    doc.setFontSize(8);
+    doc.setFontSize(8 * k);
     doc.setTextColor(150);
-    if (opt.jobName) doc.text(opt.jobName, PAGE_PAD, CUTLIST_DIMS.h - 14);
-    doc.text(`${i} / ${n}`, CUTLIST_DIMS.w - PAGE_PAD, CUTLIST_DIMS.h - 14, { align: 'right' });
+    if (opt.jobName) doc.text(opt.jobName, PAGE_PAD, dims.h - 14 * k);
+    doc.text(`${i} / ${n}`, dims.w - PAGE_PAD, dims.h - 14 * k, { align: 'right' });
     doc.setTextColor(0);
   }
   return doc;
 }
 
+/**
+ * Pixel target for the cutlist's assembly snapshots at a given page size.
+ * Matches the aspect of the half-page column each view is drawn into, and
+ * grows with the page so a larger page gets a genuinely sharper image rather
+ * than the 4:3 capture upscaled. Long side capped at 2000 px — beyond that
+ * the composer resize costs more than the print gains.
+ *
+ * Lives here so the column geometry stays in one file with the page that
+ * draws it; main.ts just asks for the size.
+ */
+export function cutlistSnapshotTarget(paper: CutlistPaper = 'cutlist-4-3'): { w: number; h: number } {
+  const dims = PAPER_DIMS[paper];
+  const k = cutlistScale(dims);
+  // Mirrors drawCutlistAssemblyPage's column box.
+  const colW = (dims.w - 2 * PAGE_PAD - 18 * k) / 2;
+  const colH = (dims.h - PAGE_PAD - 16 * k) - (PAGE_PAD + 14 * k);
+  const PX_PER_PT = 3;
+  let w = colW * PX_PER_PT;
+  let h = colH * PX_PER_PT;
+  const over = Math.max(w, h) / 2000;
+  if (over > 1) { w /= over; h /= over; }
+  return { w: Math.round(w), h: Math.round(h) };
+}
+
 /** Cutlist assembly page: assembled front + back 3/4 views side by side,
  *  panel-id balloons directly on the panels. Minimal chrome, same header
  *  style as the sheet pages. */
-function drawCutlistAssemblyPage(doc: jsPDF, views: CutlistAssemblyViews, opt: PdfOptions) {
-  const PAGE_W = CUTLIST_DIMS.w;
-  const PAGE_H = CUTLIST_DIMS.h;
+function drawCutlistAssemblyPage(
+  doc: jsPDF,
+  views: CutlistAssemblyViews,
+  opt: PdfOptions,
+  dims: { w: number; h: number },
+) {
+  const PAGE_W = dims.w;
+  const PAGE_H = dims.h;
+  const k = cutlistScale(dims);
   doc.setFont('helvetica', 'bold');
-  doc.setFontSize(14);
+  doc.setFontSize(14 * k);
   doc.setTextColor(0);
   doc.text('Assembly', PAGE_PAD, PAGE_PAD - 4);
   const sub = views.name ?? opt.jobName;
   if (sub) {
     const w = doc.getTextWidth('Assembly');
     doc.setFont('helvetica', 'normal');
-    doc.setFontSize(11);
+    doc.setFontSize(11 * k);
     doc.setTextColor(110);
-    doc.text(sub, PAGE_PAD + w + 12, PAGE_PAD - 4);
+    doc.text(sub, PAGE_PAD + w + 12 * k, PAGE_PAD - 4);
     doc.setTextColor(0);
   }
-  const top = PAGE_PAD + 14;
-  const bottom = PAGE_H - PAGE_PAD - 16; // caption strip under each view
-  const gap = 18;
+  const top = PAGE_PAD + 14 * k;
+  const bottom = PAGE_H - PAGE_PAD - 16 * k; // caption strip under each view
+  const gap = 18 * k;
   const colW = (PAGE_W - 2 * PAGE_PAD - gap) / 2;
-  drawCutlistView(doc, views.front, 'Front', PAGE_PAD, top, colW, bottom - top);
-  drawCutlistView(doc, views.back, 'Back', PAGE_PAD + colW + gap, top, colW, bottom - top);
+  drawCutlistView(doc, views.front, 'Front', PAGE_PAD, top, colW, bottom - top, k);
+  drawCutlistView(doc, views.back, 'Back', PAGE_PAD + colW + gap, top, colW, bottom - top, k);
 }
 
 /** One assembled view: aspect-fit image + white-pill id balloons at each
@@ -558,6 +670,9 @@ function drawCutlistView(
   view: CutlistView,
   caption: string,
   x: number, y: number, w: number, h: number,
+  /** Cutlist chrome scale — balloons and caption are page furniture, not
+   *  drawing, so they scale with the page rather than with the image. */
+  k: number,
 ) {
   const img = view.image;
   const scale = Math.min(w / img.width, h / img.height);
@@ -566,8 +681,8 @@ function drawCutlistView(
   const dx = x + (w - dw) / 2;
   const dy = y + (h - dh) / 2;
   doc.addImage(img.dataUrl, 'JPEG', dx, dy, dw, dh);
-  doc.setFontSize(7.5);
-  doc.setLineWidth(0.4);
+  doc.setFontSize(7.5 * k);
+  doc.setLineWidth(0.4 * k);
   for (const l of view.labels) {
     const bx = dx + l.x * scale;
     const by = dy + l.y * scale;
@@ -575,14 +690,14 @@ function drawCutlistView(
     const tw = doc.getTextWidth(l.text);
     doc.setFillColor(255, 255, 255);
     doc.setDrawColor(...CUT_OBJ_INK);
-    doc.roundedRect(bx - tw / 2 - 3, by - 5, tw + 6, 10, 2, 2, 'FD');
+    doc.roundedRect(bx - tw / 2 - 3 * k, by - 5 * k, tw + 6 * k, 10 * k, 2 * k, 2 * k, 'FD');
     doc.setTextColor(...CUT_OBJ_INK);
-    doc.text(l.text, bx, by + 2.6, { align: 'center' });
+    doc.text(l.text, bx, by + 2.6 * k, { align: 'center' });
   }
   doc.setFont('helvetica', 'normal');
-  doc.setFontSize(8.5);
+  doc.setFontSize(8.5 * k);
   doc.setTextColor(130);
-  doc.text(caption, x + w / 2, y + h + 12, { align: 'center' });
+  doc.text(caption, x + w / 2, y + h + 12 * k, { align: 'center' });
   doc.setTextColor(0);
 }
 
@@ -1494,34 +1609,22 @@ function drawSheet(
 ) {
   const PAGE_W = dims.w;
   const PAGE_H = dims.h;
+  // Page furniture (header, meta line, cross-refs) is set in points tuned
+  // against the 4:3 cutlist page; on a larger page it scales so it stays in
+  // proportion. The job PDF drives its own paper sizes and its type is
+  // already tuned per size, so it pins k to 1 and is unaffected.
+  const k = detailDims ? cutlistScale(dims) : 1;
   // Use the sheet's actual chosen dims (auto-orient may have swapped them)
   const swMm = sheet.sheetW;
   const slMm = sheet.sheetL;
   const orient = makeOrient(swMm, slMm);
   // Header — title left; ALL the sheet metadata in one line on the right
   // (dims, thickness, part count, fill, reusable offcut).
-  doc.setFont('helvetica', 'bold');
-  doc.setFontSize(14);
-  doc.text(`Sheet ${sheet.globalIndex}`, PAGE_PAD, PAGE_PAD - 4);
-  // Cutlist pages carry the JOB TITLE in the header next to the sheet
-  // number (the job PDF has a cover page for this; the cutlist doesn't).
-  if (detailDims && opt.jobName) {
-    const shW = doc.getTextWidth(`Sheet ${sheet.globalIndex}`);
-    doc.setFont('helvetica', 'normal');
-    doc.setFontSize(11);
-    doc.setTextColor(110);
-    const budget = PAGE_W - PAGE_PAD - 330 - (PAGE_PAD + shW + 12);
-    let title = opt.jobName;
-    if (doc.getTextWidth(title) > budget) {
-      while (title.length > 3 && doc.getTextWidth(`${title}…`) > budget) title = title.slice(0, -1);
-      title += '…';
-    }
-    doc.text(title, PAGE_PAD + shW + 12, PAGE_PAD - 4);
-    doc.setTextColor(0);
-  }
-  doc.setFont('helvetica', 'normal');
-  doc.setFontSize(9);
-  doc.setTextColor(120);
+  //
+  // The meta line is composed and MEASURED first, before anything is drawn:
+  // it is right-aligned to the page edge, so its real width is what's left
+  // for the job title. Reserving a flat number instead was only correct at
+  // one page width.
   const fill = sheet.parts.length > 0
     ? (sheet.usedArea / (swMm * slMm)) * 100
     : 0;
@@ -1533,14 +1636,43 @@ function drawSheet(
   if (sheet.largestFree && Math.min(sheet.largestFree.w, sheet.largestFree.h) >= 50) {
     meta.push(`offcut ${fmtDim(Math.max(sheet.largestFree.w, sheet.largestFree.h), opt.units)} × ${fmtDim(Math.min(sheet.largestFree.w, sheet.largestFree.h), opt.units)}`);
   }
-  doc.text(meta.join('   ·   '), PAGE_W - PAGE_PAD, PAGE_PAD - 4, { align: 'right' });
+  const metaText = meta.join('   ·   ');
+  doc.setFont('helvetica', 'normal');
+  doc.setFontSize(9 * k);
+  const metaW = doc.getTextWidth(metaText);
+  // Left edge of the meta line — nothing drawn from the left may cross it.
+  const metaLeft = PAGE_W - PAGE_PAD - metaW - 18 * k;
+
+  doc.setFont('helvetica', 'bold');
+  doc.setFontSize(14 * k);
+  doc.text(`Sheet ${sheet.globalIndex}`, PAGE_PAD, PAGE_PAD - 4);
+  // Cutlist pages carry the JOB TITLE in the header next to the sheet
+  // number (the job PDF has a cover page for this; the cutlist doesn't).
+  if (detailDims && opt.jobName) {
+    const shW = doc.getTextWidth(`Sheet ${sheet.globalIndex}`);
+    doc.setFont('helvetica', 'normal');
+    doc.setFontSize(11 * k);
+    doc.setTextColor(110);
+    const budget = metaLeft - (PAGE_PAD + shW + 12 * k);
+    let title = opt.jobName;
+    if (doc.getTextWidth(title) > budget) {
+      while (title.length > 3 && doc.getTextWidth(`${title}…`) > budget) title = title.slice(0, -1);
+      title += '…';
+    }
+    doc.text(title, PAGE_PAD + shW + 12 * k, PAGE_PAD - 4);
+    doc.setTextColor(0);
+  }
+  doc.setFont('helvetica', 'normal');
+  doc.setFontSize(9 * k);
+  doc.setTextColor(120);
+  doc.text(metaText, PAGE_W - PAGE_PAD, PAGE_PAD - 4, { align: 'right' });
   doc.setTextColor(0);
 
   // Cross-references under the title, kept to a single subtle line:
   //   - which cabinet each panel belongs to (only when >1 cabinet);
   //   - a "→ Join split parts p.N" note when the sheet carries dovetail
   //     segments (drawn in the nav post-pass, where the page number exists).
-  let refX = PAGE_PAD + 64;
+  let refX = PAGE_PAD + 64 * k;
   if (cabinetByPanelId && cabinetByPanelId.size > 0) {
     const byCab = new Map<string, string[]>();
     for (const p of sheet.parts) {
@@ -1555,10 +1687,14 @@ function drawSheet(
         .map(([cab, ids]) => `${cab}: ${ids.sort().join(',')}`)
         .join('   ·   ');
       doc.setFont('helvetica', 'normal');
-      doc.setFontSize(8.5);
+      doc.setFontSize(8.5 * k);
       doc.setTextColor(110);
-      doc.text(refs, refX, PAGE_PAD - 4, { maxWidth: PAGE_W - refX - 260 });
-      refX += doc.getTextWidth(refs) + 18;
+      // Cutlist stops this line at the measured meta line; the job PDF keeps
+      // its flat reserve so its pages render exactly as before.
+      doc.text(refs, refX, PAGE_PAD - 4, {
+        maxWidth: (detailDims ? metaLeft : PAGE_W - 260) - refX,
+      });
+      refX += doc.getTextWidth(refs) + 18 * k;
       doc.setTextColor(0);
     }
   }
@@ -1572,14 +1708,15 @@ function drawSheet(
     });
   }
 
-  // Available drawing area
+  // Available drawing area. The gap under the header scales with the header
+  // type so a 20pt title on 11×17 can't crowd the stock outline.
   const drawX = PAGE_PAD;
-  const drawY = PAGE_PAD + 10;
+  const drawY = PAGE_PAD + 10 * k;
   const drawW = PAGE_W - 2 * PAGE_PAD;
   const drawH = PAGE_H - drawY - PAGE_PAD;
 
   // Reserve room for dimension lines outside the sheet
-  const dimRoom = 26;
+  const dimRoom = 26 * k;
   const innerW = drawW - dimRoom;
   const innerH = drawH - dimRoom;
 
@@ -1642,8 +1779,10 @@ function drawSheet(
   const shortLabel = fmtDim(Math.min(swMm, slMm), opt.units);
   const sheetInk = detailDims ? CUT_DIM_INK : undefined;
   const sheetDimW = detailDims ? CUT_DIM_W : undefined;
-  drawDimH(doc, ox, ox + sheetPtW, oy + sheetPtH + 14, longLabel, sheetInk, sheetDimW);
-  drawDimV(doc, oy, oy + sheetPtH, ox - 14, shortLabel, sheetInk, sheetDimW);
+  // Offset and type size ride the same k as dimRoom, so the sheet dimension
+  // stays centred in its reserve at every page size (k is 1 on the job PDF).
+  drawDimH(doc, ox, ox + sheetPtW, oy + sheetPtH + 14 * k, longLabel, sheetInk, sheetDimW, DIM_TEXT_PT * k);
+  drawDimV(doc, oy, oy + sheetPtH, ox - 14 * k, shortLabel, sheetInk, sheetDimW, DIM_TEXT_PT * k);
 }
 
 function drawPart(
@@ -1842,16 +1981,22 @@ function drawPart(
       vx = bestDimLinePos(vxDef, px + 4, px + pwPt - 4, scoreVBand);
       if (scoreVBand(vx) < DIM_SCAN_SAMPLES) vx = bestDimLinePos(vxDef, px + 4, px + pwPt - 4, scoreV);
     }
-    // Width dim — value registered first, so brokenLine leaves its gap.
+    // BOTH values are registered before EITHER line is drawn. brokenLine only
+    // breaks around rects already in the registry, so registering per-dim (W
+    // rect → W line → H rect → H line) left the width line striking the
+    // height value, which had not been registered yet — the break was
+    // one-directional. On a narrow strip the two cross at right angles and
+    // the width line ran straight through the rotated "63.0 mm".
     const wTw = doc.getTextWidth(wLabel);
+    const hTw = doc.getTextWidth(hLabel);
     reg.rects.push(labelRectAt(cx, hy, wTw, fs, 0));
+    reg.rects.push(labelRectAt(vx, cy, hTw, fs, 90));
+    // Width dim
     brokenLine(doc, px, hy, px + pwPt, hy, reg);
     drawDimTri(doc, px, hy, +1, 0, aLen, aW);
     drawDimTri(doc, px + pwPt, hy, -1, 0, aLen, aW);
     doc.text(wLabel, cx, hy + fs * 0.35, { align: 'center' });
     // Height dim — vertical line broken around the rotated value.
-    const hTw = doc.getTextWidth(hLabel);
-    reg.rects.push(labelRectAt(vx, cy, hTw, fs, 90));
     brokenLine(doc, vx, py, vx, py + phPt, reg);
     drawDimTri(doc, vx, py, 0, +1, aLen, aW);
     drawDimTri(doc, vx, py + phPt, 0, -1, aLen, aW);
@@ -2286,6 +2431,9 @@ const CUT_DIM_W = 0.25;  // dimension line weight
 function drawDimH(
   doc: jsPDF, x1: number, x2: number, y: number, label: string,
   ink: [number, number, number] = DIM_COLOR, lineW = DIM_LINE_W,
+  /** Value type size. Overridable so the cutlist's overall-sheet dimension
+   *  can scale with the page like the rest of its chrome. */
+  textPt = DIM_TEXT_PT,
 ) {
   doc.setDrawColor(...ink);
   doc.setLineWidth(lineW);
@@ -2301,7 +2449,7 @@ function drawDimH(
   // Horizontal label centered above the dim line
   doc.setTextColor(...ink);
   doc.setFont('helvetica', 'normal');
-  doc.setFontSize(DIM_TEXT_PT);
+  doc.setFontSize(textPt);
   doc.text(label, (x1 + x2) / 2, y - 3, { align: 'center' });
   doc.setTextColor(0);
 }
@@ -2309,6 +2457,7 @@ function drawDimH(
 function drawDimV(
   doc: jsPDF, y1: number, y2: number, x: number, label: string,
   ink: [number, number, number] = DIM_COLOR, lineW = DIM_LINE_W,
+  textPt = DIM_TEXT_PT,
 ) {
   doc.setDrawColor(...ink);
   doc.setLineWidth(lineW);
@@ -2322,7 +2471,7 @@ function drawDimV(
   // Vertical text: rotated 90° beside the dim line
   doc.setTextColor(...ink);
   doc.setFont('helvetica', 'normal');
-  doc.setFontSize(DIM_TEXT_PT);
+  doc.setFontSize(textPt);
   doc.text(label, x - 4, (y1 + y2) / 2, { align: 'center', angle: 90 });
   doc.setTextColor(0);
 }

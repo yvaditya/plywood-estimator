@@ -208,6 +208,15 @@
                 <option value="a4-landscape">A4 landscape</option>
               </select>
             </label>
+            <label>Cutlist page
+              <select id="cutlistPaper">
+                <option value="match" selected>Match PDF paper</option>
+                <option value="cutlist-4-3">4:3 (10×7.5")</option>
+                <option value="letter-landscape">Letter landscape</option>
+                <option value="legal-landscape">Legal landscape</option>
+                <option value="tabloid-landscape">11×17 landscape</option>
+              </select>
+            </label>
           </div>
         </section>
 
@@ -446,6 +455,25 @@
                   </svg>
                   Cutlist
                 </button>
+                <details id="exportOptions" class="export-opts">
+                  <summary class="ghost" title="Choose which sections the PDF exports include">
+                    <svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                      <path d="M4 6h16M4 12h16M4 18h16" />
+                      <circle cx="9" cy="6" r="2" fill="currentColor" stroke="none" />
+                      <circle cx="15" cy="12" r="2" fill="currentColor" stroke="none" />
+                      <circle cx="8" cy="18" r="2" fill="currentColor" stroke="none" />
+                    </svg>
+                    Options
+                  </summary>
+                  <div class="export-opts-menu" role="group" aria-label="Export options">
+                    <p class="export-opts-head">Include in PDF exports</p>
+                    <label><input type="checkbox" id="optAssembly" checked /> Assembly pages</label>
+                    <label><input type="checkbox" id="optPanelLists" checked /> Panel &amp; cut lists</label>
+                    <label><input type="checkbox" id="optCutSteps" checked /> Cut sequence pages</label>
+                    <p class="export-opts-head">3D view</p>
+                    <label><input type="checkbox" id="opt3dLabels" /> Part labels on bodies</label>
+                  </div>
+                </details>
                 <button id="layoutMaxBtn" class="pane-max" title="Maximize / restore">
                   <svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
                     <path d="M4 10V4h6M20 14v6h-6M14 4h6v6M10 20H4v-6" />
