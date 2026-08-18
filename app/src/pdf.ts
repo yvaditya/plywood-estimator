@@ -683,16 +683,36 @@ function drawCutlistView(
   doc.addImage(img.dataUrl, 'JPEG', dx, dy, dw, dh);
   doc.setFontSize(7.5 * k);
   doc.setLineWidth(0.4 * k);
+  doc.setFont('helvetica', 'bold');
+
+  // Balloons sit at each panel's projected centre, which on a 3/4 view can
+  // put two of them on the same spot — a thin panel seen edge-on projects to
+  // almost the same point as its neighbour. Overlapping pills are unreadable,
+  // so each one is nudged along a vertical ladder (down, up, further down, …)
+  // until it clears every pill already placed. The nudge is small enough that
+  // the balloon still reads as belonging to its panel.
+  const pillH = 10 * k;
+  const step = pillH + 1.5 * k;
+  const placed: { x: number; y: number; w: number; h: number }[] = [];
+  const hits = (a: { x: number; y: number; w: number; h: number }) =>
+    placed.some((b) => a.x < b.x + b.w && a.x + a.w > b.x
+                    && a.y < b.y + b.h && a.y + a.h > b.y);
   for (const l of view.labels) {
+    const tw = doc.getTextWidth(l.text);
+    const pillW = tw + 6 * k;
     const bx = dx + l.x * scale;
     const by = dy + l.y * scale;
-    doc.setFont('helvetica', 'bold');
-    const tw = doc.getTextWidth(l.text);
+    let box = { x: bx - pillW / 2, y: by - pillH / 2, w: pillW, h: pillH };
+    for (let i = 1; i <= 8 && hits(box); i++) {
+      const off = Math.ceil(i / 2) * step * (i % 2 === 1 ? 1 : -1);
+      box = { x: bx - pillW / 2, y: by - pillH / 2 + off, w: pillW, h: pillH };
+    }
+    placed.push(box);
     doc.setFillColor(255, 255, 255);
     doc.setDrawColor(...CUT_OBJ_INK);
-    doc.roundedRect(bx - tw / 2 - 3 * k, by - 5 * k, tw + 6 * k, 10 * k, 2 * k, 2 * k, 'FD');
+    doc.roundedRect(box.x, box.y, box.w, box.h, 2 * k, 2 * k, 'FD');
     doc.setTextColor(...CUT_OBJ_INK);
-    doc.text(l.text, bx, by + 2.6 * k, { align: 'center' });
+    doc.text(l.text, box.x + box.w / 2, box.y + box.h / 2 + 2.6 * k, { align: 'center' });
   }
   doc.setFont('helvetica', 'normal');
   doc.setFontSize(8.5 * k);
