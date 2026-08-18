@@ -25,6 +25,12 @@ import {
   type CutStrategy,
   isCncStrategy,
 } from './nest';
+import {
+  beginRearrangeRender,
+  cancelDrag,
+  makePartDraggable,
+  registerSheet,
+} from './rearrange';
 import { sheetToDxf, downloadDxf } from './dxf';
 import { buildStep, type StepPart } from './stepExport';
 import {
@@ -486,6 +492,10 @@ const pdfPaperSelect = $<HTMLSelectElement>('pdfPaper');
 const cutlistPaperSelect = $<HTMLSelectElement>('cutlistPaper');
 // Export options menu (Cut Layout header). One set of switches drives BOTH
 // PDF exports; the 3D one is viewport-only.
+const rearrangeBtn = $<HTMLButtonElement>('rearrangeBtn');
+/** Manual layout editing on/off. Lives here rather than in `state` because it
+ *  is a view mode, not part of the job — re-estimating drops it. */
+let rearrangeOn = false;
 const optAssembly = $<HTMLInputElement>('optAssembly');
 const optPanelLists = $<HTMLInputElement>('optPanelLists');
 const optCutSteps = $<HTMLInputElement>('optCutSteps');
@@ -2859,6 +2869,7 @@ async function runEstimate(opts: { seed?: number; deepSearch?: boolean } = {}) {
   downloadPdfBtn.disabled = true;
   downloadPhonePdfBtn.disabled = true;
   downloadCutlistPdfBtn.disabled = true;
+  rearrangeBtn.disabled = true;
   replayBtn.disabled = true;
 
   // Capture trial frames for the replay button. We do NOT paint frames live
@@ -3162,6 +3173,18 @@ function renderResults() {
   const sz = state.lastSheet;
   if (!result || !sz) return;
 
+  // Arm (or disarm) manual rearrange for the sheets about to be built. The
+  // registry is rebuilt every render because the old SVG nodes are discarded.
+  cancelDrag();
+  beginRearrangeRender(rearrangeOn ? {
+    result,
+    margin: sz.margin,
+    kerf: sz.kerf,
+    // renderResults re-derives the metrics tiles and the shopping list, and
+    // re-arms the mode for the freshly built SVGs.
+    onCommit: () => renderResults(),
+  } : null);
+
   resultsEmpty.hidden = true;
   resultsDetail.hidden = false;
   downloadDxfBtn.disabled = false;
@@ -3169,6 +3192,7 @@ function renderResults() {
   downloadPdfBtn.disabled = false;
   downloadPhonePdfBtn.disabled = false;
   downloadCutlistPdfBtn.disabled = false;
+  rearrangeBtn.disabled = false;
   pushPartLabelsToViewer();
   const totalSheets = result.groups.reduce((a, g) => a + g.sheets.length, 0);
 
@@ -3177,6 +3201,15 @@ function renderResults() {
   detailTitle.textContent = `${totalSheets} ${totalSheets === 1 ? 'sheet' : 'sheets'}`;
   detailSub.textContent = `kerf ${fmtDim(sz.kerf, state.units)} · margin ${fmtDim(sz.margin, state.units)}`;
   detailSvg.innerHTML = '';
+  if (rearrangeOn) {
+    const hint = document.createElement('p');
+    hint.className = 'rearrange-hint';
+    hint.textContent =
+      'Drag a panel to move it on its sheet or onto another. It snaps to edges '
+      + 'a kerf apart; red means it will not fit and the panel springs back. '
+      + 'Re-run Estimate to start over.';
+    detailSvg.appendChild(hint);
+  }
   result.groups.forEach((g, gi) => {
     g.sheets.forEach((sh, si) => {
       const key = `g${gi}-s${si}`;
@@ -3220,7 +3253,7 @@ function renderResults() {
       }
       const svgWrap = document.createElement('div');
       svgWrap.className = 'sheet-entry-svg';
-      svgWrap.appendChild(buildSheetSvg(sh, tw, tl, sz.margin, true));
+      svgWrap.appendChild(buildSheetSvg(sh, tw, tl, sz.margin, true, rearrangeOn));
       entry.appendChild(svgWrap);
       // Click to select — visual highlight + remembered active key.
       entry.addEventListener('click', () => {
@@ -3475,6 +3508,9 @@ function buildSheetSvg(
   sheetL: number,
   margin: number,
   withDimensions: boolean,
+  /** Wire this SVG up as a rearrange drag source / drop target. Only the
+   *  full-size sheet entries do — thumbnails are far too small to drag in. */
+  draggable = false,
 ): SVGSVGElement {
   const svgNS = 'http://www.w3.org/2000/svg';
   const svg = document.createElementNS(svgNS, 'svg');
@@ -3506,8 +3542,11 @@ function buildSheetSvg(
 
   // Parts
   for (const p of sheet.parts) {
-    svg.appendChild(buildPartShape(svgNS, p, withDimensions, sheet.globalIndex));
+    const g = buildPartShape(svgNS, p, withDimensions, sheet.globalIndex);
+    svg.appendChild(g);
+    if (draggable) makePartDraggable(g as SVGGElement, p, sheet);
   }
+  if (draggable) registerSheet(svg, sheet);
 
   // Overall sheet dimensions (ANSI: dim lines OUTSIDE the sheet with
   // triangular arrowheads + small witness lines from the sheet corners).
@@ -4027,6 +4066,13 @@ function pushPartLabelsToViewer() {
 
 opt3dLabels.addEventListener('change', () => {
   viewer.setPartLabelsVisible(opt3dLabels.checked);
+});
+
+rearrangeBtn.addEventListener('click', () => {
+  rearrangeOn = !rearrangeOn;
+  rearrangeBtn.classList.toggle('is-active', rearrangeOn);
+  rearrangeBtn.setAttribute('aria-pressed', String(rearrangeOn));
+  renderResults();
 });
 
 /** Current state of the export Options menu, shared by both PDF exports. */

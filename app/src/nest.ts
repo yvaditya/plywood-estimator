@@ -504,7 +504,7 @@ function placementToPart(
  *     panel's separation from the surrounding stock. A panel is considered
  *     fully separated when all of its interior edges have been cut.
  */
-function annotatePlacedParts(sheet: NestSheet) {
+export function annotatePlacedParts(sheet: NestSheet) {
   // Sort by position for stable per-sheet labels.
   const sorted = sheet.parts.slice().sort((a, b) => {
     if (Math.abs(a.y - b.y) > 0.5) return a.y - b.y;
