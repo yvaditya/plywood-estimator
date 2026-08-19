@@ -24,6 +24,7 @@ import {
   type PlacedPart,
   type CutStrategy,
   isCncStrategy,
+  migrateCutStrategy,
 } from './nest';
 import {
   beginRearrangeRender,
@@ -426,7 +427,7 @@ function applyThicknessOverride(measuredMm: number): number {
 
 // The dovetail auto-split only makes sense for contour-cutting strategies.
 function syncSplitOversizeVisibility() {
-  splitOversizeRow.hidden = !isCncStrategy((cutStrategySelect.value as CutStrategy) || 'free');
+  splitOversizeRow.hidden = !isCncStrategy(migrateCutStrategy(cutStrategySelect.value));
 }
 cutStrategySelect.addEventListener('change', syncSplitOversizeVisibility);
 syncSplitOversizeVisibility();
@@ -2888,7 +2889,9 @@ async function runEstimate(opts: { seed?: number; deepSearch?: boolean } = {}) {
   state.lastTrialFrames = [];
   state.lastTrialMetrics = [];
 
-  const strategy = (cutStrategySelect.value as CutStrategy) || 'free';
+  // Through the migration helper: a session holding a value from before the
+  // strategy list was collapsed maps onto whichever option absorbed it.
+  const strategy = migrateCutStrategy(cutStrategySelect.value);
   state.lastStrategy = strategy;
   const isCnc = isCncStrategy(strategy);
 

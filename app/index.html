@@ -110,10 +110,8 @@
             </label>
             <label style="grid-column: 1 / -1">Cut strategy
               <select id="cutStrategy">
-                <option value="free">Max yield (any cuts)</option>
                 <option value="guillotine" selected>Min cuts (track saw / panel saw)</option>
-                <option value="guillotine-exact">Min cuts+ (exhaustive search, slower)</option>
-                <option value="save-last">Max yield, save last sheet</option>
+                <option value="free">Max utilization (any cuts)</option>
                 <option value="cnc">CNC nest (any angle · router / waterjet)</option>
               </select>
             </label>

@@ -71,15 +71,21 @@ Requires Node 18 or newer.
   direction is axis-aligned with the sheet — angled cuts are minimized.
 
 ### Cut sheet nesting
-- **Five cut strategies**:
-  - **Max yield** — MaxRects bin packer (Jukka Jylänki), best yield.
-  - **Min cuts** — guillotine packing (shelf + SAS trials). Every cut
-    goes edge-to-edge — producible with a track saw or panel saw.
-  - **Min cuts+** — same objective plus a beam search over cut trees;
-    slower, often finds layouts the greedy pass can't.
-  - **Max yield, save last sheet** — the last sheet's parts cluster in
-    one corner so the remnant is a clean rectangle to keep.
+- **Three cut strategies**:
+  - **Min cuts** — guillotine packing (shelf + SAS trials plus a beam
+    search over cut trees). Every cut goes edge-to-edge — producible
+    with a track saw or panel saw.
+  - **Max utilization** — MaxRects bin packer (Jukka Jylänki), best
+    yield, cuts may be any shape.
   - **CNC nest** — true-shape any-angle nesting for router / waterjet.
+- **The remnant is saved on the last sheet of each size, always.** Every
+  strategy finishes by moving the least-full sheet of a thickness group
+  to the end and clustering its parts into one corner, so what is left
+  over is a clean rectangle worth keeping rather than scrap scattered
+  across the job. It is pure post-processing — same parts, same sheet
+  count, same cuts — so it costs nothing, which is why it is a default
+  and not a mode. Measured at +0.75 sheets over the area lower bound
+  either way.
 - **Parallel-guide-friendly cut sequence** — cuts are ordered so repeat
   cuts at the same flip-stop setting run back-to-back ("same setting"
   notes in the PDF), rip↔crosscut rotations are minimized, big reusable

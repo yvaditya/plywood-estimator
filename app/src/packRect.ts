@@ -24,34 +24,43 @@ export interface Rect { x: number; y: number; w: number; h: number }
 export type Heuristic = 'BSSF' | 'BLSF' | 'BAF' | 'BL';
 
 /**
- * 'free'        = MaxRects (any cut, max yield).
- * 'guillotine'  = shelf-based, edge-to-edge guillotine cuts (min cuts;
- *                  track-saw / panel-saw friendly).
- * 'save-last'   = MaxRects for all sheets EXCEPT the last, which gets
- *                  re-packed with Bottom-Left placement so parts cluster
- *                  in one corner and the remaining material on the last
- *                  sheet is a clean rectangle the user can save for
- *                  another job.
- * 'cnc'         = true-shape any-angle nesting for CNC router / waterjet
- *                  (handled by cncNest.ts, NOT this rectangle packer). Listed
- *                  here so the strategy type is shared; nest.ts dispatches it
- *                  before the rectangle path runs.
- * 'guillotine-exact' = same min-cuts objective as 'guillotine', but the trial
- *                  pool additionally runs a beam search over guillotine cut
- *                  trees (part choice × orientation × split axis) — slower,
- *                  often finds layouts a greedy shelf/SAS pass can't.
+ * 'guillotine'  = "Min cuts" — shelf/SAS packers plus a beam search over
+ *                  guillotine cut trees, all edge-to-edge cuts, track-saw and
+ *                  panel-saw friendly.
+ * 'free'        = "Max utilization" — MaxRects, any cut, highest yield.
+ * 'cnc'         = "CNC nest" — true-shape any-angle nesting for router /
+ *                  waterjet (handled by cncNest.ts, NOT this rectangle
+ *                  packer). Listed here so the strategy type is shared;
+ *                  nest.ts dispatches it before the rectangle path runs.
+ *
+ * Two earlier strategies were folded away rather than kept as options:
+ *
+ *   'guillotine-exact' — the beam search is now part of 'guillotine'. On the
+ *     benchmark it bought 0.10 sheets for 7× the time (506ms vs 75ms), which
+ *     is worth spending but not worth asking the user to predict.
+ *   'save-last' — clustering the last sheet's parts into one corner so the
+ *     remnant is a clean rectangle is now DEFAULT for every strategy, per
+ *     thickness group. It is a post-process and costs nothing: measured at
+ *     the same +0.75 sheets over the area bound as 'free'.
  */
-export type CutStrategy = 'free' | 'guillotine' | 'guillotine-exact' | 'save-last' | 'cnc';
+export type CutStrategy = 'free' | 'guillotine' | 'cnc';
+
+/** Legacy persisted values → the strategy that absorbed them. */
+export function migrateCutStrategy(s: string | null | undefined): CutStrategy {
+  if (s === 'guillotine' || s === 'free' || s === 'cnc') return s;
+  if (s === 'guillotine-exact') return 'guillotine';
+  if (s === 'save-last') return 'free';
+  return 'guillotine';
+}
 
 /** True for the CNC (true-shape) strategy — dispatched to cncNest.ts. */
 export function isCncStrategy(s: CutStrategy): boolean {
   return s === 'cnc';
 }
 
-/** True for any min-cuts (panel-saw) strategy — both share the same
- *  objective; 'guillotine-exact' just searches harder. */
+/** True for the min-cuts (panel-saw) strategy. */
 export function isGuillotineStrategy(s: CutStrategy | undefined): boolean {
-  return s === 'guillotine' || s === 'guillotine-exact';
+  return s === 'guillotine';
 }
 
 export interface PackInput {
@@ -1577,12 +1586,14 @@ export function buildTrialSchedule(job: PackJob, restarts: number, seedOffset = 
       trials.push({ order, heur: 'BSSF', binKind: 'sas' });
       trials.push({ order, heur: 'BAF', binKind: 'sas' });
     }
-    if (job.cutStrategy === 'guillotine-exact') {
-      trials.push({ order: baseline, heur: 'BSSF', binKind: 'beam48' });
-      trials.push({ order: byHeight, heur: 'BSSF', binKind: 'beam48' });
-      trials.push({ order: byWidth, heur: 'BSSF', binKind: 'beam24' });
-      trials.push({ order: bySide, heur: 'BSSF', binKind: 'beam24' });
-    }
+    // Beam search over guillotine cut trees. Used to be the separate
+    // 'guillotine-exact' strategy; it is always on now — 0.10 sheets better
+    // for 7× the time on the benchmark, which is a trade worth making once
+    // rather than a choice worth surfacing.
+    trials.push({ order: baseline, heur: 'BSSF', binKind: 'beam48' });
+    trials.push({ order: byHeight, heur: 'BSSF', binKind: 'beam48' });
+    trials.push({ order: byWidth, heur: 'BSSF', binKind: 'beam24' });
+    trials.push({ order: bySide, heur: 'BSSF', binKind: 'beam24' });
     const budget = Math.max(0, restarts - trials.length);
     for (let i = 0; i < budget; i++) {
       const kind = kinds[i % kinds.length];
@@ -1602,11 +1613,11 @@ export function buildTrialSchedule(job: PackJob, restarts: number, seedOffset = 
   return trials;
 }
 
-/** 'save-last' packs as 'free' and post-processes — the optimiser job uses
- *  the effective strategy while the OBJECTIVE keeps the user's strategy. */
+/** Kept as the single place packing-vs-objective strategy could diverge.
+ *  Nothing diverges now that 'save-last' is a default post-process rather
+ *  than a strategy that packed as 'free'. */
 export function effectiveJob(job: PackJob): PackJob {
-  const effectiveStrategy = job.cutStrategy === 'save-last' ? 'free' : job.cutStrategy;
-  return effectiveStrategy === job.cutStrategy ? job : { ...job, cutStrategy: effectiveStrategy };
+  return job;
 }
 
 /**
@@ -1615,7 +1626,28 @@ export function effectiveJob(job: PackJob): PackJob {
  */
 export function finishPack(job: PackJob, best: MultiSheetResult): MultiSheetResult {
   const result = consolidateSheets(best, effectiveJob(job));
-  if (job.cutStrategy === 'save-last' && result.sheets.length > 0) {
+  // Cluster the LAST sheet's parts into one corner so what is left over is a
+  // clean rectangle worth keeping. Default for every strategy now, not an
+  // option: it is pure post-processing — the parts and the sheet count are
+  // unchanged, only their arrangement on that one sheet — so it cannot cost
+  // anything. `nest.ts` packs each thickness group separately, so this lands
+  // on the last sheet OF EACH SIZE.
+  if (result.sheets.length > 0) {
+    // Put the EMPTIEST sheet last first. Which sheet ends up last is an
+    // artefact of the objective — 'free' and 'cnc' happen to leave the
+    // slack there, min-cuts optimises cuts and leaves it on sheet 1, where
+    // clustering it does the user no good. Sheet order carries no meaning
+    // for the saw (each sheet owns its own cut tree, and they are cut
+    // independently), so reordering is free and makes the remnant land
+    // where it can actually be saved.
+    let leanest = 0;
+    for (let i = 1; i < result.sheets.length; i++) {
+      if (result.sheets[i].usedArea < result.sheets[leanest].usedArea) leanest = i;
+    }
+    if (leanest !== result.sheets.length - 1) {
+      const [s] = result.sheets.splice(leanest, 1);
+      result.sheets.push(s);
+    }
     const meta = new Map<string, { id: string; w: number; h: number; allowRotate: boolean }>();
     for (const it of job.items) meta.set(it.id, { id: it.id, w: it.w, h: it.h, allowRotate: it.allowRotate });
     const repacked = repackLastSheetCorner(result.sheets[result.sheets.length - 1], job, meta);
@@ -1701,9 +1733,15 @@ export function isBetter(a: MultiSheetResult, b: MultiSheetResult, strategy: Cut
   // guillotine-cuttable (fewer parts left joined in a non-guillotine block).
   const freed = (r: MultiSheetResult) => r.sheets.reduce((s, sh) => s + (sh.fullySeparated ?? 0), 0);
 
+  // Applied at the BOTTOM of every strategy: prefer the layout leaving less
+  // on the last sheet, so the remnant is a bigger reusable piece. Lowest
+  // priority by construction — it can never cost a sheet, a cut or yield,
+  // which is what makes "save more on the last sheet" safe as a default
+  // rather than a strategy of its own.
+  const leavesMore = () => lastUsed(a) < lastUsed(b);
+
   switch (strategy) {
-    case 'guillotine':
-    case 'guillotine-exact': {
+    case 'guillotine': {
       // Min cuts, track-saw practical: first minimise AWKWARD cuts (saw run
       // over stock narrower than a rail can sit on — the thing users hate),
       // then total cuts, then yield, then the widest narrowest-piece.
@@ -1725,17 +1763,9 @@ export function isBetter(a: MultiSheetResult, b: MultiSheetResult, strategy: Cut
         for (const sh of r.sheets) for (const c of sh.cuts) m = Math.min(m, c.parentW, c.parentH);
         return m;
       };
-      return narrowest(a) > narrowest(b);
-    }
-    case 'save-last': {
-      // Save last: prefer LOWER fill on the last sheet (so the remnant is
-      // bigger and reusable). Then higher overall yield, then — at equal
-      // yield — the more cleanly cuttable layout.
-      const al = lastUsed(a), bl = lastUsed(b);
-      if (al !== bl) return al < bl;
-      const at = totalUsed(a), bt = totalUsed(b);
-      if (at !== bt) return at > bt;
-      return freed(a) > freed(b);
+      const an = narrowest(a), bn = narrowest(b);
+      if (an !== bn) return an > bn;
+      return leavesMore();
     }
     case 'free':
     default: {
@@ -1748,8 +1778,11 @@ export function isBetter(a: MultiSheetResult, b: MultiSheetResult, strategy: Cut
       // every panel, at ZERO cost to yield or sheet count.
       const af = freed(a), bf = freed(b);
       if (af !== bf) return af > bf;
-      // Then: more on the last sheet = packing parts as early as possible.
-      return lastUsed(a) > lastUsed(b);
+      // Then leave as much of the last sheet whole as possible. This used to
+      // prefer the OPPOSITE — more on the last sheet, "packing parts as early
+      // as possible" — which fights the save-the-remnant default now that it
+      // applies to every strategy.
+      return leavesMore();
     }
   }
 }

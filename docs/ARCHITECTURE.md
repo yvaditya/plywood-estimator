@@ -195,7 +195,7 @@ rectangle packing (`packRect.ts`) or CNC true-shape (`cncNest.ts`). The
 animated path routes through the **multicore worker pool** (`optPool.ts` →
 `optWorker.ts`), with the single-core drivers as automatic fallback.
 
-### Rectangle path (free / guillotine / guillotine-exact / save-last)
+### Rectangle path (guillotine / free)
 
 1. **Bucket by thickness** at 0.5 mm tolerance. Each bucket nests
    independently into its own stack of sheets.
@@ -232,18 +232,40 @@ animated path routes through the **multicore worker pool** (`optPool.ts` →
    - **`ShelfBin`** — FFDH shelves; the min-cuts strategy (`guillotine`).
    - **`GuillotineBin`** (SAS splitter) — one of the bin kinds `guillotine`
      trials sweep, alongside shelf/shelf-v.
-   - **`packBeam`** — beam search over guillotine cut trees, added only for
-     **`guillotine-exact`** ("Min cuts+"): keeps the K most promising partial
+   - **`packBeam`** — beam search over guillotine cut trees, always part of
+     the `guillotine` trial pool: keeps the K most promising partial
      layouts and branches on which part to cut next, its orientation, and the
      axis of the next full-span cut, discarding regions to waste when that's
      the better local call. One sheet is searched at a time (maximise area
      placed, then fewest cuts); it also runs the full greedy trial pool
      alongside it and only has to beat it. Slower than the greedy shelf/SAS
-     trials, often finds fewer cuts.
+     trials, often finds fewer cuts. This was the separate
+     `guillotine-exact` strategy; it is unconditional now because on
+     `tests/nest_bench.mjs` it bought 0.10 sheets for 7x the time
+     (506ms vs 75ms) — worth spending once, not worth asking the user
+     to predict.
 
 8. **Finish** (`finishPack`): `consolidateSheets` rebuilds live bins from
    finished sheets and tries to dissolve the least-filled sheet into the
-   others' free space; save-last then corner-packs the last sheet.
+   others' free space. Then, for EVERY strategy, the least-full remaining
+   sheet is moved to the end of the group and its parts corner-packed, so
+   the leftover is one clean rectangle.
+
+   Both halves matter. Which sheet ends up last is an artefact of the
+   objective — `free` and `cnc` happen to leave their slack there, while
+   min-cuts optimises cuts and strands it on sheet 1, where clustering it
+   helps nobody. Sheet order carries no meaning for the saw (each sheet
+   owns its own cut tree and they are cut independently), so reordering is
+   free. Since `nest.ts` packs each thickness group separately, this lands
+   on the last sheet OF EACH SIZE.
+
+   This replaced the `save-last` strategy. It is post-processing — same
+   parts, same sheet count, same cuts — so it cannot cost anything, which
+   is what makes it safe as a default. Benchmarked at +0.75 sheets over
+   the area bound with or without it. The matching `isBetter` preference
+   (leave less on the last sheet) sits at the BOTTOM of every strategy's
+   comparison chain, below sheets, cuts and yield, so it can never buy a
+   tidier remnant with a extra sheet.
 
 ### CNC path (`cnc`) — `cncNest.ts`
 
@@ -259,10 +281,12 @@ alternates per-sheet shake with consolidation, then save-last compaction.
 orders (order-crossover + swap mutation, generations evaluated in
 parallel).
 
-(The dedicated **`cnc-save-last`** strategy was removed from the UI's
-strategy list; the engine's save-last compaction machinery above still
-exists internally but no longer has a strategy option that requests it
-specifically.)
+The engine's save-last compaction (`finalSqueeze` / `compactLastSheet`) is
+now driven unconditionally: `nest.ts` passes `saveLast: true` on both
+`packCnc` calls, per thickness group. It had been dead code — the dedicated
+`cnc-save-last` strategy was removed from the UI long ago and nothing set
+the flag afterwards, so CNC jobs were the one path never consolidating
+their remnant.
 
 ### Output
 

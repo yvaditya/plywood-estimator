@@ -43,27 +43,45 @@ Quick orientation for a fresh session working on this repo.
 | `style.css` | Notion-style light theme |
 
 ## Cut strategies (`packRect.CutStrategy`)
-Five strategies (user trimmed the list 2026-07 — `cnc-save-last` removed):
-- **`free`** — MaxRects, max yield (any cuts).
-- **`guillotine`** — min cuts; trials sweep shelf / shelf-v / SAS bins.
-  Free-grain parts auto-unlock rotation under guillotine strategies (the
-  per-body `rotation='lock'` default would otherwise block shelf
-  optimisation).
-- **`guillotine-exact`** — same objective + `packBeam` beam search over
-  cut trees; slower, often beats the greedy pass.
-- **`save-last`** — MaxRects everywhere except the last sheet, which is
-  re-packed Bottom-Left so parts cluster in one corner and the remnant is
-  a clean usable rectangle.
-- **`cnc`** — true-shape any-angle nesting handled by `cncNest.ts`, NOT
-  this rectangle packer; `nest.ts` dispatches via `isCncStrategy()`. (The
-  engine's `saveLast` machinery still exists but no strategy sets it.)
+THREE strategies (user collapsed the list 2026-08 from five):
+- **`guillotine`** — "Min cuts". Trials sweep shelf / shelf-v / SAS bins
+  AND `packBeam` (beam search over cut trees). Free-grain parts auto-unlock
+  rotation under this strategy (the per-body `rotation='lock'` default would
+  otherwise block shelf optimisation).
+- **`free`** — "Max utilization". MaxRects, any cuts.
+- **`cnc`** — true-shape any-angle nesting handled by `cncNest.ts`, NOT this
+  rectangle packer; `nest.ts` dispatches via `isCncStrategy()`.
+
+Two strategies were FOLDED AWAY, not deleted — `migrateCutStrategy()` maps
+old persisted values onto whatever absorbed them:
+- `guillotine-exact` → `guillotine`. Its beam search is now unconditional.
+  On `tests/nest_bench.mjs` it bought 0.10 sheets for 7× the time (506 ms vs
+  75 ms) — worth spending once, not worth asking the user to predict.
+- `save-last` → `free`. Saving the remnant is now DEFAULT for every
+  strategy: `finishPack` moves the least-full sheet of the group to the END
+  and corner-packs it. Which sheet lands last is otherwise an artefact of
+  the objective (`free`/`cnc` leave slack there; min-cuts strands it on
+  sheet 1), and sheet order means nothing to the saw — each sheet owns its
+  own cut tree. Since `nest.ts` packs per thickness group, this lands on the
+  last sheet OF EACH SIZE. It is post-processing, so it costs nothing:
+  benchmarked at +0.75 sheets over the area bound with or without it.
 
 The multi-restart optimiser objective is strategy-aware (`isBetter` in
 `packRect.ts`):
 - `free` → maximise total used area
-- `guillotine` → minimise total cut count
-- `save-last` → minimise last-sheet fill
-Every strategy still tie-breaks first on (fewer unplaced → fewer sheets).
+- `guillotine` → minimise awkward cuts, then total cuts
+Every strategy tie-breaks first on (fewer unplaced → fewer sheets), and
+LAST on "leaves more of the final sheet whole" — bottom of the chain, so a
+tidier remnant can never buy itself an extra sheet or an extra cut.
+
+## Nesting benchmark
+`tests/nest_bench.mjs` (needs `packrect_bundle.mjs` — see its header) runs
+generated cabinet-like jobs at n=20/40/80/160 and reports mean excess over
+the AREA lower bound. Current: **free +0.75 sheets / 70 ms**, **guillotine
++1.20 / 510 ms**. The four sample STEPs are useless for this — every one
+already hits its lower bound, and `Start cabinets` is provably optimal at 2
+sheets despite showing 36% yield. Use the bench, not the samples, to judge
+a packing change.
 
 ## Sheet orientation
 **Locked landscape**. `nest.ts` only runs `packMulti` with `binW = usableL`

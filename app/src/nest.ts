@@ -23,12 +23,12 @@
  */
 
 import type { Vec2 } from './geometry';
-import { packMulti, isCncStrategy, isGuillotineStrategy, type PackInput, type PackPlacement, type CutStrategy, type Cut, type PackProgress } from './packRect';
+import { packMulti, isCncStrategy, isGuillotineStrategy, migrateCutStrategy, type PackInput, type PackPlacement, type CutStrategy, type Cut, type PackProgress } from './packRect';
 import { packCnc, polyArea, type CncInput, type CncSheet } from './cncNest';
 import { packMultiParallel, packCncParallel, packCncDeep } from './optPool';
 
 export type { CutStrategy, Cut, PackProgress };
-export { isCncStrategy };
+export { isCncStrategy, migrateCutStrategy };
 
 export type GrainLock = 'free' | 'length' | 'width';
 export type RotationMode = 'lock' | 'flip90' | 'any';
@@ -729,6 +729,9 @@ export function runCncNest(parts: NestPart[], config: NestConfig): NestResult {
       restarts: config.restarts,
       seed: config.seed,
       extraEffort: config.deepSearch,
+      // Cluster the last sheet of THIS thickness so its remnant stays a
+      // usable piece — default for every strategy now, not an option.
+      saveLast: true,
     });
     const sheets = res.sheets.map((cs, idx) =>
       cncSheetToNest(cs, idx, t, margin, winnerSheetW, winnerSheetL, meta));
@@ -791,6 +794,9 @@ export async function runCncNestAnimated(
       restarts: config.restarts,
       seed: config.seed,
       extraEffort: config.deepSearch,
+      // Cluster the last sheet of THIS thickness so its remnant stays a
+      // usable piece — default for every strategy now, not an option.
+      saveLast: true,
     };
     const onCncProgress = async (p: { trial: number; total: number; current: CncSheet[]; best: CncSheet[]; isNewBest: boolean }) => {
       await onTrial({
