@@ -449,10 +449,117 @@ is measured from — the parent's left edge for a vertical cut, top edge for
 a horizontal cut — drawn last, with captions reading "from L edge" /
 "from T edge".
 
+### Cutlist PDF
+`buildCutlistPdf(result, opt)` — the minimal companion: one sheet page per
+cut sheet via the same `drawSheet` in `detailDims` mode, then one assembly
+page per cabinet with front/back 3/4 snapshots and panel-id balloons
+placed at each body's projected centre (`snapshotFiltered` returns those
+anchors). Balloons are nudged apart when two panels project to nearly the
+same point — a thin panel seen edge-on lands on its neighbour.
+
+Page size comes from `opt.cutlistPaper`, independent of the job PDF's
+`paper`; the UI defaults it to *Match PDF paper*. Because the sheet
+drawing scales off the page but the page furniture was tuned in absolute
+points against 4:3, `cutlistScale(dims)` derives a factor (phone 0.55 · 4:3
+and 16:9 1.00 · Letter 1.10 · Legal 1.13 · 11×17 1.47) that headers, the
+meta line, footers and balloons all ride. `PAGE_PAD` deliberately does NOT
+scale — it is a real 0.5" print margin, so bigger pages also gain
+proportionally more drawing area. `drawSheet` pins the factor to 1 outside
+cutlist mode, leaving the job PDF untouched.
+
+### Keeping dimension values readable
+Two mechanisms, for two different kinds of collision:
+
+- `brokenLine` + `DimRegistry` breaks a DIMENSION line where a value sits.
+  It only breaks around rects already registered, so every value must be
+  registered before any line that could cross it is drawn — registering
+  per-dimension (W rect, W line, H rect, H line) made the break
+  one-directional and let the width line run through the rotated height
+  value on narrow strips.
+- `maskDimText` handles OBJECT lines, which are drawn per part before any
+  dimension exists and must not be broken — cutting a panel boundary to
+  let a number through would misrepresent the part. In cutlist mode panels
+  are stroke-only, so everything behind a value is the stock cream;
+  painting that into the value's box is invisible and hides whatever
+  crosses it. Note `placeAlignedText` DRAWS as it measures, so those sites
+  compute the rect up front and mask before calling it.
+
+`tests/dim_overlap_check.py` verifies the invariant on any exported PDF:
+it extracts every stroke and text span and reports strokes passing through
+glyphs, skipping cream fills as ink and treating a masked value as
+protected against anything painted before its mask.
+
 ### STEP (unplaced parts)
 `buildStep()` in `src/stepExport.ts` — one extruded-prism solid per
 unplaced instance from its footprint outline (split segments resolve via
 `state.splitSegmentGeo`).
+
+---
+
+## Stage 6.5: Manual rearrange — `src/rearrange.ts`
+
+Optional, off by default. `#rearrangeBtn` arms drag mode on EVERY rendered
+sheet at once, because "move this panel to the next sheet" needs two live
+drop targets. `renderResults` calls `beginRearrangeRender(ctx | null)` on
+each pass, which resets the registry — the previous render's SVG nodes are
+about to be discarded — then `registerSheet` / `makePartDraggable` /
+`registerStaging` re-arm the fresh ones.
+
+Sheet SVGs use a viewBox in millimetres, so `getScreenCTM()` converts
+pointer positions straight into sheet coordinates. Nothing needs a pixel
+scale except the drag ghost — a screen-space stand-in that follows the
+cursor, since the real element cannot leave its own SVG.
+
+**Push-aside cascade** — `planReshuffle(sheet, anchor, ax, ay, margin,
+kerf)`. The dropped panel is the anchor and never moves; anything fouling
+it *slides* in one of four directions until clear of EVERYTHING, and
+moving it re-queues whoever it now fouls. Sliding past all blockers at
+once matters: resolving against one blocker at a time makes a panel boxed
+in by several ping-pong between them until it burns its move budget, which
+reported "no room" on half-empty sheets. Runs on a copy of the positions
+and returns null rather than a partial result, so a cascade that cannot
+resolve leaves the sheet untouched. Total work and per-panel moves are
+both capped.
+
+**Magnetic snap** — candidates are scored by distance plus a rank penalty
+(`RANK_BIAS_MM`), so contact a kerf apart beats flush alignment beats the
+margin box, while a much closer alignment still wins over a far-off
+contact. Positions are clamped into the margin box *before* snapping, so
+dragging a panel wider than the space to one side pins it against the
+margin instead of refusing.
+
+**Live movement** — the plan is applied to the real panel elements as CSS
+transforms during the drag. CSS transform overrides the `transform`
+attribute wholesale, so each value is an absolute planned position, not an
+offset. Throttled to `requestAnimationFrame`; the ghost still tracks at
+full pointer rate.
+
+**Rotation** — arrow keys call `rotatePart`, which turns the outer ring
+and holes, re-anchors them to (0,0) (`PlacedPart.outer` is defined as
+rotated-and-anchored) and recomputes `w`/`h` FROM the ring so the bbox
+cannot drift from the geometry. Geometry is snapshotted at pickup and
+restored if the drag is abandoned.
+
+**Staging tray** — panels lifted off the sheets, held in `ctx.staging` as
+`{part, thickness}`. Thickness travels with them because a parked panel
+has no sheet to infer its stock from, and is enforced on the way back;
+cross-sheet drags check it too. The tray is present for the whole mode
+rather than revealed on pickup — revealing it mid-drag reflowed the pane
+and shifted every sheet under the cursor. Exports are disabled while it
+holds anything, since a parked panel is absent from every export.
+
+On commit, `refreshSheet` re-derives used area, `deriveGuillotineCuts` and
+`annotatePlacedParts` (exported from `nest.ts` for this), plus
+`largestFreeRect` — largest empty rectangle over the coordinate grid
+induced by the panels' own edges, inflated by half a kerf since blade path
+cannot come back as usable offcut. A hand-made layout may not be
+guillotine-cuttable, in which case `cuts` comes back empty. Empty sheets
+are pruned when the mode is switched OFF, not per move, so parking every
+panel off a sheet does not delete the sheet you meant to put them back on.
+
+Every export reads `state.lastNest`, so edits flow through with no extra
+plumbing, and cut-sequence overrides key off a signature computed from
+live part positions — a move invalidates them on its own.
 
 ---
 

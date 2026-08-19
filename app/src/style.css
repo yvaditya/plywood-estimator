@@ -1333,12 +1333,49 @@ input[type="checkbox"]:focus-visible { box-shadow: 0 0 0 2px var(--accent-ring);
   padding: 4px 6px;
   border-radius: 4px;
   font-size: 12px;
+  /* The pane header uppercases its labels; inside the menu they read as
+     shouty next to the normal-case export names. */
+  text-transform: none;
+  letter-spacing: 0;
+  font-weight: 400;
   color: var(--text);
   cursor: pointer;
   white-space: nowrap;
 }
 .export-opts-menu label:hover { background: var(--hover-wash); }
 .export-opts-menu input[type='checkbox'] { margin: 0; cursor: pointer; }
+.export-opts > summary { display: inline-flex; align-items: center; gap: 6px; }
+.export-opts-caret { opacity: 0.5; margin-left: 1px; }
+.export-opts[open] .export-opts-caret { transform: rotate(180deg); }
+
+/* Download rows. Two lines each — the name plus what it actually gets you —
+   which is what lets five exports live in one menu without a legend. */
+.export-item {
+  display: flex; flex-direction: column; align-items: flex-start; gap: 1px;
+  width: 100%;
+  padding: 5px 6px;
+  border: none; border-radius: 4px;
+  background: transparent;
+  text-align: left;
+  cursor: pointer;
+}
+.export-item:hover:not(:disabled) { background: var(--hover-wash); }
+.export-item:disabled { opacity: 0.4; cursor: default; }
+.export-item-name { font-size: 12px; font-weight: 500; color: var(--text); }
+.export-item-sub { font-size: 10.5px; color: var(--muted); }
+/* Export progress replaces the row's contents while a PDF builds. */
+.export-item.busy { cursor: progress; flex-direction: row; align-items: center; gap: 7px; }
+.export-item.busy .progress-bar {
+  width: 54px; height: 4px; background: var(--line);
+  border-radius: 3px; overflow: hidden; display: inline-block;
+}
+.export-item.busy .progress-fill {
+  display: block; height: 100%;
+  background: var(--accent, #2383E2); transition: width .25s ease-out;
+}
+.export-item.busy .progress-label {
+  font-size: 11px; color: var(--muted); font-variant-numeric: tabular-nums;
+}
 
 /* ==========================================================================
    Rearrange mode — drag panels between/within sheets.

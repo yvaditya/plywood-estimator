@@ -115,11 +115,53 @@ Requires Node 18 or newer.
      **cut sequence** cards. Color language: green = edge the dimension
      is measured from, blue = reference edges, red = this cut.
   4. Assembly guide (per-cabinet exploded views + step pages).
-- **Phone PDF** button — one cut per page with big type, for the phone
-  at the saw.
+- **Phone PDF** — one cut per page with big type, for the phone at the
+  saw.
+- **Cutlist PDF** — the minimal companion to the job PDF: one
+  sheet-overview page per cut sheet carrying the layout, panel ids and
+  mechanical-drawing dimensions and nothing else, then one assembly page
+  per cabinet showing front and back 3/4 views with the panel-id
+  balloons drawn on the panels. Page size follows the **Cutlist page**
+  selector, which defaults to *Match PDF paper* so one control drives
+  both exports; 4:3, Letter, Legal and 11×17 can also be picked
+  explicitly. Page furniture scales with the sheet size, so 11×17 gets a
+  bigger drawing without the header shrinking away.
 - **Parallel guide dims** toggle — quoted distances equal the flip-stop
   setting (keeper width to the near side of the kerf), so the numbers
   on the cards are the finished part dimensions.
+
+All five downloads live in one **Export** menu in the Cut layout header,
+along with switches for what goes in them — assembly pages, panel & cut
+lists, cut sequence pages — plus a toggle that draws each panel's id on
+its body in the 3D view. Turning assembly pages off also skips the 3D
+snapshot capture rather than rendering images the document then discards,
+which is the fastest route to a PDF.
+
+### Rearranging a layout by hand
+The optimiser gives a good layout; **Rearrange** in the Cut layout header
+is the escape hatch for when you know something it doesn't — grain run, a
+defect in the sheet, keeping one offcut whole.
+
+Every sheet becomes a drop target at once, so a panel can be dragged
+within its sheet or onto another. What it lands on **shuffles aside to
+make room**, live, while the pointer is still down; edges are magnetic
+and snap a kerf apart; and the **arrow keys rotate** the panel mid-drag
+(← / → a quarter turn, ↑ / ↓ a half) so it can be spun until it fits.
+
+A drop only commits if every panel ends up somewhere legal — inside the
+margin box and a kerf clear of its neighbours — otherwise the panel
+springs back and the sheet is left exactly as it was. Committing
+re-derives used area, the guillotine cut tree, panel letters and the
+largest offcut. A hand-made layout may not be guillotine-cuttable at all,
+in which case the cut tree comes back empty and the cut pages have
+nothing to show for it.
+
+Panels can be **parked** in the staging tray above the sheet list while
+you shuffle, then dragged back onto any sheet of the same thickness.
+Exports are held while anything is parked: a parked panel is on no sheet,
+and a cut list quietly short a few parts is worse than none. Sheets
+emptied during an edit are dropped when Rearrange is switched off, not
+mid-drag. Re-running Estimate discards manual edits.
 
 ### Shopping list (sidebar)
 Auto-generated from the latest nest result.
@@ -155,7 +197,9 @@ plywood estimator/
         ├── instructions.ts   Letter labels + cut-step generation
         ├── shoppingList.ts   Buy/have rollup + CSV
         ├── dxf.ts            DXF R12 writer
-        ├── pdf.ts            jsPDF report (summary + parts + sheets + cuts)
+        ├── pdf.ts            jsPDF job report + cutlist (sheets, cuts, assembly)
+        ├── rearrange.ts      Manual layout editing — drag, push-aside
+        │                     cascade, magnetic snap, rotate, staging tray
         ├── units.ts          mm/in formatting, fractional inches, money
         ├── main.ts           UI wiring
         └── style.css         Notion-style theme
