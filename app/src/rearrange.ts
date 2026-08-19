@@ -21,8 +21,24 @@ import { annotatePlacedParts, type NestResult, type NestSheet, type PlacedPart }
 import { deriveGuillotineCuts } from './packRect';
 
 const SVG_NS = 'http://www.w3.org/2000/svg';
-/** Snap radius, sheet mm. Generous: manual placement should land flush. */
-const SNAP_MM = 14;
+/** Snap radius, sheet mm. Magnetic: a panel jumps into alignment well before
+ *  it is actually touching. */
+const SNAP_MM = 40;
+/**
+ * Candidate preference, in millimetres of "virtual distance" added per rank.
+ * Contact (a kerf apart, the cut-tight case) outranks flush alignment, which
+ * outranks the margin box — so when two snaps are both in range the panel
+ * prefers to touch. Expressed as a distance penalty rather than a hard
+ * ordering so a much closer alignment still wins over a far-off contact.
+ */
+const RANK_BIAS_MM = 8;
+const RANK_CONTACT = 0;
+const RANK_FLUSH = 1;
+const RANK_MARGIN = 2;
+/** Cap on cascade work — a pathological push cycle must not spin. */
+const MAX_SHOVES = 400;
+/** Per-panel move cap; ping-ponging between two blockers bails out. */
+const MAX_MOVES_PER_PART = 8;
 /** Float slack for edge comparisons (STEP tessellation noise, mm). */
 const EPS = 0.05;
 
@@ -99,22 +115,116 @@ function snap(
   sheet: NestSheet, part: PlacedPart, x: number, y: number,
   margin: number, kerf: number,
 ): { x: number; y: number } {
-  const xs = [margin, sheet.sheetW - margin - part.w];
-  const ys = [margin, sheet.sheetL - margin - part.h];
+  type Cand = { v: number; rank: number };
+  const xs: Cand[] = [
+    { v: margin, rank: RANK_MARGIN },
+    { v: sheet.sheetW - margin - part.w, rank: RANK_MARGIN },
+  ];
+  const ys: Cand[] = [
+    { v: margin, rank: RANK_MARGIN },
+    { v: sheet.sheetL - margin - part.h, rank: RANK_MARGIN },
+  ];
   for (const o of sheet.parts) {
     if (o === part) continue;
-    xs.push(o.x, o.x + o.w - part.w, o.x + o.w + kerf, o.x - part.w - kerf);
-    ys.push(o.y, o.y + o.h - part.h, o.y + o.h + kerf, o.y - part.h - kerf);
+    xs.push({ v: o.x + o.w + kerf, rank: RANK_CONTACT },
+            { v: o.x - part.w - kerf, rank: RANK_CONTACT },
+            { v: o.x, rank: RANK_FLUSH },
+            { v: o.x + o.w - part.w, rank: RANK_FLUSH });
+    ys.push({ v: o.y + o.h + kerf, rank: RANK_CONTACT },
+            { v: o.y - part.h - kerf, rank: RANK_CONTACT },
+            { v: o.y, rank: RANK_FLUSH },
+            { v: o.y + o.h - part.h, rank: RANK_FLUSH });
   }
-  const nearest = (v: number, cands: number[]) => {
-    let best = v, bestD = SNAP_MM;
+  const nearest = (v: number, cands: Cand[]) => {
+    let best = v;
+    let bestScore = SNAP_MM;
     for (const c of cands) {
-      const d = Math.abs(c - v);
-      if (d < bestD) { bestD = d; best = c; }
+      const d = Math.abs(c.v - v);
+      if (d > SNAP_MM) continue;
+      const score = d + c.rank * RANK_BIAS_MM;
+      if (score < bestScore) { bestScore = score; best = c.v; }
     }
     return best;
   };
   return { x: nearest(x, xs), y: nearest(y, ys) };
+}
+
+// ---------------------------------------------------------------------------
+// Push-aside cascade
+// ---------------------------------------------------------------------------
+
+/**
+ * Shove every panel out of the dragged one's way, cascading into their own
+ * neighbours, and return the resulting positions — or null if some panel has
+ * nowhere legal to go.
+ *
+ * `anchor` is immovable: you dropped it there, so everything else yields to
+ * it. Each blocked panel escapes along whichever of the four axes needs the
+ * least travel while keeping it inside the margin box; moving it can block
+ * someone else, so it re-queues.
+ *
+ * The whole thing runs on a COPY. Callers commit only on success, so a
+ * cascade that cannot resolve leaves the sheet untouched rather than half
+ * rearranged. Both the total work and the per-panel move count are capped:
+ * two panels can otherwise shove each other back and forth forever.
+ */
+export function planReshuffle(
+  sheet: NestSheet, anchor: PlacedPart, ax: number, ay: number,
+  margin: number, kerf: number,
+): Map<PlacedPart, { x: number; y: number }> | null {
+  const pos = new Map<PlacedPart, { x: number; y: number }>();
+  for (const p of sheet.parts) pos.set(p, { x: p.x, y: p.y });
+  pos.set(anchor, { x: ax, y: ay });
+  // The anchor must be inside the sheet on its own account.
+  if (ax < margin - EPS || ay < margin - EPS
+      || ax + anchor.w > sheet.sheetW - margin + EPS
+      || ay + anchor.h > sheet.sheetL - margin + EPS) return null;
+
+  const moves = new Map<PlacedPart, number>();
+  const queue: PlacedPart[] = sheet.parts.filter((p) => p !== anchor);
+  const sep = (a: PlacedPart, b: PlacedPart) => {
+    const A = pos.get(a)!, B = pos.get(b)!;
+    return Math.max(
+      Math.max(B.x - (A.x + a.w), A.x - (B.x + b.w)),
+      Math.max(B.y - (A.y + a.h), A.y - (B.y + b.h)),
+    );
+  };
+
+  for (let guard = 0; queue.length > 0; guard++) {
+    if (guard > MAX_SHOVES) return null;
+    const p = queue.shift()!;
+    if (p === anchor) continue;
+    const blocker = sheet.parts.find((q) => q !== p && sep(p, q) < kerf - EPS);
+    if (!blocker) continue;
+
+    const P = pos.get(p)!, B = pos.get(blocker)!;
+    // Four ways out, each just clearing the blocker by a kerf.
+    const options = [
+      { x: B.x - kerf - p.w, y: P.y },
+      { x: B.x + blocker.w + kerf, y: P.y },
+      { x: P.x, y: B.y - kerf - p.h },
+      { x: P.x, y: B.y + blocker.h + kerf },
+    ].filter((o) => o.x >= margin - EPS && o.y >= margin - EPS
+                 && o.x + p.w <= sheet.sheetW - margin + EPS
+                 && o.y + p.h <= sheet.sheetL - margin + EPS);
+    if (options.length === 0) return null;
+    options.sort((a, b) =>
+      (Math.abs(a.x - P.x) + Math.abs(a.y - P.y))
+      - (Math.abs(b.x - P.x) + Math.abs(b.y - P.y)));
+
+    const n = (moves.get(p) ?? 0) + 1;
+    if (n > MAX_MOVES_PER_PART) return null;
+    moves.set(p, n);
+    pos.set(p, options[0]);
+    // This panel moved, so it may now foul others — and itself again.
+    queue.push(p);
+    for (const q of sheet.parts) {
+      if (q !== p && q !== anchor && !queue.includes(q) && sep(p, q) < kerf - EPS) {
+        queue.push(q);
+      }
+    }
+  }
+  return pos;
 }
 
 /**
@@ -207,6 +317,66 @@ export function refreshSheet(sheet: NestSheet, margin: number, kerf: number) {
 }
 
 // ---------------------------------------------------------------------------
+// Rotation
+// ---------------------------------------------------------------------------
+
+type Ring = [number, number][];
+
+/** Rotate a ring by a multiple of 90°. Screen coords are y-down, so a visual
+ *  clockwise turn is (x, y) → (−y, x). */
+function rotateRing(ring: Ring, quarter: number): Ring {
+  const q = ((quarter % 4) + 4) % 4;
+  return ring.map(([x, y]): [number, number] => (
+    q === 1 ? [-y, x] : q === 2 ? [-x, -y] : q === 3 ? [y, -x] : [x, y]
+  ));
+}
+
+/**
+ * Turn a placed panel by a multiple of 90°, in place.
+ *
+ * Rings are re-anchored to (0, 0) afterwards because PlacedPart.outer is
+ * defined as rotated-and-anchored, and w/h are recomputed FROM the ring
+ * rather than swapped, so the bbox can never drift away from the geometry
+ * it is supposed to describe. Holes shift by the outer ring's offset, which
+ * is the combined minimum since holes lie inside it.
+ */
+export function rotatePart(p: PlacedPart, quarter: number) {
+  p.outer = rotateRing(p.outer as Ring, quarter);
+  p.holes = p.holes.map((h) => rotateRing(h as Ring, quarter));
+  let minX = Infinity, minY = Infinity;
+  for (const [x, y] of p.outer) { minX = Math.min(minX, x); minY = Math.min(minY, y); }
+  if (!Number.isFinite(minX)) return;
+  for (const r of [p.outer, ...p.holes]) {
+    for (const pt of r) { pt[0] -= minX; pt[1] -= minY; }
+  }
+  let maxX = 0, maxY = 0;
+  for (const [x, y] of p.outer) { maxX = Math.max(maxX, x); maxY = Math.max(maxY, y); }
+  p.w = maxX;
+  p.h = maxY;
+  p.rotation = (((p.rotation + quarter * 90) % 360) + 360) % 360;
+}
+
+/** Everything a drag may mutate, so an abandoned drag can be undone. */
+interface PartSnapshot {
+  x: number; y: number; w: number; h: number; rotation: number;
+  outer: Ring; holes: Ring[];
+}
+
+function snapshotPart(p: PlacedPart): PartSnapshot {
+  return {
+    x: p.x, y: p.y, w: p.w, h: p.h, rotation: p.rotation,
+    outer: (p.outer as Ring).map(([a, b]): [number, number] => [a, b]),
+    holes: p.holes.map((h) => (h as Ring).map(([a, b]): [number, number] => [a, b])),
+  };
+}
+
+function restorePart(p: PlacedPart, s: PartSnapshot) {
+  p.x = s.x; p.y = s.y; p.w = s.w; p.h = s.h; p.rotation = s.rotation;
+  p.outer = s.outer.map(([a, b]): [number, number] => [a, b]);
+  p.holes = s.holes.map((h) => h.map(([a, b]): [number, number] => [a, b]));
+}
+
+// ---------------------------------------------------------------------------
 // Drag
 // ---------------------------------------------------------------------------
 
@@ -239,11 +409,21 @@ interface DragState {
   /** px per mm at pickup — the ghost is a screen-space element, so it needs
    *  the scale to place the grab point under the cursor. */
   scale: number;
-  preview: SVGRectElement | null;
-  previewSvg: SVGSVGElement | null;
+  /** Drop outline plus the faint outlines of every panel the cascade will
+   *  shove, so the consequence of the drop is visible before releasing. */
+  previews: SVGElement[];
   /** Last legal landing spot, or null when the pointer is over nothing. */
   drop: { sheet: NestSheet; x: number; y: number } | null;
+  /** Positions the cascade will apply on commit. */
+  plan: Map<PlacedPart, { x: number; y: number }> | null;
   group: SVGGElement;
+  /** Geometry as it was at pickup — restored if the drag is abandoned, so an
+   *  arrow-key rotation cannot leak out of a cancelled drag. */
+  origin: PartSnapshot;
+  /** Last pointer position, so a rotation can re-run placement without the
+   *  pointer having moved. */
+  clientX: number;
+  clientY: number;
 }
 
 let drag: DragState | null = null;
@@ -276,12 +456,40 @@ function onPointerDown(ev: PointerEvent, g: SVGGElement, part: PlacedPart, sheet
   drag = {
     part, from: sheet,
     offX: at.x - part.x, offY: at.y - part.y,
-    ghost, scale: at.scale, preview: null, previewSvg: null, drop: null, group: g,
+    ghost, scale: at.scale, previews: [], drop: null, plan: null, group: g,
+    origin: snapshotPart(part), clientX: ev.clientX, clientY: ev.clientY,
   };
   positionGhost(ev.clientX, ev.clientY);
+  updateDrag(ev.clientX, ev.clientY);
 
   window.addEventListener('pointermove', onPointerMove);
   window.addEventListener('pointerup', onPointerUp, { once: true });
+  window.addEventListener('keydown', onKeyDown);
+}
+
+/**
+ * Arrow keys turn the panel mid-drag: ← / → by a quarter each way, ↑ / ↓ by a
+ * half. The ghost is resized and placement re-tested against the pointer
+ * where it already is, so a panel can be spun until it fits without letting
+ * go. preventDefault stops the page scrolling under the drag.
+ */
+function onKeyDown(ev: KeyboardEvent) {
+  if (!drag) return;
+  const quarter = ev.key === 'ArrowRight' ? 1
+    : ev.key === 'ArrowLeft' ? -1
+    : (ev.key === 'ArrowUp' || ev.key === 'ArrowDown') ? 2
+    : 0;
+  if (quarter === 0) return;
+  ev.preventDefault();
+  rotatePart(drag.part, quarter);
+  // The grab offset was measured against the old orientation; re-centre it so
+  // the panel doesn't leap out from under the cursor as it turns.
+  drag.offX = drag.part.w / 2;
+  drag.offY = drag.part.h / 2;
+  drag.ghost.style.width = `${drag.part.w * drag.scale}px`;
+  drag.ghost.style.height = `${drag.part.h * drag.scale}px`;
+  updateDrag(drag.clientX, drag.clientY);
+  positionGhost(drag.clientX, drag.clientY);
 }
 
 function positionGhost(clientX: number, clientY: number) {
@@ -293,66 +501,109 @@ function positionGhost(clientX: number, clientY: number) {
 }
 
 function onPointerMove(ev: PointerEvent) {
-  if (!drag || !ctx) return;
-  const target = sheetAt(ev.clientX, ev.clientY);
-  clearPreview();
-  drag.drop = null;
-
-  if (target) {
-    const at = toSheetMm(target.svg, ev.clientX, ev.clientY);
-    if (at) {
-      const raw = { x: at.x - drag.offX, y: at.y - drag.offY };
-      // Snapping ignores the dragged panel itself; on a cross-sheet move it
-      // isn't in the target's list anyway.
-      const s = snap(target.sheet, drag.part, raw.x, raw.y, ctx.margin, ctx.kerf);
-      const legal = placementLegal(target.sheet, drag.part, s.x, s.y, ctx.margin, ctx.kerf);
-      showPreview(target.svg, s.x, s.y, drag.part.w, drag.part.h, legal);
-      if (legal) drag.drop = { sheet: target.sheet, x: s.x, y: s.y };
-    }
-  }
-  drag.ghost.classList.toggle('rearrange-ghost--bad', !drag.drop);
+  if (!drag) return;
+  drag.clientX = ev.clientX;
+  drag.clientY = ev.clientY;
+  updateDrag(ev.clientX, ev.clientY);
   positionGhost(ev.clientX, ev.clientY);
 }
 
-function showPreview(
-  svg: SVGSVGElement, x: number, y: number, w: number, h: number, legal: boolean,
-) {
+/**
+ * Work out where the panel would land from the current pointer position, and
+ * show it. A spot counts as legal if it is either already clear OR the
+ * surrounding panels can be shoved out of the way — so the red state now
+ * means genuinely impossible, not merely occupied.
+ */
+function updateDrag(clientX: number, clientY: number) {
+  if (!drag || !ctx) return;
+  const target = sheetAt(clientX, clientY);
+  clearPreview();
+  drag.drop = null;
+  drag.plan = null;
+
+  if (target) {
+    const at = toSheetMm(target.svg, clientX, clientY);
+    if (at) {
+      const s = snap(target.sheet, drag.part,
+                     at.x - drag.offX, at.y - drag.offY, ctx.margin, ctx.kerf);
+      // On a cross-sheet move the panel isn't in the target's list yet, so it
+      // has to be considered alongside them for the cascade to see it.
+      const scratch: NestSheet = target.sheet.parts.includes(drag.part)
+        ? target.sheet
+        : { ...target.sheet, parts: [...target.sheet.parts, drag.part] };
+      const plan = planReshuffle(scratch, drag.part, s.x, s.y, ctx.margin, ctx.kerf);
+      showPreview(target.svg, s.x, s.y, drag.part.w, drag.part.h, plan !== null);
+      if (plan) {
+        drag.drop = { sheet: target.sheet, x: s.x, y: s.y };
+        drag.plan = plan;
+        // Faint outline wherever a neighbour is about to be pushed to.
+        for (const [p, np] of plan) {
+          if (p === drag.part) continue;
+          if (Math.abs(np.x - p.x) < EPS && Math.abs(np.y - p.y) < EPS) continue;
+          showShovePreview(target.svg, np.x, np.y, p.w, p.h);
+        }
+      }
+    }
+  }
+  drag.ghost.classList.toggle('rearrange-ghost--bad', !drag.drop);
+}
+
+function previewRect(svg: SVGSVGElement, cls: string, x: number, y: number, w: number, h: number) {
   if (!drag) return;
   const r = document.createElementNS(SVG_NS, 'rect');
-  r.setAttribute('class', `rearrange-preview${legal ? '' : ' rearrange-preview--bad'}`);
+  r.setAttribute('class', cls);
   r.setAttribute('x', String(x));
   r.setAttribute('y', String(y));
   r.setAttribute('width', String(w));
   r.setAttribute('height', String(h));
   svg.appendChild(r);
-  drag.preview = r;
-  drag.previewSvg = svg;
+  drag.previews.push(r);
+}
+
+function showPreview(
+  svg: SVGSVGElement, x: number, y: number, w: number, h: number, legal: boolean,
+) {
+  previewRect(svg, `rearrange-preview${legal ? '' : ' rearrange-preview--bad'}`, x, y, w, h);
+}
+
+function showShovePreview(svg: SVGSVGElement, x: number, y: number, w: number, h: number) {
+  previewRect(svg, 'rearrange-shove', x, y, w, h);
 }
 
 function clearPreview() {
-  if (drag?.preview) drag.preview.remove();
-  if (drag) { drag.preview = null; drag.previewSvg = null; }
+  if (!drag) return;
+  for (const p of drag.previews) p.remove();
+  drag.previews = [];
 }
 
 function onPointerUp() {
   window.removeEventListener('pointermove', onPointerMove);
+  window.removeEventListener('keydown', onKeyDown);
   if (!drag || !ctx) return;
-  const { part, from, drop, ghost, group } = drag;
+  const { part, from, drop, plan, ghost, group, origin } = drag;
   clearPreview();
   ghost.remove();
   group.classList.remove('part--dragging');
   drag = null;
 
-  // No legal landing spot → the panel stays exactly where it was.
-  if (!drop) return;
-  if (drop.sheet === from && Math.abs(drop.x - part.x) < EPS && Math.abs(drop.y - part.y) < EPS) {
-    return;
-  }
+  // Nowhere legal to land — undo everything the drag touched, including any
+  // rotation, so an abandoned drag leaves no trace.
+  if (!drop || !plan) { restorePart(part, origin); return; }
+
+  const rotated = part.rotation !== origin.rotation;
+  const sameSpot = drop.sheet === from
+    && Math.abs(drop.x - origin.x) < EPS && Math.abs(drop.y - origin.y) < EPS;
+  const shoved = [...plan].some(([p, np]) =>
+    p !== part && (Math.abs(np.x - p.x) > EPS || Math.abs(np.y - p.y) > EPS));
+  if (sameSpot && !rotated && !shoved) return;
 
   if (drop.sheet !== from) {
     from.parts.splice(from.parts.indexOf(part), 1);
     drop.sheet.parts.push(part);
   }
+  // Apply the cascade: the dragged panel to its drop spot, everyone the plan
+  // moved to wherever they were pushed.
+  for (const [p, np] of plan) { p.x = np.x; p.y = np.y; }
   part.x = drop.x;
   part.y = drop.y;
 
@@ -370,9 +621,12 @@ function onPointerUp() {
 export function cancelDrag() {
   if (!drag) return;
   window.removeEventListener('pointermove', onPointerMove);
+  window.removeEventListener('keydown', onKeyDown);
   clearPreview();
   drag.ghost.remove();
   drag.group.classList.remove('part--dragging');
+  // Undo any mid-drag rotation — the panel was never dropped.
+  restorePart(drag.part, drag.origin);
   drag = null;
 }
 

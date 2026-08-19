@@ -1374,6 +1374,12 @@ input[type="checkbox"]:focus-visible { box-shadow: 0 0 0 2px var(--accent-ring);
   stroke: #2383E2; stroke-width: 6; stroke-dasharray: 18 12;
 }
 .rearrange-preview--bad { fill: rgba(193, 68, 46, 0.16); stroke: #C1442E; }
+/* Where a neighbour is about to be shoved to — quieter than the drop
+   outline, so the panel you are actually placing stays the loud one. */
+.rearrange-shove {
+  fill: none;
+  stroke: #787774; stroke-width: 4; stroke-dasharray: 10 10; opacity: 0.75;
+}
 .rearrange-hint {
   margin: 0 0 8px; font-size: 11.5px; color: var(--muted);
 }

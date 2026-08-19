@@ -3205,9 +3205,11 @@ function renderResults() {
     const hint = document.createElement('p');
     hint.className = 'rearrange-hint';
     hint.textContent =
-      'Drag a panel to move it on its sheet or onto another. It snaps to edges '
-      + 'a kerf apart; red means it will not fit and the panel springs back. '
-      + 'Re-run Estimate to start over.';
+      'Drag a panel to move it on its sheet or onto another — whatever it lands '
+      + 'on shuffles aside to make room, shown as dashed outlines. Arrow keys '
+      + 'rotate while dragging. Edges are magnetic and snap a kerf apart. Red '
+      + 'means it will not fit even after shuffling, and the panel springs '
+      + 'back. Re-run Estimate to start over.';
     detailSvg.appendChild(hint);
   }
   result.groups.forEach((g, gi) => {
