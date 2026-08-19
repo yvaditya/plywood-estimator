@@ -161,6 +161,19 @@ class MaxRectsBin implements BinPacker {
     return { id: '', x: cand.x, y: cand.y, w: cand.w, h: cand.h, rotated: cand.rotated };
   }
 
+  /** Best placement for this rect WITHOUT taking it — used by the global
+   *  best-fit selector, which has to score every remaining part against the
+   *  bin before choosing one. */
+  probe(w: number, h: number, allowRotate: boolean, heur: Heuristic): ScoredPlacement | null {
+    return this.findBest(w, h, allowRotate, heur);
+  }
+
+  /** Take a placement previously returned by `probe`. */
+  take(cand: ScoredPlacement): PackPlacement {
+    this.commit(cand);
+    return { id: '', x: cand.x, y: cand.y, w: cand.w, h: cand.h, rotated: cand.rotated };
+  }
+
   private findBest(w: number, h: number, allowRotate: boolean, heur: Heuristic): ScoredPlacement | null {
     let best: ScoredPlacement | null = null;
     for (const f of this.free) {
@@ -1072,6 +1085,8 @@ export function packOne(job: PackJob, heur: Heuristic, order: PackInput[], binKi
       kind === 'shelf'   ? new ShelfBin(job.sheetW, job.sheetH) :
       kind === 'shelf-v' ? new ShelfBinV(job.sheetW, job.sheetH) :
       kind === 'sas'     ? new GuillotineBin(job.sheetW, job.sheetH) :
+                           // 'maxrects' and 'maxrects-g' share the bin; only
+                           // the selection order over parts differs.
                            new MaxRectsBin(job.sheetW, job.sheetH);
     const cur: PackedSheet = { placements: [], usedArea: 0, largestFree: null, cuts: [], fullySeparated: 0 };
     const carry: PackInput[] = []; // didn't fit on THIS bin → try next bin
@@ -1080,7 +1095,56 @@ export function packOne(job: PackJob, heur: Heuristic, order: PackInput[], binKi
     // recovery so its cuts land in the same frame as the guillotine path.
     const placedInflated: Rect[] = [];
 
-    for (const item of remaining) {
+    /**
+     * Global best-fit (Jylänki): rather than walking the order and giving each
+     * part the best spot left for it, score EVERY remaining part against every
+     * free rectangle and place whichever pair fits best, repeatedly.
+     *
+     * MEASURED WORSE HERE — do not put it back in the default trial schedule.
+     * `tests/bin_compare.mjs`, single ordering, no search: maxrects +0.85
+     * sheets over the area bound, maxrects-g +1.25, and the gap widens with
+     * size (+1.4 vs +2.4 at n=160). Adding it to the 256-trial pool moved the
+     * mean not at all.
+     *
+     * Jylänki measured it ahead of order-based insertion, but on ONLINE
+     * packing of many small rectangles into a single bin. Cabinet jobs are
+     * few large parts across many bins, already fed largest-area-first —
+     * and greedy tightest-fit spends the good space on small parts early,
+     * then strands the big ones, which is exactly what a decreasing-size
+     * order exists to prevent. Kept because bin_compare exercises it and it
+     * is the evidence for that call.
+     */
+    const globalFill = () => {
+      const mr = bin as MaxRectsBin;
+      const pool = remaining.slice();
+      for (;;) {
+        let pick = -1;
+        let pickCand: ScoredPlacement | null = null;
+        for (let i = 0; i < pool.length; i++) {
+          const it = pool[i];
+          const c = mr.probe(it.w + job.kerf, it.h + job.kerf, it.allowRotate, heur);
+          if (c && (!pickCand || better(c, pickCand))) { pickCand = c; pick = i; }
+        }
+        if (pick < 0 || !pickCand) break;
+        const item = pool.splice(pick, 1)[0];
+        const placed = mr.take(pickCand);
+        const halfKerf = job.kerf / 2;
+        const actualW = placed.w - job.kerf;
+        const actualH = placed.h - job.kerf;
+        cur.placements.push({
+          id: item.id,
+          x: placed.x + halfKerf, y: placed.y + halfKerf,
+          w: actualW, h: actualH, rotated: placed.rotated,
+        });
+        placedInflated.push({ x: placed.x, y: placed.y, w: placed.w, h: placed.h });
+        cur.usedArea += actualW * actualH;
+        anyPlacedThisBin = true;
+      }
+      carry.push(...pool);
+    };
+
+    if (kind === 'maxrects-g') globalFill();
+    else for (const item of remaining) {
       const w = item.w + job.kerf;
       const h = item.h + job.kerf;
       const placed = bin.insert(w, h, item.allowRotate, heur);
@@ -1552,7 +1616,7 @@ function consolidateSheets(result: MultiSheetResult, job: PackJob): MultiSheetRe
  * identical parts" pattern a human uses. 'guillotine-exact' adds beam-search
  * trials on top (see packBeam).
  */
-export type BinKind = 'maxrects' | 'shelf' | 'shelf-v' | 'sas' | `beam${number}`;
+export type BinKind = 'maxrects' | 'maxrects-g' | 'shelf' | 'shelf-v' | 'sas' | `beam${number}`;
 
 export interface PackTrial { order: PackInput[]; heur: Heuristic; binKind?: BinKind }
 

@@ -83,6 +83,44 @@ already hits its lower bound, and `Start cabinets` is provably optimal at 2
 sheets despite showing 36% yield. Use the bench, not the samples, to judge
 a packing change.
 
+`tests/bin_compare.mjs` runs the constructive packers head-to-head on ONE
+ordering with no search — "is this a better packer" as distinct from "does
+one more trial in a 256-trial pool help", which a pool can hide entirely.
+
+### Things already tried on the packer that did NOT help (2026-08)
+The search is SATURATED. Do not spend effort on a better search; measure
+before assuming otherwise.
+
+- **8x the restart budget does nothing.** 256 -> 2048 restarts: free
+  +0.75 -> +0.70 sheets, guillotine +1.20 -> +1.20 (unchanged). More
+  sampling of the ordering space is not where the remaining gap is.
+- **Ruin & Recreate over orderings** (Gardeyn & Wauters style, SA
+  acceptance, goal-driven ruin of the emptiest sheet) reached +0.70 free
+  — identical to just running 2048 restarts, never better — and 24.6s on
+  guillotine because the winning seed trial is a beam kind, so every
+  repair iteration re-ran a beam search. Reverted. The reason it cannot
+  win: the state is an ORDERING, so packOne rebuilds the whole layout each
+  iteration and the emptiest sheet simply re-forms. A version worth trying
+  would ruin the LAYOUT and reinsert only the removed parts into the
+  surviving free space (`consolidateSheets` already has the machinery —
+  `inflate` / `rebuild` / `finalizeSheet`), but note it bails out for
+  guillotine because MaxRects free-space reasoning does not preserve
+  cuttability.
+- **Global best-fit** (`maxrects-g`, Jylanki's "global" variant) is WORSE:
+  +1.25 vs maxrects' +0.85 on a single ordering, widening to +2.4 vs +1.4
+  at n=160. Jylanki measured it ahead on ONLINE packing of many small
+  rects into one bin; cabinet jobs are few large parts across many bins,
+  already sorted largest-first, and greedy tightest-fit spends the good
+  space on small parts and strands the big ones. The kind is kept and
+  exercised by bin_compare, but is NOT in the default schedule.
+
+What the numbers actually say: `free` at +0.75 is close to the achievable
+limit, and guillotine's +1.20 is mostly the genuine cost of edge-to-edge
+cuts, not slack — a guillotine layout can never beat the free layout of
+the same instance, so at most ~0.45 sheets separates it from free's
+result. Any real gain now has to come from a different CONSTRUCTIVE
+algorithm, not more search.
+
 ## Sheet orientation
 **Locked landscape**. `nest.ts` only runs `packMulti` with `binW = usableL`
 (long edge along the bin's X axis). The portrait try was removed at user
