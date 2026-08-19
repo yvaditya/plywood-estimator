@@ -29,7 +29,11 @@ import {
   beginRearrangeRender,
   cancelDrag,
   makePartDraggable,
+  makeStagedDraggable,
+  pruneEmptySheets,
   registerSheet,
+  registerStaging,
+  type StagedPart,
 } from './rearrange';
 import { sheetToDxf, downloadDxf } from './dxf';
 import { buildStep, type StepPart } from './stepExport';
@@ -496,6 +500,13 @@ const rearrangeBtn = $<HTMLButtonElement>('rearrangeBtn');
 /** Manual layout editing on/off. Lives here rather than in `state` because it
  *  is a view mode, not part of the job — re-estimating drops it. */
 let rearrangeOn = false;
+/** Panels lifted off the sheets and held aside while rearranging. Anything in
+ *  here is on no sheet, so it is absent from every export — which is why the
+ *  export buttons are disabled while it is non-empty. */
+const staging: StagedPart[] = [];
+const stagingArea = $('stagingArea');
+const stagingItems = $('stagingItems');
+const stagingNote = $('stagingNote');
 const optAssembly = $<HTMLInputElement>('optAssembly');
 const optPanelLists = $<HTMLInputElement>('optPanelLists');
 const optCutSteps = $<HTMLInputElement>('optCutSteps');
@@ -3180,18 +3191,29 @@ function renderResults() {
     result,
     margin: sz.margin,
     kerf: sz.kerf,
+    staging,
     // renderResults re-derives the metrics tiles and the shopping list, and
     // re-arms the mode for the freshly built SVGs.
     onCommit: () => renderResults(),
+    // The tray is part of the layout for the whole of Rearrange mode, not
+    // just while a panel is in the air. Revealing it on pickup reflowed the
+    // pane and every sheet jumped down under the cursor mid-drag.
+    onStagingVisible: () => { stagingArea.hidden = !rearrangeOn; },
   } : null);
+  renderStaging();
 
   resultsEmpty.hidden = true;
   resultsDetail.hidden = false;
-  downloadDxfBtn.disabled = false;
-  downloadCutDxfBtn.disabled = false;
-  downloadPdfBtn.disabled = false;
-  downloadPhonePdfBtn.disabled = false;
-  downloadCutlistPdfBtn.disabled = false;
+  // Parked panels are on no sheet, so every export would silently omit them —
+  // a cut list short a few parts is worse than no cut list. Held until the
+  // tray is empty; the tray itself says why, so the buttons keep their own
+  // descriptive titles rather than having them overwritten.
+  const parked = staging.length > 0;
+  downloadDxfBtn.disabled = parked;
+  downloadCutDxfBtn.disabled = parked;
+  downloadPdfBtn.disabled = parked;
+  downloadPhonePdfBtn.disabled = parked;
+  downloadCutlistPdfBtn.disabled = parked;
   rearrangeBtn.disabled = false;
   pushPartLabelsToViewer();
   const totalSheets = result.groups.reduce((a, g) => a + g.sheets.length, 0);
@@ -4074,8 +4096,48 @@ rearrangeBtn.addEventListener('click', () => {
   rearrangeOn = !rearrangeOn;
   rearrangeBtn.classList.toggle('is-active', rearrangeOn);
   rearrangeBtn.setAttribute('aria-pressed', String(rearrangeOn));
+  // Leaving the mode is when the layout settles: sheets emptied during the
+  // edit are dropped now rather than mid-drag, so parking every panel off a
+  // sheet doesn't delete the sheet you were about to put them back on.
+  if (!rearrangeOn && state.lastNest) pruneEmptySheets(state.lastNest);
   renderResults();
 });
+
+/**
+ * Draw the parked-panel tray. Tiles are scaled to the largest parked panel so
+ * their relative sizes read correctly, and each is draggable straight back
+ * onto a sheet.
+ */
+function renderStaging() {
+  stagingItems.innerHTML = '';
+  stagingArea.hidden = !rearrangeOn;
+  if (!rearrangeOn) return;
+  if (staging.length === 0) {
+    stagingNote.textContent = 'Drop a panel here to hold it while you rearrange';
+    stagingNote.classList.remove('staging-note--warn');
+  } else {
+    stagingNote.textContent =
+      `${staging.length} panel${staging.length === 1 ? '' : 's'} parked — `
+      + 'on no sheet, so exports are held until they are placed';
+    stagingNote.classList.add('staging-note--warn');
+  }
+  registerStaging(stagingArea);
+  const biggest = Math.max(1, ...staging.map((s) => Math.max(s.part.w, s.part.h)));
+  for (const entry of staging) {
+    const tile = document.createElement('div');
+    tile.className = 'staging-tile';
+    const long = Math.max(entry.part.w, entry.part.h);
+    tile.style.width = `${Math.max(26, (entry.part.w / biggest) * 92)}px`;
+    tile.style.height = `${Math.max(20, (entry.part.h / biggest) * 92)}px`;
+    tile.style.background = entry.part.color;
+    tile.title = `${entry.part.partName} · ${fmtDim(long, state.units)} × `
+      + `${fmtDim(Math.min(entry.part.w, entry.part.h), state.units)} · `
+      + `${fmtDim(entry.thickness, state.units)} thick`;
+    tile.textContent = entry.part.panelLabel;
+    stagingItems.appendChild(tile);
+    makeStagedDraggable(tile, entry);
+  }
+}
 
 /** Current state of the export Options menu, shared by both PDF exports. */
 function currentSections(): import('./pdf').PdfSections {

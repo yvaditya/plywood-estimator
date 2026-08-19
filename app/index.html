@@ -508,6 +508,16 @@
                   </div>
                 </header>
                 <div id="convergenceChart" class="convergence-chart" hidden></div>
+                <!-- Staging tray: materialises while a panel is being dragged
+                     and stays as long as it holds parked panels. Sticky so it
+                     is reachable no matter which sheet is scrolled into view. -->
+                <div id="stagingArea" class="staging" hidden>
+                  <div class="staging-head">
+                    <span class="staging-title">Parked panels</span>
+                    <span id="stagingNote" class="staging-note">Drop a panel here to hold it while you rearrange</span>
+                  </div>
+                  <div id="stagingItems" class="staging-items"></div>
+                </div>
                 <div class="detail-svg" id="detailSvg"></div>
                 <div class="metrics-row" id="detailMetrics"></div>
                 <div class="inv-check" id="inventoryCheck"></div>

@@ -42,18 +42,36 @@ const MAX_MOVES_PER_PART = 8;
 /** Float slack for edge comparisons (STEP tessellation noise, mm). */
 const EPS = 0.05;
 
+/** A panel lifted off the sheets and held aside. Thickness travels with it:
+ *  once parked it has no sheet to infer its material from, and it must not be
+ *  put back onto stock of a different thickness. */
+export interface StagedPart {
+  part: PlacedPart;
+  thickness: number;
+}
+
 export interface RearrangeCtx {
   result: NestResult;
   margin: number;
   kerf: number;
+  /** Panels parked out of the sheets. Owned by the caller so it survives the
+   *  re-render that every commit triggers; mutated here. */
+  staging: StagedPart[];
   /** Re-render the results pane after a committed move. */
   onCommit: () => void;
+  /** Show or hide the staging tray mid-drag, without a full re-render. */
+  onStagingVisible: (visible: boolean) => void;
 }
 
 interface Registered { svg: SVGSVGElement; sheet: NestSheet }
 
 let ctx: RearrangeCtx | null = null;
 let registry: Registered[] = [];
+/** Rendered panel → its SVG group, so the cascade can move the real elements
+ *  live during a drag rather than only previewing where they would land. */
+let partEls = new Map<PlacedPart, SVGGElement>();
+/** The staging tray element, registered per render while the mode is armed. */
+let stagingEl: HTMLElement | null = null;
 
 /**
  * Called once per results render. Pass the context to arm drag mode, or null
@@ -63,6 +81,20 @@ let registry: Registered[] = [];
 export function beginRearrangeRender(next: RearrangeCtx | null) {
   ctx = next;
   registry = [];
+  partEls = new Map();
+  stagingEl = null;
+}
+
+/** Register the staging tray as a drop target for this render. */
+export function registerStaging(el: HTMLElement) {
+  if (!ctx) return;
+  stagingEl = el;
+}
+
+/** Make a parked tile draggable back out onto a sheet. */
+export function makeStagedDraggable(el: HTMLElement, entry: StagedPart) {
+  if (!ctx) return;
+  el.addEventListener('pointerdown', (ev) => onPointerDown(ev, null, entry.part, null));
 }
 
 export function rearrangeArmed(): boolean {
@@ -182,31 +214,53 @@ export function planReshuffle(
 
   const moves = new Map<PlacedPart, number>();
   const queue: PlacedPart[] = sheet.parts.filter((p) => p !== anchor);
-  const sep = (a: PlacedPart, b: PlacedPart) => {
-    const A = pos.get(a)!, B = pos.get(b)!;
-    return Math.max(
-      Math.max(B.x - (A.x + a.w), A.x - (B.x + b.w)),
-      Math.max(B.y - (A.y + a.h), A.y - (B.y + b.h)),
-    );
+  const inBox = (p: PlacedPart, x: number, y: number) =>
+    x >= margin - EPS && y >= margin - EPS
+    && x + p.w <= sheet.sheetW - margin + EPS
+    && y + p.h <= sheet.sheetL - margin + EPS;
+  /** Would `p`, placed at (x, y), foul `q` where it currently sits? */
+  const foulsAt = (p: PlacedPart, x: number, y: number, q: PlacedPart) => {
+    const Q = pos.get(q)!;
+    const gx = Math.max(Q.x - (x + p.w), x - (Q.x + q.w));
+    const gy = Math.max(Q.y - (y + p.h), y - (Q.y + q.h));
+    return Math.max(gx, gy) < kerf - EPS;
+  };
+  const firstFoul = (p: PlacedPart, x: number, y: number) =>
+    sheet.parts.find((q) => q !== p && foulsAt(p, x, y, q));
+
+  /**
+   * Slide `p` in one direction until it is clear of EVERYTHING, not just the
+   * first thing in its way. Resolving against a single blocker at a time makes
+   * a panel boxed in by several ping-pong between them and burn its move
+   * budget, which is what made crowded sheets report "no room" when there was
+   * plenty. Returns null if it runs off the margin box.
+   */
+  const slide = (p: PlacedPart, dir: 0 | 1 | 2 | 3) => {
+    const P = pos.get(p)!;
+    let { x, y } = P;
+    for (let i = 0; i <= sheet.parts.length + 1; i++) {
+      const hit = firstFoul(p, x, y);
+      if (!hit) return { x, y };
+      const H = pos.get(hit)!;
+      if (dir === 0) x = H.x - kerf - p.w;
+      else if (dir === 1) x = H.x + hit.w + kerf;
+      else if (dir === 2) y = H.y - kerf - p.h;
+      else y = H.y + hit.h + kerf;
+      if (!inBox(p, x, y)) return null;
+    }
+    return null;
   };
 
   for (let guard = 0; queue.length > 0; guard++) {
     if (guard > MAX_SHOVES) return null;
     const p = queue.shift()!;
     if (p === anchor) continue;
-    const blocker = sheet.parts.find((q) => q !== p && sep(p, q) < kerf - EPS);
-    if (!blocker) continue;
+    const P = pos.get(p)!;
+    if (!firstFoul(p, P.x, P.y)) continue;
 
-    const P = pos.get(p)!, B = pos.get(blocker)!;
-    // Four ways out, each just clearing the blocker by a kerf.
-    const options = [
-      { x: B.x - kerf - p.w, y: P.y },
-      { x: B.x + blocker.w + kerf, y: P.y },
-      { x: P.x, y: B.y - kerf - p.h },
-      { x: P.x, y: B.y + blocker.h + kerf },
-    ].filter((o) => o.x >= margin - EPS && o.y >= margin - EPS
-                 && o.x + p.w <= sheet.sheetW - margin + EPS
-                 && o.y + p.h <= sheet.sheetL - margin + EPS);
+    const options = ([0, 1, 2, 3] as const)
+      .map((d) => slide(p, d))
+      .filter((o): o is { x: number; y: number } => o !== null);
     if (options.length === 0) return null;
     options.sort((a, b) =>
       (Math.abs(a.x - P.x) + Math.abs(a.y - P.y))
@@ -216,10 +270,10 @@ export function planReshuffle(
     if (n > MAX_MOVES_PER_PART) return null;
     moves.set(p, n);
     pos.set(p, options[0]);
-    // This panel moved, so it may now foul others — and itself again.
-    queue.push(p);
+    // This panel moved, so it may now foul others.
     for (const q of sheet.parts) {
-      if (q !== p && q !== anchor && !queue.includes(q) && sep(p, q) < kerf - EPS) {
+      if (q !== p && q !== anchor && !queue.includes(q)
+          && foulsAt(q, pos.get(q)!.x, pos.get(q)!.y, p)) {
         queue.push(q);
       }
     }
@@ -401,7 +455,8 @@ function sheetAt(clientX: number, clientY: number): Registered | null {
 
 interface DragState {
   part: PlacedPart;
-  from: NestSheet;
+  /** Sheet the panel came from, or null when it was lifted out of staging. */
+  from: NestSheet | null;
   /** Grab point measured from the panel's top-left, in mm. */
   offX: number;
   offY: number;
@@ -409,14 +464,16 @@ interface DragState {
   /** px per mm at pickup — the ghost is a screen-space element, so it needs
    *  the scale to place the grab point under the cursor. */
   scale: number;
-  /** Drop outline plus the faint outlines of every panel the cascade will
-   *  shove, so the consequence of the drop is visible before releasing. */
+  /** Outline showing where the dragged panel itself will land. */
   previews: SVGElement[];
-  /** Last legal landing spot, or null when the pointer is over nothing. */
-  drop: { sheet: NestSheet; x: number; y: number } | null;
+  /** Where it will land: a sheet position, or the staging tray. */
+  drop: { sheet: NestSheet; x: number; y: number } | { staged: true } | null;
   /** Positions the cascade will apply on commit. */
   plan: Map<PlacedPart, { x: number; y: number }> | null;
-  group: SVGGElement;
+  /** Panels currently displaced on screen, so they can be put back when the
+   *  pointer moves on. */
+  live: Set<PlacedPart>;
+  group: SVGGElement | null;
   /** Geometry as it was at pickup — restored if the drag is abandoned, so an
    *  arrow-key rotation cannot leak out of a cancelled drag. */
   origin: PartSnapshot;
@@ -424,6 +481,9 @@ interface DragState {
    *  pointer having moved. */
   clientX: number;
   clientY: number;
+  /** Pending animation frame — pointermove fires far more often than the
+   *  cascade needs to run. */
+  raf: number;
 }
 
 let drag: DragState | null = null;
@@ -432,32 +492,57 @@ let drag: DragState | null = null;
 export function makePartDraggable(g: SVGGElement, part: PlacedPart, sheet: NestSheet) {
   if (!ctx) return;
   g.classList.add('part--draggable');
+  partEls.set(part, g);
   g.addEventListener('pointerdown', (ev) => onPointerDown(ev, g, part, sheet));
 }
 
-function onPointerDown(ev: PointerEvent, g: SVGGElement, part: PlacedPart, sheet: NestSheet) {
+/**
+ * Start a drag. `g`/`sheet` are null when the panel is being lifted out of the
+ * staging tray, where there is no SVG to measure against — the grab point is
+ * taken as the panel's centre and the scale from whichever sheet is on screen,
+ * so the ghost still matches the size it will be when dropped.
+ */
+function onPointerDown(
+  ev: PointerEvent, g: SVGGElement | null, part: PlacedPart, sheet: NestSheet | null,
+) {
   if (!ctx || drag || ev.button !== 0) return;
-  const svg = g.ownerSVGElement;
-  if (!svg) return;
-  const at = toSheetMm(svg, ev.clientX, ev.clientY);
-  if (!at) return;
+  let offX: number, offY: number, scale: number;
+  if (g && sheet) {
+    const svg = g.ownerSVGElement;
+    if (!svg) return;
+    const at = toSheetMm(svg, ev.clientX, ev.clientY);
+    if (!at) return;
+    offX = at.x - part.x;
+    offY = at.y - part.y;
+    scale = at.scale;
+  } else {
+    const ref = registry[0];
+    const m = ref?.svg.getScreenCTM();
+    scale = m?.a || 1;
+    offX = part.w / 2;
+    offY = part.h / 2;
+  }
   // The sheet click handler selects the sheet; a drag is not a selection.
   ev.preventDefault();
   ev.stopPropagation();
 
   const ghost = document.createElement('div');
   ghost.className = 'rearrange-ghost';
-  ghost.style.width = `${part.w * at.scale}px`;
-  ghost.style.height = `${part.h * at.scale}px`;
-  ghost.textContent = `${sheet.globalIndex}${part.panelLabel}`;
+  ghost.style.width = `${part.w * scale}px`;
+  ghost.style.height = `${part.h * scale}px`;
+  ghost.textContent = sheet ? `${sheet.globalIndex}${part.panelLabel}` : part.panelLabel;
   document.body.appendChild(ghost);
 
-  g.classList.add('part--dragging');
+  g?.classList.add('part--dragging');
+  // The tray is a drop target for the whole drag, so it has to be on screen
+  // from the moment a panel is picked up — that IS the "drag a panel out and
+  // a box appears" behaviour.
+  ctx.onStagingVisible(true);
   drag = {
-    part, from: sheet,
-    offX: at.x - part.x, offY: at.y - part.y,
-    ghost, scale: at.scale, previews: [], drop: null, plan: null, group: g,
-    origin: snapshotPart(part), clientX: ev.clientX, clientY: ev.clientY,
+    part, from: sheet, offX, offY,
+    ghost, scale, previews: [], drop: null, plan: null,
+    live: new Set(), group: g,
+    origin: snapshotPart(part), clientX: ev.clientX, clientY: ev.clientY, raf: 0,
   };
   positionGhost(ev.clientX, ev.clientY);
   updateDrag(ev.clientX, ev.clientY);
@@ -504,8 +589,43 @@ function onPointerMove(ev: PointerEvent) {
   if (!drag) return;
   drag.clientX = ev.clientX;
   drag.clientY = ev.clientY;
-  updateDrag(ev.clientX, ev.clientY);
+  // The ghost must track the cursor at full rate; the cascade only needs to
+  // keep up with the display.
   positionGhost(ev.clientX, ev.clientY);
+  if (drag.raf) return;
+  drag.raf = requestAnimationFrame(() => {
+    if (!drag) return;
+    drag.raf = 0;
+    updateDrag(drag.clientX, drag.clientY);
+  });
+}
+
+/**
+ * Push the cascade's positions onto the REAL panel elements, so neighbours
+ * slide out of the way live while the pointer is still down. A CSS transform
+ * overrides the element's own `transform` attribute wholesale, so each value
+ * is the panel's absolute planned position, not an offset. Panels no longer
+ * displaced are released back to their attribute position.
+ */
+function applyLive(plan: Map<PlacedPart, { x: number; y: number }> | null) {
+  if (!drag) return;
+  const next = new Set<PlacedPart>();
+  if (plan) {
+    for (const [p, np] of plan) {
+      if (p === drag.part) continue;
+      if (Math.abs(np.x - p.x) < EPS && Math.abs(np.y - p.y) < EPS) continue;
+      const el = partEls.get(p);
+      if (!el) continue;
+      el.style.transform = `translate(${np.x}px, ${np.y}px)`;
+      next.add(p);
+    }
+  }
+  for (const p of drag.live) {
+    if (next.has(p)) continue;
+    const el = partEls.get(p);
+    if (el) el.style.transform = '';
+  }
+  drag.live = next;
 }
 
 /**
@@ -516,36 +636,62 @@ function onPointerMove(ev: PointerEvent) {
  */
 function updateDrag(clientX: number, clientY: number) {
   if (!drag || !ctx) return;
-  const target = sheetAt(clientX, clientY);
   clearPreview();
   drag.drop = null;
   drag.plan = null;
 
+  // The tray wins over the sheets: it is drawn above them, so a pointer
+  // inside it is aiming at it.
+  if (stagingEl && overElement(stagingEl, clientX, clientY)) {
+    stagingEl.classList.add('staging--hot');
+    applyLive(null);
+    // Parking is always possible; there is nothing to collide with.
+    drag.drop = { staged: true };
+    drag.ghost.classList.remove('rearrange-ghost--bad');
+    return;
+  }
+  stagingEl?.classList.remove('staging--hot');
+
+  const target = sheetAt(clientX, clientY);
+  let plan: Map<PlacedPart, { x: number; y: number }> | null = null;
   if (target) {
     const at = toSheetMm(target.svg, clientX, clientY);
-    if (at) {
-      const s = snap(target.sheet, drag.part,
-                     at.x - drag.offX, at.y - drag.offY, ctx.margin, ctx.kerf);
+    // A panel may only go back onto stock of its own thickness — off its
+    // original sheet it has no other way to know what it is cut from.
+    const sameStock = !drag.from || drag.from.thickness === target.sheet.thickness;
+    if (at && sameStock) {
+      // Clamp into the margin box BEFORE snapping. Dragging a panel wider than
+      // the space to one side would otherwise put its corner off the sheet and
+      // simply refuse — pinning it against the margin is what you meant.
+      const maxX = target.sheet.sheetW - ctx.margin - drag.part.w;
+      const maxY = target.sheet.sheetL - ctx.margin - drag.part.h;
+      const cx = Math.min(Math.max(at.x - drag.offX, ctx.margin), Math.max(ctx.margin, maxX));
+      const cy = Math.min(Math.max(at.y - drag.offY, ctx.margin), Math.max(ctx.margin, maxY));
+      const s = snap(target.sheet, drag.part, cx, cy, ctx.margin, ctx.kerf);
       // On a cross-sheet move the panel isn't in the target's list yet, so it
       // has to be considered alongside them for the cascade to see it.
       const scratch: NestSheet = target.sheet.parts.includes(drag.part)
         ? target.sheet
         : { ...target.sheet, parts: [...target.sheet.parts, drag.part] };
-      const plan = planReshuffle(scratch, drag.part, s.x, s.y, ctx.margin, ctx.kerf);
+      plan = planReshuffle(scratch, drag.part, s.x, s.y, ctx.margin, ctx.kerf);
       showPreview(target.svg, s.x, s.y, drag.part.w, drag.part.h, plan !== null);
-      if (plan) {
-        drag.drop = { sheet: target.sheet, x: s.x, y: s.y };
-        drag.plan = plan;
-        // Faint outline wherever a neighbour is about to be pushed to.
-        for (const [p, np] of plan) {
-          if (p === drag.part) continue;
-          if (Math.abs(np.x - p.x) < EPS && Math.abs(np.y - p.y) < EPS) continue;
-          showShovePreview(target.svg, np.x, np.y, p.w, p.h);
-        }
-      }
+      if (plan) { drag.drop = { sheet: target.sheet, x: s.x, y: s.y }; drag.plan = plan; }
+    } else if (at) {
+      // Wrong thickness — show where it would go, in red, and refuse.
+      showPreview(target.svg, at.x - drag.offX, at.y - drag.offY,
+                  drag.part.w, drag.part.h, false);
     }
   }
+  // Neighbours slide aside for real, right now, rather than being previewed.
+  applyLive(plan);
   drag.ghost.classList.toggle('rearrange-ghost--bad', !drag.drop);
+}
+
+/** Is the pointer inside this element's box? */
+function overElement(el: HTMLElement, x: number, y: number): boolean {
+  if (el.hidden) return false;
+  const b = el.getBoundingClientRect();
+  return x >= b.left && x <= b.right && y >= b.top && y <= b.bottom;
 }
 
 function previewRect(svg: SVGSVGElement, cls: string, x: number, y: number, w: number, h: number) {
@@ -566,10 +712,6 @@ function showPreview(
   previewRect(svg, `rearrange-preview${legal ? '' : ' rearrange-preview--bad'}`, x, y, w, h);
 }
 
-function showShovePreview(svg: SVGSVGElement, x: number, y: number, w: number, h: number) {
-  previewRect(svg, 'rearrange-shove', x, y, w, h);
-}
-
 function clearPreview() {
   if (!drag) return;
   for (const p of drag.previews) p.remove();
@@ -581,24 +723,44 @@ function onPointerUp() {
   window.removeEventListener('keydown', onKeyDown);
   if (!drag || !ctx) return;
   const { part, from, drop, plan, ghost, group, origin } = drag;
+  if (drag.raf) cancelAnimationFrame(drag.raf);
   clearPreview();
+  releaseLive();
   ghost.remove();
-  group.classList.remove('part--dragging');
+  group?.classList.remove('part--dragging');
+  stagingEl?.classList.remove('staging--hot');
   drag = null;
 
   // Nowhere legal to land — undo everything the drag touched, including any
   // rotation, so an abandoned drag leaves no trace.
-  if (!drop || !plan) { restorePart(part, origin); return; }
+  if (!drop) { restorePart(part, origin); syncStagingVisible(); return; }
+
+  // Parked: lift it off its sheet and hold it aside. Thickness comes from the
+  // sheet it left, which is the only place that knows.
+  if ('staged' in drop) {
+    if (from) {
+      from.parts.splice(from.parts.indexOf(part), 1);
+      ctx.staging.push({ part, thickness: from.thickness });
+      refreshSheet(from, ctx.margin, ctx.kerf);
+      ctx.onCommit();
+    }
+    return;
+  }
+  if (!plan) { restorePart(part, origin); syncStagingVisible(); return; }
+
+  // Coming back out of staging.
+  const staged = ctx.staging.findIndex((s) => s.part === part);
+  if (staged >= 0) ctx.staging.splice(staged, 1);
 
   const rotated = part.rotation !== origin.rotation;
-  const sameSpot = drop.sheet === from
+  const sameSpot = drop.sheet === from && staged < 0
     && Math.abs(drop.x - origin.x) < EPS && Math.abs(drop.y - origin.y) < EPS;
   const shoved = [...plan].some(([p, np]) =>
     p !== part && (Math.abs(np.x - p.x) > EPS || Math.abs(np.y - p.y) > EPS));
-  if (sameSpot && !rotated && !shoved) return;
+  if (sameSpot && !rotated && !shoved) { syncStagingVisible(); return; }
 
   if (drop.sheet !== from) {
-    from.parts.splice(from.parts.indexOf(part), 1);
+    from?.parts.splice(from.parts.indexOf(part), 1);
     drop.sheet.parts.push(part);
   }
   // Apply the cascade: the dragged panel to its drop spot, everyone the plan
@@ -608,12 +770,27 @@ function onPointerUp() {
   part.y = drop.y;
 
   refreshSheet(drop.sheet, ctx.margin, ctx.kerf);
-  if (drop.sheet !== from) {
-    refreshSheet(from, ctx.margin, ctx.kerf);
-    // Emptying a sheet should remove it from the job, not leave a blank page.
-    pruneEmptySheets(ctx.result);
-  }
+  if (from && drop.sheet !== from) refreshSheet(from, ctx.margin, ctx.kerf);
+  // NOTE: empty sheets are deliberately NOT pruned here. Parking every panel
+  // off a sheet would delete the sheet and leave nowhere to put them back.
+  // pruneEmptySheets runs when the mode is switched off instead.
   ctx.onCommit();
+}
+
+/** Put every live-displaced panel back where its attribute says it is. */
+function releaseLive() {
+  if (!drag) return;
+  for (const p of drag.live) {
+    const el = partEls.get(p);
+    if (el) el.style.transform = '';
+  }
+  drag.live.clear();
+}
+
+/** The tray is shown while a drag is in flight, and stays while it holds
+ *  anything. */
+function syncStagingVisible() {
+  if (ctx) ctx.onStagingVisible(ctx.staging.length > 0);
 }
 
 /** Abandon any drag in flight — called when the mode is switched off or the
@@ -622,12 +799,16 @@ export function cancelDrag() {
   if (!drag) return;
   window.removeEventListener('pointermove', onPointerMove);
   window.removeEventListener('keydown', onKeyDown);
+  if (drag.raf) cancelAnimationFrame(drag.raf);
   clearPreview();
+  releaseLive();
   drag.ghost.remove();
-  drag.group.classList.remove('part--dragging');
+  drag.group?.classList.remove('part--dragging');
+  stagingEl?.classList.remove('staging--hot');
   // Undo any mid-drag rotation — the panel was never dropped.
   restorePart(drag.part, drag.origin);
   drag = null;
+  syncStagingVisible();
 }
 
 /**
