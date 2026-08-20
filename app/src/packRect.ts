@@ -686,11 +686,39 @@ function largestEmptyRect(
   }
   return bestArea > 1 ? best : null;
 }
-/** A setting difference smaller than this does not decide a layout on its own
- *  — a materially better offcut is worth one extra setup. */
-const SETTING_SLACK = 2;
-/** Offcut area difference that counts as materially better (mm²) = 0.05 m². */
-const REMNANT_SLACK = 50_000;
+/**
+ * What one awkward cut costs, in setups. Was effectively infinite: awkward
+ * cuts were compared before everything else, so one layout with zero of them
+ * beat every alternative regardless. The user's own hand-packed ideal layout
+ * contains several, so the true price is real but finite.
+ */
+const AWKWARD_SETUPS = 1;
+/**
+ * How much leftover rectangle buys one setup (mm²). 0.1 m² per setup: half a
+ * square metre of recovered panel is worth about five setup changes, which is
+ * roughly the trade the user makes by hand.
+ */
+const REMNANT_PER_SETUP = 50_000;
+/**
+ * Beyond this aspect ratio an offcut is strip stock, not a panel, and the
+ * extra length is not worth what its area suggests.
+ */
+const REMNANT_MAX_ASPECT = 4;
+
+/**
+ * What an offcut is actually WORTH, as opposed to how big it is.
+ *
+ * Raw area ranks 2413 × 352 (0.85 m²) above 881 × 1046 (0.92 m²) once you
+ * account for nothing else — yet the first is a strip you can only get rails
+ * out of and the second is a door. Length beyond 4:1 is therefore not
+ * counted, so the value is the area of the usable panel inside the offcut.
+ */
+function remnantValue(f: { w: number; h: number } | null): number {
+  if (!f) return 0;
+  const short = Math.min(f.w, f.h);
+  const long = Math.min(Math.max(f.w, f.h), short * REMNANT_MAX_ASPECT);
+  return short * long;
+}
 /** An empty strip at least this wide (both dimensions) is a REUSABLE offcut —
  *  the sequence frees it first, whole, so it can be racked for a later job. */
 const REUSABLE_MM = 200;
@@ -1904,7 +1932,8 @@ export function isBetter(a: MultiSheetResult, b: MultiSheetResult, strategy: Cut
     for (const sh of r.sheets) {
       const f = sh.largestFree;
       if (!f) continue;
-      const a = f.w * f.h, m = Math.min(f.w, f.h);
+      // Ranked by VALUE, not size — see remnantValue.
+      const a = remnantValue(f), m = Math.min(f.w, f.h);
       if (a > area || (a === area && m > short)) { area = a; short = m; }
     }
     return { area, short };
@@ -1923,9 +1952,15 @@ export function isBetter(a: MultiSheetResult, b: MultiSheetResult, strategy: Cut
 
   switch (strategy) {
     case 'guillotine': {
-      // Min cuts, track-saw practical: first minimise AWKWARD cuts (saw run
-      // over stock narrower than a rail can sit on — the thing users hate),
-      // then total cuts, then yield, then the widest narrowest-piece.
+      // Track-saw practical. Everything here is a COST in setups, traded off
+      // against each other rather than ranked absolutely — which is the
+      // correction. Awkward cuts used to veto: they were compared first, so a
+      // single zero-awkward layout won no matter what it cost elsewhere. On a
+      // real job that meant paying two extra setups and half a square metre of
+      // offcut to avoid one fiddly cut. The user's own hand-packed "ideal"
+      // layout is full of awkward cuts — two 63mm backs sharing 128mm of
+      // stock, four 63mm strips stacked at 65mm pitch — so avoiding them is
+      // plainly worth something, but not everything.
       const awkward = (r: MultiSheetResult) => {
         let n = 0;
         for (const sh of r.sheets) for (const c of sh.cuts) {
@@ -1933,22 +1968,17 @@ export function isBetter(a: MultiSheetResult, b: MultiSheetResult, strategy: Cut
         }
         return n;
       };
-      const aa = awkward(a), ba = awkward(b);
-      if (aa !== ba) return aa < ba;
+      // Setups, plus one setup per awkward cut, minus what the offcut is
+      // worth. REMNANT_PER_SETUP says how much rectangle buys one setup, so
+      // the whole thing is denominated in setups and directly comparable.
+      const cost = (r: MultiSheetResult) =>
+        settings(r) + awkward(r) * AWKWARD_SETUPS
+        - bestFree(r).area / REMNANT_PER_SETUP;
+      const ca = cost(a), cb = cost(b);
+      if (Math.abs(ca - cb) > 0.01) return ca < cb;
 
-      // SETTINGS before raw cut count — the saw is paid for in setups, not in
-      // blade passes. But NOT as a strict ordering: on a real job the pool
-      // holds layouts at 13 settings with a 0.52 m² offcut and at 14 with a
-      // 1.05 m² one, and spending a single extra setup to get a whole extra
-      // panel back is the trade a person makes every time. So a setting
-      // difference only decides it when it is worth more than one setup, and
-      // a materially better remnant gets to answer first otherwise.
-      const as = settings(a), bs = settings(b);
-      if (Math.abs(as - bs) >= SETTING_SLACK) return as < bs;
       const fa = bestFree(a), fb = bestFree(b);
-      if (Math.abs(fa.area - fb.area) > REMNANT_SLACK) return fa.area > fb.area;
       if (Math.abs(fa.short - fb.short) > 25) return fa.short > fb.short;
-      if (as !== bs) return as < bs;
       const ac = totalCuts(a), bc = totalCuts(b);
       if (ac !== bc) return ac < bc;
       const at = totalUsed(a), bt = totalUsed(b);
