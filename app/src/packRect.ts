@@ -622,6 +622,75 @@ function guillotineSplitAxis(f: FreeRect, w: number, h: number, childDepth: numb
  *  the user run the saw over such pieces when an alternative exists. */
 const AWKWARD_MM = 150;
 
+
+/** Two cut distances this close are the same flip-stop setting (mm). */
+const SETTING_TOL = 1.0;
+
+/**
+ * The largest single RECTANGLE of stock left over — not the leftover area.
+ *
+ * Area is the wrong measure: the same square metre split into two slivers is
+ * scrap, while one clean rectangle is a panel you can cut a door from. Only a
+ * rectangle can be put back on the rack and used, so that is what gets
+ * measured.
+ *
+ * Solved exactly, on the coordinate grid induced by the placed parts' own
+ * edges — every maximal empty rectangle has its corners on those lines, so
+ * the grid cannot miss one. Cells are marked occupied, then the standard
+ * largest-rectangle-in-histogram sweep runs down the rows with per-column
+ * widths.
+ *
+ * NOT taken from the bin's free list: MaxRects keeps maximal rectangles, but
+ * the shelf and SAS bins keep leftover SHELF space, which understates what is
+ * actually free and made guillotine layouts look worse than they are.
+ *
+ * `rects` are kerf-inflated footprints in bin coordinates.
+ */
+function largestEmptyRect(
+  rects: Rect[], binW: number, binH: number,
+): { w: number; h: number } | null {
+  if (binW <= 0 || binH <= 0) return null;
+  const EPS = 0.01;
+  const uniq = (vals: number[], hi: number) =>
+    [...new Set(vals.filter((v) => v > EPS && v < hi - EPS).concat([0, hi]))]
+      .sort((p, q) => p - q);
+  const xs = uniq(rects.flatMap((r) => [r.x, r.x + r.w]), binW);
+  const ys = uniq(rects.flatMap((r) => [r.y, r.y + r.h]), binH);
+  const nx = xs.length - 1, ny = ys.length - 1;
+  if (nx <= 0 || ny <= 0) return null;
+
+  const heights = new Array<number>(nx).fill(0);
+  const colW = Array.from({ length: nx }, (_, c) => xs[c + 1] - xs[c]);
+  let best: { w: number; h: number } | null = null;
+  let bestArea = 0;
+  for (let r = 0; r < ny; r++) {
+    const cy = (ys[r] + ys[r + 1]) / 2;
+    const rowH = ys[r + 1] - ys[r];
+    for (let c = 0; c < nx; c++) {
+      const cx = (xs[c] + xs[c + 1]) / 2;
+      const occupied = rects.some(
+        (q) => cx > q.x && cx < q.x + q.w && cy > q.y && cy < q.y + q.h);
+      heights[c] = occupied ? 0 : heights[c] + rowH;
+    }
+    for (let c = 0; c < nx; c++) {
+      if (heights[c] === 0) continue;
+      let h = heights[c];
+      let w = 0;
+      for (let d = c; d < nx && heights[d] > 0; d++) {
+        h = Math.min(h, heights[d]);
+        w += colW[d];
+        const area = w * h;
+        if (area > bestArea) { bestArea = area; best = { w, h }; }
+      }
+    }
+  }
+  return bestArea > 1 ? best : null;
+}
+/** A setting difference smaller than this does not decide a layout on its own
+ *  — a materially better offcut is worth one extra setup. */
+const SETTING_SLACK = 2;
+/** Offcut area difference that counts as materially better (mm²) = 0.05 m². */
+const REMNANT_SLACK = 50_000;
 /** An empty strip at least this wide (both dimensions) is a REUSABLE offcut —
  *  the sequence frees it first, whole, so it can be racked for a later job. */
 const REUSABLE_MM = 200;
@@ -1181,13 +1250,9 @@ export function packOne(job: PackJob, heur: Heuristic, order: PackInput[], binKi
       // merges into one fragment (fewer cuts, the human sequence).
       thinStripsTop(cur.placements, placedInflated, job.sheetH);
       bin.cuts = deriveGuillotineCuts(placedInflated, job.sheetW, job.sheetH);
-      // Snapshot the largest remaining free rectangle (by area).
-      let best: { w: number; h: number; a: number } | null = null;
-      for (const f of bin.free) {
-        const a = f.w * f.h;
-        if (!best || a > best.a) best = { w: f.w, h: f.h, a };
-      }
-      cur.largestFree = best ? { w: best.w, h: best.h } : null;
+      // Largest single leftover RECTANGLE, measured from the placements
+      // rather than read off the bin's free list — see largestEmptyRect.
+      cur.largestFree = largestEmptyRect(placedInflated, job.sheetW, job.sheetH);
       // Keep the derived tree's depth-first order — it IS the physical
       // top-to-bottom work sequence (see deriveGuillotineCuts).
       cur.cuts = bin.cuts.slice();
@@ -1419,15 +1484,10 @@ function packBeam(job: PackJob, order: PackInput[], beamWidth: number): MultiShe
     const usedArea = placements.reduce((a, p) => a + p.w * p.h, 0);
     thinStripsTop(placements, best.placedInflated, job.sheetH);
     const cuts = deriveGuillotineCuts(best.placedInflated, job.sheetW, job.sheetH);
-    let bigFree: { w: number; h: number; a: number } | null = null;
-    for (const f of [...best.free, ...best.waste]) {
-      const a = f.w * f.h;
-      if (!bigFree || a > bigFree.a) bigFree = { w: f.w, h: f.h, a };
-    }
     sheets.push({
       placements,
       usedArea,
-      largestFree: bigFree ? { w: bigFree.w, h: bigFree.h } : null,
+      largestFree: largestEmptyRect(best.placedInflated, job.sheetW, job.sheetH),
       cuts,
       fullySeparated: countFreedParts(cuts, best.placedInflated, job.sheetW, job.sheetH),
     });
@@ -1484,11 +1544,6 @@ function repackLastSheetCorner(
     placedInflated.push({ x: placed.x, y: placed.y, w: placed.w, h: placed.h });
     usedArea += actualW * actualH;
   }
-  let best: { w: number; h: number; a: number } | null = null;
-  for (const f of bin.free) {
-    const a = f.w * f.h;
-    if (!best || a > best.a) best = { w: f.w, h: f.h, a };
-  }
   // Recover a guillotine cut tree from the corner-clustered layout so its
   // cut sequence is edge-to-edge per sub-piece (not full-sheet lines).
   // (A vertical mirror keeps the cluster in a corner, so the remnant stays
@@ -1498,7 +1553,9 @@ function repackLastSheetCorner(
   return {
     placements,
     usedArea,
-    largestFree: best ? { w: best.w, h: best.h } : null,
+    // Measured after thinStripsTop, which is what actually parks the cluster
+    // in a corner — the whole point of this repack is the rectangle it leaves.
+    largestFree: largestEmptyRect(placedInflated, job.sheetW, job.sheetH),
     cuts,
     fullySeparated: countFreedParts(cuts, placedInflated, job.sheetW, job.sheetH),
   };
@@ -1540,15 +1597,10 @@ function consolidateSheets(result: MultiSheetResult, job: PackJob): MultiSheetRe
     const placedInflated = placements.map(inflate);
     thinStripsTop(placements, placedInflated, job.sheetH);
     const cuts = deriveGuillotineCuts(placedInflated, job.sheetW, job.sheetH);
-    let bestFree: { w: number; h: number; a: number } | null = null;
-    for (const f of bin.free) {
-      const a = f.w * f.h;
-      if (!bestFree || a > bestFree.a) bestFree = { w: f.w, h: f.h, a };
-    }
     return {
       placements,
       usedArea: placements.reduce((s, p) => s + p.w * p.h, 0),
-      largestFree: bestFree ? { w: bestFree.w, h: bestFree.h } : null,
+      largestFree: largestEmptyRect(placedInflated, job.sheetW, job.sheetH),
       cuts,
       fullySeparated: countFreedParts(cuts, placedInflated, job.sheetW, job.sheetH),
     };
@@ -1642,7 +1694,24 @@ export function buildTrialSchedule(job: PackJob, restarts: number, seedOffset = 
     // share a strip and a single rip sizes them all.
     const byHeight = job.items.slice().sort((a, b) => b.h - a.h || b.w - a.w);
     const byWidth = job.items.slice().sort((a, b) => b.w - a.w || b.h - a.h);
-    const orders = [baseline, bySide, byHeight, byWidth];
+    // Orders that put equal dimensions ADJACENT, so a shelf packer lays them
+    // in one band and a single rip sizes the lot. `byHeight`/`byWidth` sort by
+    // the raw dimension, which still interleaves near-equal sizes; these two
+    // group EXACTLY-equal dimensions first and order the groups by how many
+    // parts share them, so the biggest shared band gets the best space.
+    const groupBy = (dim: (p: PackInput) => number, other: (p: PackInput) => number) => {
+      const buckets = new Map<number, PackInput[]>();
+      for (const it of job.items) {
+        const k = Math.round(dim(it) * 2) / 2;
+        (buckets.get(k) ?? buckets.set(k, []).get(k)!).push(it);
+      }
+      return [...buckets.values()]
+        .sort((x, y) => y.length - x.length || dim(y[0]) - dim(x[0]))
+        .flatMap((g) => g.sort((x, y) => other(y) - other(x)));
+    };
+    const bandH = groupBy((p) => p.h, (p) => p.w);
+    const bandW = groupBy((p) => p.w, (p) => p.h);
+    const orders = [baseline, bySide, byHeight, byWidth, bandH, bandW];
     const kinds: BinKind[] = ['shelf', 'shelf-v', 'sas'];
     for (const order of orders) {
       trials.push({ order, heur: 'BSSF', binKind: 'shelf' });
@@ -1797,12 +1866,60 @@ export function isBetter(a: MultiSheetResult, b: MultiSheetResult, strategy: Cut
   // guillotine-cuttable (fewer parts left joined in a non-guillotine block).
   const freed = (r: MultiSheetResult) => r.sheets.reduce((s, sh) => s + (sh.fullySeparated ?? 0), 0);
 
-  // Applied at the BOTTOM of every strategy: prefer the layout leaving less
-  // on the last sheet, so the remnant is a bigger reusable piece. Lowest
-  // priority by construction — it can never cost a sheet, a cut or yield,
-  // which is what makes "save more on the last sheet" safe as a default
-  // rather than a strategy of its own.
-  const leavesMore = () => lastUsed(a) < lastUsed(b);
+  /**
+   * Distinct flip-stop SETTINGS a layout needs.
+   *
+   * Two cuts on the same axis at the same distance are ONE setting — the
+   * scheduler already batches them ("· same setting"), so the saw is set once
+   * and every part in that run comes off it. On a track saw with a parallel
+   * guide this, not the raw cut count, is what the job costs: six parts
+   * sharing a width is one setup, six different widths is six.
+   *
+   * Counted per sheet and summed. Cutting sheet 2 does not preserve sheet 1's
+   * setting once you have moved on, so sharing across sheets is not credited.
+   */
+  const settings = (r: MultiSheetResult) => {
+    let n = 0;
+    for (const sh of r.sheets) {
+      const seen: { axis: 'H' | 'V'; d: number }[] = [];
+      for (const c of sh.cuts) {
+        if (!seen.some((s) => s.axis === c.axis && Math.abs(s.d - c.distance) <= SETTING_TOL)) {
+          seen.push({ axis: c.axis, d: c.distance });
+          n++;
+        }
+      }
+    }
+    return n;
+  };
+
+  /**
+   * The most useful single offcut in the job. Judged by area, then by its
+   * SHORT side: 2413 × 271 is nominally bigger than 884 × 1045 and worth far
+   * less, because a 271 mm strip is not a panel. Taken as the best over all
+   * sheets rather than the last one — finishPack moves the leanest sheet to
+   * the end afterwards, so during the search "last" is not yet meaningful.
+   */
+  const bestFree = (r: MultiSheetResult) => {
+    let area = 0, short = 0;
+    for (const sh of r.sheets) {
+      const f = sh.largestFree;
+      if (!f) continue;
+      const a = f.w * f.h, m = Math.min(f.w, f.h);
+      if (a > area || (a === area && m > short)) { area = a; short = m; }
+    }
+    return { area, short };
+  };
+
+  // Applied at the BOTTOM of every strategy: prefer the layout whose leftover
+  // is the more usable piece. Lowest priority by construction — it can never
+  // cost a sheet, a cut or yield, which is what makes "save the remnant" safe
+  // as a default rather than a strategy of its own.
+  const leavesMore = () => {
+    const fa = bestFree(a), fb = bestFree(b);
+    if (Math.abs(fa.area - fb.area) > 1) return fa.area > fb.area;
+    if (Math.abs(fa.short - fb.short) > 1) return fa.short > fb.short;
+    return lastUsed(a) < lastUsed(b);
+  };
 
   switch (strategy) {
     case 'guillotine': {
@@ -1818,6 +1935,20 @@ export function isBetter(a: MultiSheetResult, b: MultiSheetResult, strategy: Cut
       };
       const aa = awkward(a), ba = awkward(b);
       if (aa !== ba) return aa < ba;
+
+      // SETTINGS before raw cut count — the saw is paid for in setups, not in
+      // blade passes. But NOT as a strict ordering: on a real job the pool
+      // holds layouts at 13 settings with a 0.52 m² offcut and at 14 with a
+      // 1.05 m² one, and spending a single extra setup to get a whole extra
+      // panel back is the trade a person makes every time. So a setting
+      // difference only decides it when it is worth more than one setup, and
+      // a materially better remnant gets to answer first otherwise.
+      const as = settings(a), bs = settings(b);
+      if (Math.abs(as - bs) >= SETTING_SLACK) return as < bs;
+      const fa = bestFree(a), fb = bestFree(b);
+      if (Math.abs(fa.area - fb.area) > REMNANT_SLACK) return fa.area > fb.area;
+      if (Math.abs(fa.short - fb.short) > 25) return fa.short > fb.short;
+      if (as !== bs) return as < bs;
       const ac = totalCuts(a), bc = totalCuts(b);
       if (ac !== bc) return ac < bc;
       const at = totalUsed(a), bt = totalUsed(b);
