@@ -34,9 +34,14 @@ function gitVersionLine(): Plugin {
         git('log -1 --format=%an', 'local'),
         git('log -1 --format=%cs', ''),
       ].filter(Boolean);
+      // The FULL sha rides along as data-sha: the update check asks GitHub how
+      // this exact commit relates to the branch head, so it needs a ref the
+      // API can resolve, not the display string.
+      const sha = git('rev-parse HEAD', '');
       return html.replace(
-        /(<p class="version" id="versionLine">)[^<]*(<\/p>)/,
-        `$1${escapeHtml(parts.join(' · '))}$2`,
+        /<p class="version" id="versionLine"[^>]*>[^<]*<\/p>/,
+        `<p class="version" id="versionLine" data-sha="${escapeHtml(sha)}">`
+        + `${escapeHtml(parts.join(' · '))}</p>`,
       );
     },
   };

@@ -36,6 +36,7 @@ import {
   registerStaging,
   type StagedPart,
 } from './rearrange';
+import { checkForUpdate, dismissUpdate } from './updateCheck';
 import { sheetToDxf, downloadDxf } from './dxf';
 import { buildStep, type StepPart } from './stepExport';
 import {
@@ -916,6 +917,29 @@ pickFileBtn.addEventListener('click', () => fileInput.click());
 // the first file open doesn't pay it inside the load path. Delayed so it
 // never competes with first paint.
 setTimeout(preloadOcct, 500);
+
+/**
+ * Tell the user when the build they are running is behind the repo, and hand
+ * them a download link. Deliberately late and deliberately quiet: it waits
+ * until after first paint and the OCCT warm-up, and any failure — offline,
+ * rate-limited, a commit GitHub has never seen — shows nothing at all.
+ */
+setTimeout(() => {
+  const sha = document.getElementById('versionLine')?.dataset.sha ?? '';
+  void checkForUpdate(sha).then((info) => {
+    if (!info) return;
+    const banner = $('updateBanner');
+    $('updateBehind').textContent =
+      `— ${info.behindBy} commit${info.behindBy === 1 ? '' : 's'} behind`;
+    const dl = $<HTMLAnchorElement>('updateDownload');
+    dl.href = info.downloadUrl;
+    $('updateDismiss').addEventListener('click', () => {
+      dismissUpdate(info.headSha);
+      banner.hidden = true;
+    });
+    banner.hidden = false;
+  });
+}, 2000);
 fileInput.addEventListener('change', () => {
   if (fileInput.files?.length) handleFiles(fileInput.files);
   // Reset so picking the SAME file(s) again re-fires change.

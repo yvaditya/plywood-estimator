@@ -29,6 +29,16 @@
               <p class="version" id="versionLine">build · author</p>
             </div>
           </div>
+          <!-- Shown only when GitHub says this build is behind the branch
+               head. Hidden and inert otherwise — see updateCheck.ts. -->
+          <div id="updateBanner" class="update-banner" hidden>
+            <span class="update-banner-text">
+              <strong>Update available</strong>
+              <span id="updateBehind"></span>
+            </span>
+            <a id="updateDownload" class="update-banner-link" href="#" target="_blank" rel="noopener">Download</a>
+            <button id="updateDismiss" class="update-banner-dismiss" type="button" title="Hide until the next update">Dismiss</button>
+          </div>
         </header>
 
         <!-- Mode switch: Cut planning vs whole-cabinet structural Analysis -->

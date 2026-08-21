@@ -33,6 +33,21 @@ Open <http://localhost:5173/>.
 
 Requires Node 18 or newer.
 
+### Update notice
+On launch the app asks GitHub how the running build compares to the repo's
+`master`, and if it is behind, shows a strip under the title with the number
+of commits and a **Download** link to the current source zip. Dismiss hides it
+until there is a newer commit than the one dismissed.
+
+It uses the *compare* endpoint rather than matching commit hashes, so having
+unpushed local commits reads as "ahead" and says nothing, instead of nagging
+you to download a build older than the one you are running. Offline, rate
+limited, or a commit GitHub has never seen: all silent. The answer is cached
+for six hours so a dev session's reloads don't spend the unauthenticated rate
+limit — which also means a fresh release can take up to six hours to appear.
+The request is an unauthenticated read of a public repo; nothing about your
+job leaves the machine.
+
 ---
 
 ## Features

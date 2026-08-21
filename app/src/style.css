@@ -1290,6 +1290,49 @@ input[type="checkbox"]:focus-visible { box-shadow: 0 0 0 2px var(--accent-ring);
 }
 
 /* ==========================================================================
+   Update banner — sits under the brand block when the running build is behind
+   the repo. Quiet by design: it is information, not an interruption, so it
+   gets a tinted strip rather than a modal.
+   ========================================================================== */
+.update-banner {
+  display: flex;
+  align-items: center;
+  /* The sidebar is narrow, so the message always takes its own line and the
+     two actions share the next one — rather than Dismiss wrapping alone. */
+  flex-wrap: wrap;
+  gap: 6px 8px;
+  margin: 8px 0 0;
+  padding: 6px 9px;
+  border: 1px solid rgba(35, 131, 226, 0.35);
+  border-radius: 6px;
+  background: rgba(35, 131, 226, 0.07);
+  font-size: 11.5px;
+  color: var(--text);
+}
+.update-banner-text { flex: 1 1 100%; }
+.update-banner-text strong { font-weight: 600; }
+.update-banner-text span { color: var(--muted); }
+.update-banner-link {
+  margin-left: auto;   /* pins both actions to the right of their row */
+  padding: 2px 8px;
+  border-radius: 4px;
+  background: var(--accent, #2383E2);
+  color: #fff;
+  text-decoration: none;
+  font-weight: 500;
+}
+.update-banner-link:hover { filter: brightness(1.08); }
+.update-banner-dismiss {
+  background: none;
+  border: none;
+  padding: 2px 4px;
+  color: var(--muted);
+  font-size: 11.5px;
+  cursor: pointer;
+}
+.update-banner-dismiss:hover { color: var(--text); text-decoration: underline; }
+
+/* ==========================================================================
    Export options — a <details> popover in the Cut Layout header, next to the
    export buttons. Native disclosure, so no JS is needed to open/close it;
    main.ts only reads the checkbox states at export time.
