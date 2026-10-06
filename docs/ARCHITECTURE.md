@@ -636,6 +636,18 @@ source coordinates. It includes unchanged supported panels and excludes
 disclosed zero-thickness surfaces. It does not reconstruct CAD feature history.
 This route is independent of nesting and of the unplaced-parts export above.
 
+`PlacedStepPart.color` carries the imported body's linear RGB colour through
+`correctionStepParts()`. The writer converts it to sRGB and attaches AP214
+surface styles to each solid. Uncoloured bodies receive no invented style.
+These colours are independent of the cut-planning display palette.
+
+`stepLoader.ts` also uses `stepColors.ts` to recover body styles that OCCT
+0.0.23 can omit on nested assembly occurrences. It reads a temporary copy with
+occurrence metadata detached and matches each definition to the original
+occurrence by name, triangle topology, and every vertex under one rigid
+transform. Only missing body colours are copied; geometry, placement and face
+styles stay from the original import. Ambiguous matches are left unchanged.
+
 ---
 
 ## Stage 6.5: Manual rearrange — `src/rearrange.ts`

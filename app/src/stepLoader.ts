@@ -3,6 +3,8 @@
  * The library is loaded as a global script from /public/occt/.
  */
 
+import { restoreStepBodyColors } from './stepColors';
+
 export interface OcctMesh {
   name: string;
   color?: [number, number, number];
@@ -80,14 +82,21 @@ export async function parseStep(buffer: ArrayBuffer): Promise<OcctResult> {
   //     features (hinge-cup holes etc.) where the linear bound alone is lax.
   // 0.1 mm is far inside any saw/router tolerance, so downstream outlines,
   // SVG/DXF exports and CNC masks treat curves as effectively exact.
-  const res = occt.ReadStepFile(bytes, {
+  const params = {
     linearUnit: 'millimeter',
     linearDeflectionType: 'absolute_value',
     linearDeflection: 0.1,
     angularDeflection: 0.2,
-  });
+  };
+  const res = occt.ReadStepFile(bytes, params);
   if (!res || !res.success) {
     throw new Error('STEP parse failed.');
+  }
+  try {
+    restoreStepBodyColors(bytes, res, definitionBytes => occt.ReadStepFile(definitionBytes, params));
+  } catch (error) {
+    // Optional metadata recovery must never replace or prevent a valid import.
+    console.warn('Unable to recover nested STEP body colours.', error);
   }
   console.log(
     `step: occt boot ${(t1 - t0).toFixed(0)}ms · parse ${(performance.now() - t1).toFixed(0)}ms (${(bytes.length / 1024).toFixed(0)} KB, ${res.meshes?.length ?? 0} meshes)`,

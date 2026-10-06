@@ -11,6 +11,14 @@ const outfile = resolve(root, 'tests/_output/stepExport_test.mjs');
 await build({ entryPoints: [resolve(root, 'app/src/stepExport.ts')], bundle: true,
   format: 'esm', platform: 'node', outfile, logLevel: 'silent' });
 const exporter = await import(pathToFileURL(outfile).href);
+const correctionFile = resolve(root, 'tests/_output/stepExport_correction_test.mjs');
+await build({ entryPoints: [resolve(root, 'app/src/thicknessCorrection.ts')], bundle: true,
+  format: 'esm', platform: 'node', outfile: correctionFile, logLevel: 'silent' });
+const { correctThickness, correctionStepParts } = await import(pathToFileURL(correctionFile).href);
+const loaderFile = resolve(root, 'tests/_output/stepExport_loader_test.mjs');
+await build({ entryPoints: [resolve(root, 'app/src/stepLoader.ts')], bundle: true,
+  format: 'esm', platform: 'node', outfile: loaderFile, logLevel: 'silent' });
+const { parseStep } = await import(pathToFileURL(loaderFile).href);
 const require = createRequire(new URL('../app/package.json', import.meta.url));
 const occt = await require('occt-import-js')();
 const date = '2026-10-05T12:00:00.000Z';
@@ -58,6 +66,36 @@ function volume(mesh) {
   return result / 6;
 }
 
+// A real nested STEP assembly, including a translated/rotated occurrence.
+// OCCT 0.0.23 drops solid colours on these located child shapes.
+function nestedAssembly(step) {
+  const id = re => { const m = step.match(re); assert.ok(m); return m[1]; };
+  const context = id(/#(\d+)=\(GEOMETRIC_REPRESENTATION_CONTEXT/);
+  const productContext = id(/#(\d+)=PRODUCT_CONTEXT/);
+  const definitionContext = id(/#(\d+)=PRODUCT_DEFINITION_CONTEXT/);
+  const definition = id(/#(\d+)=PRODUCT_DEFINITION\(/);
+  const representation = id(/#(\d+)=ADVANCED_BREP_SHAPE_REPRESENTATION/);
+  const placement = id(/ADVANCED_BREP_SHAPE_REPRESENTATION\('',\(#(\d+)/);
+  const records = `
+#9000=PRODUCT('Cabinet','Cabinet','',(#${productContext}));
+#9001=PRODUCT_DEFINITION_FORMATION('','',#9000);
+#9002=PRODUCT_DEFINITION('design','',#9001,#${definitionContext});
+#9003=PRODUCT_DEFINITION_SHAPE('','',#9002);
+#9004=CARTESIAN_POINT('',(200.0,-100.0,35.0));
+#9005=DIRECTION('',(0.0,0.0,1.0));
+#9006=DIRECTION('',(0.0,1.0,0.0));
+#9007=AXIS2_PLACEMENT_3D('',#9004,#9005,#9006);
+#9008=SHAPE_REPRESENTATION('',(#${placement},#9007),#${context});
+#9009=SHAPE_DEFINITION_REPRESENTATION(#9003,#9008);
+#9010=NEXT_ASSEMBLY_USAGE_OCCURRENCE('Occurrence; #9011=not an entity','', '',#9002,#${definition},$);
+#9011=PRODUCT_DEFINITION_SHAPE('','',#9010);
+#9012=ITEM_DEFINED_TRANSFORMATION('','',#${placement},#9007);
+#9013=(REPRESENTATION_RELATIONSHIP('','',#${representation},#9008)REPRESENTATION_RELATIONSHIP_WITH_TRANSFORMATION(#9012)SHAPE_REPRESENTATION_RELATIONSHIP());
+#9014=CONTEXT_DEPENDENT_SHAPE_REPRESENTATION(#9013,#9011);
+`;
+  return step.replace('ENDSEC;\nEND-ISO', records + 'ENDSEC;\nEND-ISO');
+}
+
 test('assembly round trip keeps three panel orientations, negative positions, and butt contacts', () => {
   const parts = [
     panel({ name: 'Base', origin: [-80, 30, -100] }),
@@ -93,6 +131,76 @@ test('assembly round trip supports a tilted orthonormal frame', () => {
     close(Math.min(...projections), 0, 'local minimum');
     close(Math.max(...projections), extent, 'local maximum');
   }
+});
+
+test('assembly round trip retains individual linear RGB body colours without colouring plain bodies', () => {
+  const colours = [[.2, .5, .8], [0, 0, 0], [1, 1, 1], [.001, .0031308, .25], undefined];
+  const parts = colours.map((color, i) => panel({ name: `Colour ${i}`, origin: [i * 200, 0, 0], color }));
+  const snapshot = structuredClone(parts);
+  const model = readStep(assembly(parts));
+  assert.equal(model.meshes.length, parts.length);
+  for (const [i, color] of colours.entries()) {
+    if (!color) assert.equal(model.meshes[i].color, undefined, 'plain body stays uncoloured');
+    else {
+      assert.ok(model.meshes[i].color, `body ${i} keeps its colour`);
+      color.forEach((channel, k) => close(model.meshes[i].color[k], channel, `body ${i} channel ${k}`));
+    }
+  }
+  assert.deepEqual(parts, snapshot);
+});
+
+test('import, thickness correction, and STEP export retain source body colours', () => {
+  const colours = [[.2, .5, .8], [1, 0, 0], [0, 0, 0], undefined];
+  const source = readStep(assembly([
+    panel({ outer: rectangle(600, 100), thickness: 19.05, uAxis: [0, 1, 0], vAxis: [0, 0, 1], normal: [1, 0, 0], color: colours[0] }),
+    panel({ outer: rectangle(600, 100), thickness: 19.05, origin: [980.95, 0, 0], uAxis: [0, 1, 0], vAxis: [0, 0, 1], normal: [1, 0, 0], color: colours[1] }),
+    panel({ outer: rectangle(961.9, 100), thickness: 19.05, origin: [19.05, 19.05, 0], uAxis: [1, 0, 0], vAxis: [0, 0, 1], normal: [0, -1, 0], color: colours[2] }),
+    panel({ outer: rectangle(961.9, 100), thickness: 19.05, origin: [19.05, 600, 0], uAxis: [1, 0, 0], vAxis: [0, 0, 1], normal: [0, -1, 0] }),
+  ]));
+  const snapshot = structuredClone(source);
+  const proposal = correctThickness(source.meshes.map((mesh, id) => ({ id, name: `Board ${id}`, mesh })),
+    { sourceThickness: 19.05, targetThickness: 18 });
+  assert.equal(proposal.ok, true, JSON.stringify(proposal.issues));
+  const model = readStep(assembly(correctionStepParts(proposal)));
+  colours.forEach((color, i) => {
+    if (!color) assert.equal(model.meshes[i].color, undefined);
+    else {
+      assert.ok(model.meshes[i].color, `corrected board ${i} keeps its source colour`);
+      color.forEach((channel, k) => close(model.meshes[i].color[k], channel));
+    }
+  });
+  assert.deepEqual(source, snapshot, 'correction/export preserve the imported baseline');
+  expectBounds(model.meshes[0], [[0, 0, 0], [18, 600, 100]]);
+  expectBounds(model.meshes[2], [[18, 0, 0], [982, 18, 100]]);
+});
+
+test('assembly rejects invalid body colours instead of silently changing them', () => {
+  for (const color of [[-.1, 0, 0], [0, 1.1, 0], [NaN, 0, 0], [0, Infinity, 0], [1, 0]])
+    assert.throws(() => assembly([panel({ color })]), /colou?r/i);
+});
+
+test('STEP import recovers nested body colours without changing occurrence geometry or plain bodies', async () => {
+  const step = nestedAssembly(assembly([
+    panel({ name: "First; #9010= 'board'", color: [.2, .5, .8] }),
+    panel({ name: 'Second', origin: [200, 0, 0], color: [0, 0, 0] }),
+    panel({ name: 'Plain', origin: [400, 0, 0] }),
+  ], "Definition 'boards'; #1=comment"));
+  const original = readStep(step);
+  assert.equal(original.meshes.length, 3);
+  // Exercise the production browser import with the real parser, no mock metadata.
+  globalThis.window = { occtimportjs: async () => occt };
+  const restored = await parseStep(new TextEncoder().encode(step).buffer);
+  assert.deepEqual(restored.root, original.root);
+  restored.meshes.forEach((mesh, i) => {
+    assert.deepEqual(mesh.attributes, original.meshes[i].attributes);
+    assert.deepEqual(mesh.index, original.meshes[i].index);
+    assert.deepEqual(mesh.brep_faces, original.meshes[i].brep_faces);
+  });
+  assert.ok(restored.meshes[0].color, 'nested source body keeps its colour');
+  [.2, .5, .8].forEach((value, i) => close(restored.meshes[0].color[i], value));
+  assert.deepEqual(restored.meshes[1].color, [0, 0, 0]);
+  assert.equal(restored.meshes[2].color, undefined);
+  expectBounds(restored.meshes[0], [[150, -100, 35], [200, 0, 53]]);
 });
 
 test('assembly round trip preserves a through hole after placement', () => {

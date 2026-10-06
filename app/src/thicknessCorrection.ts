@@ -355,7 +355,8 @@ export function correctionStepParts(proposal: CorrectionProposal, sourceOffset: 
     const n=p.thicknessAxis,u=(n+1)%3,v=(n+2)%3,s=size(p.after);
     const origin=sub(world(p.after.min,proposal.frame),sourceOffset);
     return {name:p.name,origin,uAxis:proposal.frame[u],vAxis:proposal.frame[v],normal:proposal.frame[n],
-      outer:[[0,0],[s[u],0],[s[u],s[v]],[0,s[v]]],holes:[],thickness:s[n]};
+      outer:[[0,0],[s[u],0],[s[u],s[v]],[0,s[v]]],holes:[],thickness:s[n],
+      color:p.mesh.color ? [...p.mesh.color] : undefined};
   });
 }
 

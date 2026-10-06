@@ -130,7 +130,12 @@ correction rather than silently disappearing from the output.
 
 The download contains positioned panel solids in the source file's coordinate
 system. Display spacing between imported cabinets and floor offsets are
-removed. It preserves assembly placement, but does not recreate the original
+removed. Each panel retains its imported body colour, including unchanged
+panels; bodies without a source colour remain uncoloured. The app's cut-planning
+palette is separate from these CAD colours. Re-import the source file if it was
+loaded before the colour-preservation update.
+
+It preserves assembly placement, but does not recreate the original
 CAD application's feature history, sketches, or parametric constraints.
 
 This differs from the Cut planning export of **unplaced parts**, which lays
@@ -144,7 +149,8 @@ The supplied `FULL TOE KICK.stp` was checked from **19.05 → 18 mm**:
 - 42 panels corrected; 126 face contacts retained.
 - Zero measured joint-gap change, outside-reference error, or collisions.
 - Two reference surfaces disclosed and excluded from panel-solid export.
-- Export re-imported through OpenCascade to verify panel dimensions and positions.
+- Export re-imported through OpenCascade to verify panel dimensions, positions,
+  and the original body colours on all 42 panels.
 - Corrected panels fitted on two 48 × 96-inch sheets in Repeated long rips
   mode, with 12.7 mm margin, 1.8 mm kerf, and 256 trials.
 

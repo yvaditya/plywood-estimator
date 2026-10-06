@@ -24,6 +24,8 @@ export interface StepPart {
 }
 
 export interface PlacedStepPart extends StepPart {
+  /** Imported body colour in linear RGB, with each channel in [0, 1] (OCCT). */
+  color?: [number, number, number];
   /** World position of local (0, 0, 0), in mm. */
   origin: Vec3;
   /** Orthonormal, right-handed local axes in world coordinates. */
@@ -78,6 +80,9 @@ function validatePlacedPart(part: PlacedStepPart): void {
     Array.isArray(v) && v.length === size && v.every(Number.isFinite);
   if (![part.origin, part.uAxis, part.vAxis, part.normal].every(v => finiteVector(v, 3))) {
     throw new Error(`Panel "${part.name}" requires finite origin and frame vectors.`);
+  }
+  if (part.color !== undefined && (!finiteVector(part.color, 3) || part.color.some(c => c < 0 || c > 1))) {
+    throw new Error(`Panel "${part.name}" colour must have three finite RGB channels between 0 and 1.`);
   }
   const dot = (a: Vec3, b: Vec3) => a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
   const u = part.uAxis, v = part.vAxis, n = part.normal;
@@ -292,6 +297,25 @@ function buildStepDocument(parts: StepPart[], isoDate: string, assembly?: { part
   const placement = w.e(`AXIS2_PLACEMENT_3D('',#${originPt},#${zd},#${xd})`);
   const repItems = [placement, ...solids];
   const shapeRep = w.e(`ADVANCED_BREP_SHAPE_REPRESENTATION('',${w.refs(repItems)},#${ctx})`);
+
+  if (assembly) {
+    const styles: number[] = [];
+    for (const [index, part] of assembly.parts.entries()) {
+      if (!part.color) continue;
+      // OCCT exposes linear RGB; STEP COLOUR_RGB uses sRGB. Writing linear
+      // values directly would darken the colours on every export/re-import.
+      const srgb = part.color.map(c => c <= 0.0031308 ? 12.92 * c : 1.055 * c ** (1 / 2.4) - 0.055);
+      const color = w.e(`COLOUR_RGB('',${srgb.map(assemblyReal).join(',')})`);
+      const fillColor = w.e(`FILL_AREA_STYLE_COLOUR('',#${color})`);
+      const fill = w.e(`FILL_AREA_STYLE('',(#${fillColor}))`);
+      const surface = w.e(`SURFACE_STYLE_FILL_AREA(#${fill})`);
+      const side = w.e(`SURFACE_SIDE_STYLE('',(#${surface}))`);
+      const usage = w.e(`SURFACE_STYLE_USAGE(.BOTH.,#${side})`);
+      const assignment = w.e(`PRESENTATION_STYLE_ASSIGNMENT((#${usage}))`);
+      styles.push(w.e(`STYLED_ITEM('',(#${assignment}),#${solids[index]})`));
+    }
+    if (styles.length) w.e(`MECHANICAL_DESIGN_GEOMETRIC_PRESENTATION_REPRESENTATION('',${w.refs(styles)},#${ctx})`);
+  }
 
   const appCtx = w.e('APPLICATION_CONTEXT(\'core data for automotive mechanical design processes\')');
   w.e(`APPLICATION_PROTOCOL_DEFINITION('international standard','automotive_design',2000,#${appCtx})`);

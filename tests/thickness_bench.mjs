@@ -17,12 +17,15 @@ async function bundle(name){
 }
 const {correctThickness,correctionStepParts}=await bundle('thicknessCorrection');
 const {buildAssemblyStep}=await bundle('stepExport');
+const {restoreStepBodyColors}=await bundle('stepColors');
 const {analyzeBody}=await bundle('geometry');
 const {runNest}=await bundle('nest');
 const occt=await require('occt-import-js')();
 const parse=bytes=>occt.ReadStepFile(bytes,{linearUnit:'millimeter',linearDeflectionType:'absolute_value',linearDeflection:.1,angularDeflection:.2});
-const original=parse(new Uint8Array(readFileSync(file)));
+const sourceBytes=new Uint8Array(readFileSync(file));
+const original=parse(sourceBytes);
 assert.equal(original.success,true);
+restoreStepBodyColors(sourceBytes,original,parse);
 const inputs=original.meshes.map((mesh,id)=>({mesh,id,name:mesh.name||`Board ${id+1}`}));
 const start=performance.now();
 const proposal=correctThickness(inputs,{sourceThickness:19.05,targetThickness});
@@ -46,6 +49,10 @@ const actualBounds=new Map();
 const parts=imported.meshes.map((mesh,index)=>{
   const p=proposal.panels[index],a=analyzeBody(mesh),actual=meshBounds(mesh,proposal.frame);
   assert.ok(a);near(a.thickness,p.thickness);
+  if(p.mesh.color){
+    assert.ok(mesh.color,`Panel ${index} lost its imported colour`);
+    p.mesh.color.forEach((channel,k)=>near(mesh.color[k],channel));
+  } else assert.equal(mesh.color,undefined,'uncoloured source panels stay uncoloured');
   for(let k=0;k<3;k++){near(actual.min[k],p.after.min[k]);near(actual.max[k],p.after.max[k]);}
   actualBounds.set(p.id,actual);
   return {id:String(p.id),name:p.name,thickness:a.thickness,qty:1,grain:'free',rotation:'lock',outer:a.outline.outer,holes:a.outline.holes,color:'#888'};
@@ -73,7 +80,8 @@ if(base==='FULL TOE KICK' && targetThickness===18){
 const nest=runNest(parts,{sheetW:1219.2,sheetL:2438.4,margin:12.7,kerf:1.8,resolution:5,restarts:256,cutStrategy:'repeated'});
 const summary={model:basename(file),sourceThickness:19.05,targetThickness,panels:parts.length,contacts:proposal.contacts.length,
   changes:proposal.changes.length,excluded:proposal.excluded,validation:proposal.validation,elapsedMs:Math.round(elapsedMs),
-  reimportedCadVerified:true,sheets:nest.totalSheets,unplaced:nest.groups.reduce((n,g)=>n+g.unplaced.length,0),stepPath,
+  reimportedCadVerified:true,bodyColorsVerified:true,coloredPanels:proposal.panels.filter(p=>p.mesh.color).length,
+  sheets:nest.totalSheets,unplaced:nest.groups.reduce((n,g)=>n+g.unplaced.length,0),stepPath,
   dimensions:proposal.changes};
 writeFileSync(resolve(out,'thickness_bench_summary.json'),JSON.stringify(summary,null,2));
 console.log(JSON.stringify({...summary,dimensions:undefined},null,2));
