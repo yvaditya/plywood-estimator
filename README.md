@@ -5,8 +5,9 @@ Drop one or more STEP files → pick the panel bodies → get optimized cut
 sheets, a shopping list, edge-banding totals, cost rollups, DXF/PDF cut
 plans, and per-sheet cut instructions.
 
-Runs entirely in the browser. STEP parsing via OpenCascade (WASM); 2D
-nesting in pure TypeScript; 3D viewer in Three.js.
+STEP import, measured-stock correction, nesting, and exports run in the
+browser: OpenCascade (WASM), TypeScript, and Three.js. Structural analysis
+can also use the optional [local solver service](server/README.md).
 
 ---
 
@@ -61,6 +62,21 @@ job leaves the machine.
 
 ## Features
 
+### Choose a workspace
+
+| Workspace | Use it for | Main result |
+|---|---|---|
+| **Cut planning** | Select panels, set stock and grain, then estimate | Cut layouts, shopping list, and cutting exports |
+| **Thickness** | Adapt a cabinet to measured plywood thickness | Reviewed board changes and a corrected STEP assembly |
+| **Analysis** | Detect joints, set loads, and solve the assembly | Structural mesh, deflection/stress results, and analysis PDF |
+
+The workspaces share the imported model. A typical sequence is **Import →
+Thickness → Apply → Cut planning → Estimate**. Run structural analysis again
+after changing geometry. Switching tabs alone does not apply a correction.
+
+See the [Thickness workspace guide](docs/THICKNESS-CORRECTION.md) for a
+step-by-step walkthrough, screenshots, table columns, and troubleshooting.
+
 ### Import
 - **Multi-file STEP** — drop several `.step`/`.stp` files in a row; each
   file's bodies append to the model with the file name as a prefix.
@@ -95,6 +111,9 @@ job leaves the machine.
   direction is axis-aligned with the sheet — angled cuts are minimized.
 
 ### Measured stock thickness correction
+
+![Thickness workspace with stock settings, a toe-kick preview, and the old/new board-size table](docs/img/thickness-workspace.png)
+
 Open the **Thickness** workspace beside Cut planning and Analysis, select a cabinet and its source stock group,
 enter the actual thickness in millimetres, and choose **Analyse corrections**.
 The solver finds face contacts, holds the outside outline and exposed recess
@@ -244,6 +263,8 @@ plywood estimator/
 ├── README.md
 ├── docs/
 │   ├── ARCHITECTURE.md   Data flow / pipeline documentation
+│   ├── THICKNESS-CORRECTION.md  Measured-stock workflow and screenshots
+│   ├── WHITEPAPER.md     Illustrated explanation of the algorithms
 │   └── CLAUDE.md         Notes for future Claude sessions
 └── app/
     ├── index.html
@@ -252,6 +273,9 @@ plywood estimator/
     └── src/
         ├── stepLoader.ts     STEP → meshes via occt-import-js
         ├── geometry.ts       Body analysis (thickness + outline + face data)
+        ├── thicknessCorrection.ts    Joint/perimeter solver and validation
+        ├── thicknessCorrectionUI.ts  Proposal review, preview, apply/reset
+        ├── stepExport.ts     Unplaced-part and positioned-assembly STEP export
         ├── viewer.ts         Three.js viewer + grain-arrow widgets
         ├── packRect.ts       MaxRects + Guillotine bin packers
         ├── nest.ts           Group-by-thickness, multi-restart wrapper
@@ -263,11 +287,12 @@ plywood estimator/
         │                     cascade, magnetic snap, rotate, staging tray
         ├── units.ts          mm/in formatting, fractional inches, money
         ├── main.ts           UI wiring
-        └── style.css         Notion-style theme
+        └── style.css         Shared light theme and responsive workspaces
 ```
 
-See [docs/ARCHITECTURE.md](./docs/ARCHITECTURE.md) for the data flow /
-pipeline documentation.
+See [ARCHITECTURE](docs/ARCHITECTURE.md) for implementation details,
+[WHITEPAPER](docs/WHITEPAPER.md) for the algorithm walkthrough, and the
+[thickness design](docs/thickness-correction-design.md) for geometry constraints.
 
 ---
 

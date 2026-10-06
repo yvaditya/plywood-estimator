@@ -3,6 +3,11 @@
 How a dropped STEP file becomes an optimized cut plan, function by function.
 (Reader-friendly companion with diagrams: [WHITEPAPER.md](WHITEPAPER.md).)
 
+The UI has three workspaces sharing the same imported bodies: **Cut planning**,
+**Thickness**, and **Analysis**. The pipeline below is the cutting path.
+Thickness correction is an optional geometry-editing step before nesting;
+structural analysis operates on the current applied geometry.
+
 ```
 ┌──────────────┐    ┌──────────────┐    ┌──────────────┐    ┌──────────────┐
 │ User drops   │ →  │  STEP parse  │ →  │  Body        │ →  │  3D viewer   │
@@ -120,6 +125,101 @@ widthDir`. Main wraps this in a `BodyState` (with user-editable `qty`,
 
 ---
 
+## Stage 2.5: Optional thickness correction
+
+**Entry**: `mountThicknessCorrection()` in `src/thicknessCorrectionUI.ts`.
+**Solver**: `correctThickness()` in `src/thicknessCorrection.ts`.
+**Host mutation**: `installCorrectedGeometry()` in `src/main.ts`.
+
+```mermaid
+flowchart LR
+    I[Retained imported meshes] --> S[Stock settings + contact solve]
+    S --> V{Independent validation}
+    V -->|invalid| R[Review issues; Apply blocked]
+    V -->|valid| P[Proposal + old/new table]
+    P --> T[Temporary 3D preview]
+    P --> A[Apply geometry + BodyAnalysis]
+    A --> N[Fresh nesting / structural solve]
+    A --> E[Positioned assembly STEP]
+    I -->|Reset| A
+```
+
+### State ownership
+
+`ThicknessCabinet` keeps a stable file key, immutable `CorrectionInput[]`, the
+display-only `sourceOffset`, and an optional applied `CorrectionProposal`.
+Source positions retain JavaScript number precision independently of the
+Three.js buffers. Duplicate imported names receive distinct keys.
+
+The UI owns the pending proposal and its source/settings snapshot. Changing
+the cabinet, source inputs, stock group, target, or tolerance invalidates that
+proposal. Every solve starts from the retained import. Applying a new proposal
+replaces the cabinet's previous correction; applying twice cannot accumulate
+the same allowance.
+
+### Solve and validate
+
+1. Validate inputs and classify zero-thickness reference surfaces before
+   inferring the shared orthogonal assembly frame.
+2. Require each editable panel to be a closed rectangular prism, using face
+   planes, winding, welded edge incidence, face area, and volume checks.
+   Unsupported nonzero solids block the solve. Reference surfaces are disclosed.
+3. Find opposing rectangular faces within the contact tolerance with positive
+   overlap. Record their original gap and contact type. Default tolerance is
+   0.05 mm; it must be positive and at most 0.5 mm.
+4. Find connected components and exterior references from their projected
+   outside boundaries and exposed recessed broad faces. Keep disconnected
+   assemblies independent, including nested ones.
+5. Solve face-displacement equalities for new stock thickness, original
+   contacts, and fixed outside references. Preserve other in-plane dimensions
+   where compatible and minimise remaining translations.
+6. Remap panel meshes and independently check dimensions, contact gap and
+   overlap, collisions, projected perimeter, and fixed references. A failed
+   invariant produces issues and prevents Apply.
+
+`CorrectionProposal` carries `panels`, `contacts`, `changes`, `issues`,
+`excluded`, `references`, `frame`, and validation metrics. The table reorders
+each board's size vector into its original length/width/thickness axis order;
+`change.translation` is a world-space centre displacement. The table displays
+up to three decimal places, while the retained geometry is not rounded to it.
+
+### Preview, apply, reset, and export
+
+`viewer.showThicknessPreview()` draws the complete proposed panel set and
+imported edges while temporarily hiding the corresponding live bodies. It
+does not mutate `BodyState.analysis`. Clearing it restores live visibility.
+
+Apply prepares all replacement analyses first, then updates viewer geometry
+and `BodyState.analysis` together. `correctedPanelAnalysis()` uses the verified
+prism frame, avoiding the importer's nominal stock-range classification for
+already-validated corrected panels. Part identities and user settings remain.
+Apply/reset clear incompatible thickness override, old nesting, manual layout
+state, labels, shopping totals, and structural results.
+
+`correctionStepParts()` converts the applied proposal into positioned parts,
+subtracting each file's display offset. `buildAssemblyStep()` writes the
+assembly solids. Download uses `cabinet.applied`, never unapplied inputs or
+preview state. Reset derives the live panel analyses from the retained import.
+
+### Workspace lifecycle
+
+`applySidebarMode()` selects `cut`, `thickness`, or `analysis`. The mode is saved
+under `plywood.sidebarMode`; imported geometry and proposals are not persisted.
+The Thickness layout uses `#workArea.thickness-full`, with stock controls in
+the sidebar, a shared viewer, and `#thicknessReview` with its own scroll area
+and fixed action footer. Below 1050 px, the review stacks under the viewer.
+
+Leaving Thickness clears its preview, but keeps proposal/applied state.
+Entering it clears CAE graphics without deleting cached analysis. Active
+model operations and captures disable entry so late CAE paints cannot replace
+the preview. Keyboard tab navigation skips disabled workspaces. Applying or
+resetting geometry intentionally invalidates the old structural solution.
+
+User instructions and screenshots: [THICKNESS-CORRECTION.md](THICKNESS-CORRECTION.md).
+Geometry constraints: [thickness-correction-design.md](thickness-correction-design.md).
+
+---
+
 ## Stage 3: 3D viewer
 
 **Entry**: `viewer.addOcctMesh()` and `viewer.addNonSheetMesh()` in
@@ -195,7 +295,7 @@ rectangle packing (`packRect.ts`) or CNC true-shape (`cncNest.ts`). The
 animated path routes through the **multicore worker pool** (`optPool.ts` →
 `optWorker.ts`), with the single-core drivers as automatic fallback.
 
-### Rectangle path (guillotine / free)
+### Rectangle path (guillotine / repeated / free)
 
 1. **Bucket by thickness** at 0.5 mm tolerance. Each bucket nests
    independently into its own stack of sheets.
@@ -526,6 +626,16 @@ protected against anything painted before its mask.
 unplaced instance from its footprint outline (split segments resolve via
 `state.splitSegmentGeo`).
 
+### STEP (corrected panel assembly)
+
+Thickness **Download STEP** calls `buildAssemblyStep()` with positioned parts
+from the applied proposal. Each `PlacedStepPart` supplies `origin`, `uAxis`,
+`vAxis`, and `normal`, plus its outline and thickness. The exporter validates
+a right-handed orthonormal frame and writes closed planar B-rep solids in
+source coordinates. It includes unchanged supported panels and excludes
+disclosed zero-thickness surfaces. It does not reconstruct CAD feature history.
+This route is independent of nesting and of the unplaced-parts export above.
+
 ---
 
 ## Stage 6.5: Manual rearrange — `src/rearrange.ts`
@@ -613,6 +723,20 @@ different regions of the search space.
 - All internal geometry is in **millimetres**.
 - The UI defaults to **inches** display with fractional formatting
   (`fmtFracInches` in `src/units.ts`, 1/16" precision).
+- Thickness inputs, its old/new size table, and movement values always use mm.
 - `toMm` / `fromMm` convert at the IO boundary.
 - World is **Z-up** to match STEP convention. The 3D scene, lighting,
   shadows, and grain arrows all assume Z-up.
+
+## Thickness verification
+
+From `app/`, `npm test` runs the registered regression suites. Thickness-specific
+coverage lives in `tests/thickness.test.mjs` (geometry constraints) and
+`tests/stepExport.test.mjs` (real OpenCascade export/re-import).
+
+From the repository root, `node tests/thickness_bench.mjs "path/to/model.stp" 18`
+uses a 19.05 mm source-stock fixture and verifies the corrected CAD before
+nesting it. `python tests/thickness_ui.py "path/to/FULL TOE KICK.stp" URL` needs
+a running app and Python Playwright; it verifies the known toe-kick UI flow,
+table, preview/apply/reset, exports, duplicate imports, and mode persistence.
+Generated reports, STEP files, and browser screenshots stay in `tests/_output/`.

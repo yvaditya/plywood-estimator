@@ -38,7 +38,7 @@ User approved the design and explicitly requested autonomous implementation.
 - Corrected panels still nest on two 48 x 96 inch sheets in Repeated long rips mode, with no unplaced panels. Artifacts: `tests/_output/FULL TOE KICK-18mm.step` and `tests/_output/thickness_bench_summary.json`.
 - First version supports closed rectangular boards in a shared orthogonal frame. Unsupported shaped joinery, contradictory exterior anchors, and existing overlaps block application with a review report. Original STEP and feature history are not edited.
 - Final production browser verification passed: import, analyse, non-mutating preview, apply, 18 mm nesting, applied-state STEP download, repeat apply without accumulated allowances, reset, invalid target, duplicate filenames, isolated cabinet correction, clear, and zero browser errors. Both downloaded STEP files independently re-import to 42 panels at 18 mm with zero coordinate drift against the validated benchmark export. Browser artifacts are under `tests/_output/thickness_ui/`.
-- git diff --check passed. No source STEP modification, commit, or publishing was performed.
+- `git diff --check` passed. The source STEP was not modified. This ledger entry describes the initial local verification; the subsequent UI release was committed and pushed as noted below.
 
 ## Workspace UI follow-up (2026-10-06)
 
@@ -48,3 +48,10 @@ User approved the design and explicitly requested autonomous implementation.
 - Full toe-kick browser workflow passed, including table filtering, responsive fixed actions, preview cleanup on workspace changes, apply, nesting, export, reset, duplicate imports, isolated cabinet edits, and persisted workspace selection. Production checks also verified old/new table values, expandable reasons, keyboard navigation, and layouts at 900, 1280, and 1600 pixels with no browser errors.
 - Independent review reproduced an active structural solve repainting over Thickness. Entry is now disabled until shared model operations and captures finish; keyboard navigation skips the unavailable tab. The reviewer verified the real solve/capture sequence, result preservation, and graphics restoration, with no remaining findings.
 - Final TypeScript/Vite build, all 46 regression tests, and whitespace checks passed before preparing the user-requested Git update.
+- Shipped to `master` in commit `2ce4c30` together with the preceding optimizer and correction implementation.
+
+## Documentation follow-up
+
+- Added `THICKNESS-CORRECTION.md` with screenshots, a user walkthrough, state and table definitions, troubleshooting, supported geometry, and benchmark commands.
+- Linked the guide from the README and updated architecture, whitepaper, and developer notes for three workspaces, source/proposal/applied state, placed STEP export, and operation guards.
+- Kept the shipped feature documentation separate from newer in-progress code changes in the shared workspace.

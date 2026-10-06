@@ -28,6 +28,9 @@ Quick orientation for a fresh session working on this repo.
 | `main.ts` | UI wiring, file drop, state, all `addEventListener`s, async nest button + replay button + convergence chart |
 | `stepLoader.ts` | OCCT WASM init + STEP parse |
 | `geometry.ts` | Body analysis: AABB → thickness + outline polygon + face vectors. Returns null for non-sheet shapes |
+| `thicknessCorrection.ts` | Pure rectangular-panel correction: common frame, contacts, outside references, face-displacement solve, independent validation, corrected panel analyses |
+| `thicknessCorrectionUI.ts` | Dedicated Thickness controls, proposal snapshots, searchable old/new table, preview/apply/reset, applied-state STEP download |
+| `stepExport.ts` | `buildStep` for unplaced parts; `buildAssemblyStep` for panel solids with explicit origins and axes |
 | `viewer.ts` | Three.js viewer, post chain, grain arrows, non-sheet ghost group, `snapshotFiltered(visibleIds, dirs, dist, frameIds?, target?)` for PDF snapshots |
 | `nest.ts` | Per-thickness bucketing wrapper. Has `runNest` (sync) + `runNestAnimated` (async, observable, used by the UI) |
 | `packRect.ts` | `MaxRectsBin` + `ShelfBin` + (legacy) `GuillotineBin` packers. Exports `packMulti` (sync) + `packMultiAnimated` (async with `onProgress`) |
@@ -36,18 +39,19 @@ Quick orientation for a fresh session working on this repo.
 | `shoppingList.ts` | Buy/have rollup + CSV export, localStorage persistence |
 | `dxf.ts` | DXF R12 writer (layers SHEET / MARGIN / PARTS / LABELS / DIMS) |
 | `pdf.ts` | jsPDF report (cover → contents → quick ref → shopping → job-wide Panels TABLE → per-sheet (overview + panels table + cut sequence) → per-cabinet assembly + IKEA-style step pages) |
-| `cae.ts` | CAE: material cards (each carries `fbAlong`/`fbAcross` bending strengths for utilization %), panel weight, sag screening, orthotropic Mindlin plate FEM + ASSEMBLY flat-shell solver (membrane+bending, 6 DOF/node, penalty joints rigid/semi-rigid/hinged, floor grounding). The assembly LINEAR SOLVE has TWO backends handed the identical symmetric CSR (==CSC) system: **Eigen SimplicialLDLT compiled to WASM** (`solverBackend.ts` → `app/src/wasm/eigen-solver.{js,wasm}`, built from `app/native/solver.cpp` via `build.ps1`; committed so users never need emsdk) when it loads, else the built-in **Jacobi-PCG** fallback. `solveAssembly(opts)` takes `opts.backend` (DirectLinearSolver | null) + `opts.onProgress` (staged UI feedback); it reports `res.backend`/`factorMs`/`solveMs`. Benchmark (workbench, 50 kg preset, 58 452 DOF): **LDLT factor 263 ms + solve 6 ms** vs **PCG 348 iters / 765 ms** — LDLT ~2.8× faster, and re-solves after the factor are ~6 ms. The per-panel plate path stays pure-TS PCG (tiny systems). After the solve it does STRESS RECOVERY per element (membrane N + bending M at the centre → surface σ=N/t±6M/t² → per-face von Mises → nodal average), returning per-panel `vm` field + global `maxVm`/`maxVmPanelId`/`maxVmAt` + `utilPct` (peak grain-axis bending σ vs the card's fbAlong/fbAcross) + `stressVerdict` (<50% ok, <100% borderline, ≥100% weak). There is ALSO a **SOLID (hexahedral) path**: `opts.meshKind:'solid'` re-discretises the SAME preprocessed model through the thickness into `solidLayers` (default 2) 8-node hexes per in-plane cell, 3 DOF/node, and `solveAssemblySolid`/`finishSolid` run the whole solve+recovery on it. The hex uses **Wilson incompatible modes** (9 internal DOF statically condensed per element) — without them a trilinear hex shear-locks and comes out ~5× too stiff in bending, which is fatal at the 2–3 elements we can afford through an 18 mm panel. Material is **full 3D orthotropy** (`orthotropic3D`, compliance inverted so Maxwell symmetry is exact) with through-thickness modulus `0.15×E_across` and rolling shear `0.2×G12` — the ratios that make a solid model behave like plywood rather than a plastic slab. Every hex in a panel is the same rectangular box, so the 24×24 is formed ONCE per panel and rotated per element. Solid node `g·levels + l` maps back to mid-surface shell node `g`, which is how joints/grounding/loads lift over and how results collapse back onto the per-panel grid (worst value over the stack) so the texture overlay + PDF keep working. tests/cae_check.ts has NINE validation cases — keep all passing. Assembly cases (e,f,g) run against BOTH backends when the WASM loads under node (per-backend PASS + case (e) cross-backend agreement <1e-4; measured 1.2e-12). Case (g) checks recovered SS-strip surface stress; it uses a SHORT/THICK strip on hinged legs so the soft-grounding regularization — which perturbs absolute deflection for slender panels — doesn't steal the end reactions; centre moment stays P·L/4. tests/asm_bench.py times PCG vs LDLT in-browser (forces PCG via `window.__caeForcePcg`). Per-panel INTERACTIVE CAE was removed (user: useless); the ONLY CAE surface is the Analysis sidebar MODE (segmented Cut planning / Analysis switch under the brand header, green dot when solved; joints list + presets + patch loads + a Deflection/Stress heatmap field toggle that re-textures from the cached solve — no re-solve). The Solve button shows a STAGED progress bar (Meshing → Assembling <DOF> → Factorizing/Solving <backend> → Recovering stresses → Rendering; same `.busy` progress pattern as the PDF button — preprocessing=our TS, solve=the WASM core, post=browser). Result line reports both deflection AND max stress (MPa) + util% + the backend name & timing, verdict = worst of the two. Structure table + Assembly PDF page (now with stress numbers + a second von-Mises heatmap under the deflection one) gate on an assembly solve |
+| `cae.ts` | CAE: material cards (each carries `fbAlong`/`fbAcross` bending strengths for utilization %), panel weight, sag screening, orthotropic Mindlin plate FEM + ASSEMBLY flat-shell solver (membrane+bending, 6 DOF/node, penalty joints rigid/semi-rigid/hinged, floor grounding). The assembly LINEAR SOLVE has TWO backends handed the identical symmetric CSR (==CSC) system: **Eigen SimplicialLDLT compiled to WASM** (`solverBackend.ts` → `app/src/wasm/eigen-solver.{js,wasm}`, built from `app/native/solver.cpp` via `build.ps1`; committed so users never need emsdk) when it loads, else the built-in **Jacobi-PCG** fallback. `solveAssembly(opts)` takes `opts.backend` (DirectLinearSolver | null) + `opts.onProgress` (staged UI feedback); it reports `res.backend`/`factorMs`/`solveMs`. Benchmark (workbench, 50 kg preset, 58 452 DOF): **LDLT factor 263 ms + solve 6 ms** vs **PCG 348 iters / 765 ms** — LDLT ~2.8× faster, and re-solves after the factor are ~6 ms. The per-panel plate path stays pure-TS PCG (tiny systems). After the solve it does STRESS RECOVERY per element (membrane N + bending M at the centre → surface σ=N/t±6M/t² → per-face von Mises → nodal average), returning per-panel `vm` field + global `maxVm`/`maxVmPanelId`/`maxVmAt` + `utilPct` (peak grain-axis bending σ vs the card's fbAlong/fbAcross) + `stressVerdict` (<50% ok, <100% borderline, ≥100% weak). There is ALSO a **SOLID (hexahedral) path**: `opts.meshKind:'solid'` re-discretises the SAME preprocessed model through the thickness into `solidLayers` (default 2) 8-node hexes per in-plane cell, 3 DOF/node, and `solveAssemblySolid`/`finishSolid` run the whole solve+recovery on it. The hex uses **Wilson incompatible modes** (9 internal DOF statically condensed per element) — without them a trilinear hex shear-locks and comes out ~5× too stiff in bending, which is fatal at the 2–3 elements we can afford through an 18 mm panel. Material is **full 3D orthotropy** (`orthotropic3D`, compliance inverted so Maxwell symmetry is exact) with through-thickness modulus `0.15×E_across` and rolling shear `0.2×G12` — the ratios that make a solid model behave like plywood rather than a plastic slab. Every hex in a panel is the same rectangular box, so the 24×24 is formed ONCE per panel and rotated per element. Solid node `g·levels + l` maps back to mid-surface shell node `g`, which is how joints/grounding/loads lift over and how results collapse back onto the per-panel grid (worst value over the stack) so the texture overlay + PDF keep working. tests/cae_check.ts has NINE validation cases — keep all passing. Assembly cases (e,f,g) run against BOTH backends when the WASM loads under node (per-backend PASS + case (e) cross-backend agreement <1e-4; measured 1.2e-12). Case (g) checks recovered SS-strip surface stress; it uses a SHORT/THICK strip on hinged legs so the soft-grounding regularization — which perturbs absolute deflection for slender panels — doesn't steal the end reactions; centre moment stays P·L/4. tests/asm_bench.py times PCG vs LDLT in-browser (forces PCG via `window.__caeForcePcg`). Per-panel INTERACTIVE CAE was removed (user: useless); the ONLY CAE surface is the Analysis sidebar MODE (segmented Cut planning / Thickness / Analysis switch under the brand header, green dot when solved; joints list + presets + patch loads + a Deflection/Stress heatmap field toggle that re-textures from the cached solve — no re-solve). The Solve button shows a STAGED progress bar (Meshing → Assembling <DOF> → Factorizing/Solving <backend> → Recovering stresses → Rendering; same `.busy` progress pattern as the PDF button — preprocessing=our TS, solve=the WASM core, post=browser). Result line reports both deflection AND max stress (MPa) + util% + the backend name & timing, verdict = worst of the two. Structure table + Assembly PDF page (now with stress numbers + a second von-Mises heatmap under the deflection one) gate on an assembly solve |
 | `cutEditor.ts` | "Edit cuts" popup: DIRECT cutting (click candidate line → commit). Clicking a piece EDGE opens a context popup: arm as measured-from, or set/unset a DATUM edge. Datum edges render blue, become the piece's default measuring edge (fromFar when far), and PROPAGATE to child pieces that retain the same boundary segment (datums stored as geometric line segments; persisted as `SheetOverrides.datumEdges` piece-key+side). manual_cut log records measuredFrom + provenance (armed/datum/default). Overrides keyed by layoutSignature + cutKeyFor in localStorage |
 | `trainingLog.ts` | Opt-in JSONL recorder of manual sequence edits (full layout + auto sequence context per session) — source data for future learned ordering modes |
 | `units.ts` | mm/inch conversion, fractional-inch formatting, money fmt, fmtSag (decimal, sub-mm safe) |
-| `style.css` | Notion-style light theme |
+| `style.css` | Shared light theme, workspace navigation, responsive Thickness review |
 
 ## Cut strategies (`packRect.CutStrategy`)
-THREE strategies (user collapsed the list 2026-08 from five):
+Four current strategies:
 - **`guillotine`** — "Min cuts". Trials sweep shelf / shelf-v / SAS bins
   AND `packBeam` (beam search over cut trees). Free-grain parts auto-unlock
   rotation under this strategy (the per-body `rotation='lock'` default would
   otherwise block shelf optimisation).
+- **`repeated`** — "Repeated long rips". Equal-width strips along the sheet long edge, followed by crosscuts; use `packRepeatedStrips` and the saw cut-tree path. This means long rips, not grouping by finished part length.
 - **`free`** — "Max utilization". MaxRects, any cuts.
 - **`cnc`** — true-shape any-angle nesting handled by `cncNest.ts`, NOT this
   rectangle packer; `nest.ts` dispatches via `isCncStrategy()`.
@@ -57,22 +61,17 @@ old persisted values onto whatever absorbed them:
 - `guillotine-exact` → `guillotine`. Its beam search is now unconditional.
   On `tests/nest_bench.mjs` it bought 0.10 sheets for 7× the time (506 ms vs
   75 ms) — worth spending once, not worth asking the user to predict.
-- `save-last` → `free`. Saving the remnant is now DEFAULT for every
-  strategy: `finishPack` moves the least-full sheet of the group to the END
-  and corner-packs it. Which sheet lands last is otherwise an artefact of
-  the objective (`free`/`cnc` leave slack there; min-cuts strands it on
-  sheet 1), and sheet order means nothing to the saw — each sheet owns its
-  own cut tree. Since `nest.ts` packs per thickness group, this lands on the
-  last sheet OF EACH SIZE. It is post-processing, so it costs nothing:
-  benchmarked at +0.75 sheets over the area bound with or without it.
+- `save-last` → `free`. Every strategy moves the least-full sheet in each
+  thickness group to the end. Repacking or compaction is retained only when
+  it improves the selected objective. Saw layouts must keep their cut-tree
+  separation; an attractive offcut cannot justify an invalid cut sequence.
 
-The multi-restart optimiser objective is strategy-aware (`isBetter` in
-`packRect.ts`):
-- `free` → maximise total used area
-- `guillotine` → minimise awkward cuts, then total cuts
-Every strategy tie-breaks first on (fewer unplaced → fewer sheets), and
-LAST on "leaves more of the final sheet whole" — bottom of the chain, so a
-tidier remnant can never buy itself an extra sheet or an extra cut.
+The multi-restart objective is strategy-aware. Fewer unplaced parts and fewer
+sheets come first, followed by placed area and the selected cut/offcut ranking.
+Repeated long rips prioritises reusable rip settings; the other modes balance
+cut practicality and usable remnant quality. Finishing and Optimize further
+must preserve the same objective and never replace the winner with a worse
+layout. See `README.md` and `tests/optimizer.test.mjs` for current behaviour.
 
 ## Nesting benchmark
 `tests/nest_bench.mjs` (needs `packrect_bundle.mjs` — see its header) runs
@@ -218,8 +217,10 @@ the expand state across renders.
   once already.
 
 ## Build / test
-- `npx tsc --noEmit` from `app/` → must be clean before committing.
-- `npx vite build` from `app/` → production build to `app/dist/`.
+- `npm test` from `app/` → registered regression suites.
+- `npm run build` from `app/` → TypeScript check and production build to `app/dist/`.
+- `node tests/thickness_bench.mjs "path/to/model.stp" 18` from the root → 19.05 mm source-stock fixture, corrected STEP round trip, contact/perimeter checks, and nesting.
+- `python tests/thickness_ui.py "path/to/FULL TOE KICK.stp" URL` → requires a running app and Python Playwright; real toe-kick correction workflow and workspace/table checks.
 - `python tests/visual_check.py [filter] [--snap]` → end-to-end
   Playwright run against every sample STEP, generates PDFs + per-page
   PNGs in `tests/_output/<sample>/`. The default cut strategy is Min
@@ -304,6 +305,32 @@ painted with. Colour maps + `sampleColorMap` / `resolveLegendRange` /
   every frame keeps the subtree permanently "unstable" and stalls screenshots.
 - Load arrows are subsampled to ≤140; a patch over a fine mesh is hundreds of
   identical arrows that hide the geometry. The stats line carries the true count.
+
+## Thickness workspace and state
+
+- User guide: `docs/THICKNESS-CORRECTION.md`. Technical flow: Stage 2.5 in
+  `docs/ARCHITECTURE.md`. Design constraints: `docs/thickness-correction-design.md`.
+- The user requested a dedicated workspace and a **table** of old/new sizes,
+  not an accordion of board cards in the sidebar. Keep stock setup, 3D view,
+  and review separate, with actions visible while the report scrolls.
+- Keep immutable source meshes and their display offsets in `ThicknessCabinet`.
+  Pending proposals belong to exact settings/input snapshots. Changing them
+  invalidates the proposal. Apply always replaces the previous correction
+  from the import; it must not accumulate earlier allowances.
+- Preview includes all proposal panels, not only changed ones: an older
+  applied correction may have changed live panels that this proposal restores.
+  Preview is temporary. Applied geometry alone feeds Download STEP and nesting.
+- Apply/reset update mesh and body analysis together, clear thickness override,
+  and invalidate nesting, manual layout, exports, and structural results.
+- Workspace switching clears preview but keeps proposal/applied state.
+  Thickness entry is disabled while model operations or captures are active
+  because those operations share the viewer and can paint late CAE results.
+- Source stock and table values use mm regardless of Cut planning display units.
+  World translation is separate from length/width/thickness changes. Export
+  subtracts per-file display offsets to recover source coordinates.
+- Rectangular solids only; zero-thickness surfaces are disclosed and excluded.
+  Unsupported solids, conflicting anchors, or failed post-validation block
+  Apply. Do not silently drop unsupported geometry or bypass these checks.
 
 ## Analysis mode UI
 - The Cut layout half is HIDDEN in Analysis mode (`#workArea.analysis-full`,
@@ -450,15 +477,19 @@ leaves regions one margin too wide. `seedRegions` in cutEditor.ts shaves
 that margin after the trims; without it every reorder reads illegal.
 
 ## Sidebar
-Workflow-ordered tinted groups (Import → Stock → Cutting → Parts → Job &
-export → Shopping), full-bleed ~97%-lightness tints per group, flat chrome.
+Three workspaces share a neutral light sidebar and consistent left-aligned
+headings. Cut planning orders Import → Stock → Cutting → Parts → Job &
+export → Shopping. Thickness has dedicated stock settings and a separate
+review pane; Analysis has its structural controls. Use colour for state and
+model data rather than decorative section tints.
 Kerf is a select (1.8 mm default / 2.5 mm / custom); margin default 0.5";
 `#kerfRef` (keeper / center / spacing) drives quotedDistance + far-trim
 placement; `#material` (CAE material cards) sits in Stock.
 
 ## UI rules from the user (don't violate without asking)
-- Notion-style **light theme** for the chrome; 3D viewer is intentionally
-  a dark stage; the Cut layout is now flat / minimal (no card chrome).
+- Restrained **light theme** for the chrome, clear workflow hierarchy, and
+  functional colour. The user requested Dieter Rams-inspired cleanup; keep
+  the current neutral surfaces and readable data tables.
 - **Parts** in the cut sheet use **per-body colors** that match the 3D
   viewer 1:1.
 - **Sheet rect**: brown fill (`#6B4F31`), no border. The SVG canvas
@@ -469,8 +500,9 @@ placement; `#material` (CAE material cards) sits in Stock.
   normals can point INTO other panels). Each snapshot drops a
   semi-transparent ghost at the panel's rest position so the user sees
   where it lands.
-- **Parts are not moved in the 3D view.** Auto-flatten was reverted at
-  user request; bodies display in their original STEP orientation.
+- **No automatic flattening in the 3D view.** Bodies retain their STEP
+  orientation. Explicit Thickness correction can resize and translate them
+  to preserve validated joints and outside references; Reset restores the import.
 - **Animation cadence**: 25 fps. Don't change without asking.
 - **Two-finger trackpad pan**: handled in `viewer.handleWheelPan`. The
   sign convention is "scroll the scene like a document" (opposite of

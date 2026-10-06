@@ -17,16 +17,22 @@ thickness and 2D outline, then packs all the panels onto stock sheets
 - a **shopping list** (how many sheets of each thickness to buy, with cost),
 - **DXF** files a CNC router / waterjet / saw shop can use directly,
 - a multi-page **PDF report** (cut sequences, assembly steps, labels),
-- a **STEP** file of any parts that didn't fit.
+- a **STEP** file of any parts that didn't fit, or a corrected panel assembly
+  from the Thickness workspace.
 
-Everything runs in the browser — there is no server. The heavy math
-(parsing, nesting) runs in WebAssembly and Web Workers on your own CPU.
+Import, thickness correction, nesting, and exports run in the browser.
+Structural analysis can also use an optional local solver service; see
+[server setup](../server/README.md). The CAD geometry and cutting workflow
+remain local to your machine.
 
 ```mermaid
 flowchart LR
     A[STEP files] --> B[Parse + tessellate<br/>OpenCascade WASM]
     B --> C[Body analysis<br/>thickness + outline]
     C --> D[3D viewer<br/>pick parts, set grain]
+    C --> T[Optional Thickness correction<br/>review old and new sizes]
+    T -->|Apply| D
+    T -->|Applied assembly| S[Corrected STEP]
     D --> E[Nest optimiser<br/>multicore]
     E --> F[Cut layouts]
     F --> G[DXF / PDF / CSV / STEP exports]
@@ -86,6 +92,47 @@ flowchart TD
 
 Importing many bodies shows a progress bar (parse → per-body analysis), and
 the work yields to the browser so the page never freezes.
+
+---
+
+### 2.4 When your plywood is a different thickness
+
+Choose **Thickness** beside Cut planning and Analysis. The workspace separates
+stock settings, the assembly preview, and a change report with **Old size**,
+**New size**, and **Movement** columns. Search for a board or expand its name
+to see which joints or outside references require its change.
+
+![Thickness workspace showing the old/new board-size comparison beside the assembly](img/thickness-workspace.png)
+
+For example, 3/4-inch plywood is 19.05 mm nominally. Replacing it with 18 mm
+stock leaves a 1.05 mm difference per board. If two side panels keep their
+outside faces fixed, a rail between them grows by 2.10 mm to reach their new
+inside faces. A support under a fixed top can grow by 1.05 mm. Connected layers
+can create cumulative allowances, so the app solves the assembly together.
+
+The solver first verifies rectangular panel solids and finds their contacting
+faces. It then holds the outside outline and inferred exposed recess faces,
+changes the chosen stock thickness, and adjusts connected boards. It checks
+joint gaps, overlap, collisions, and the exterior again before offering Apply.
+Internal clear openings can change.
+
+**Analyse** produces a proposal; **Preview** shows it without changing the
+live cutting dimensions. **Apply** updates the model and invalidates old cut
+layouts and structural results. **Reset** restores the import. Every analysis
+starts from that import, so corrections do not accumulate on repeated use.
+The STEP download contains the applied assembly in source coordinates.
+
+The current automatic correction supports rectangular boards in a common
+orthogonal frame, including a globally rotated assembly. It blocks unsupported
+joinery and conflicting constraints. Zero-thickness reference surfaces are
+reported and omitted from the solid-panel export. It produces editable CAD
+solids, not the original application's feature history.
+
+The toe-kick benchmark corrected 42 panels from 19.05 to 18 mm, retained 126
+contacts, and passed a STEP re-import check with no joint-gap or outside-reference
+error. Two reference surfaces were excluded. These results apply to that
+fixture; see the [guide](THICKNESS-CORRECTION.md#benchmark-and-verification) for
+the exact settings and reproduction commands.
 
 ---
 
