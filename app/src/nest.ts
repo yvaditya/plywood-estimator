@@ -23,7 +23,7 @@
  */
 
 import type { Vec2 } from './geometry';
-import { packMulti, isCncStrategy, isGuillotineStrategy, migrateCutStrategy, type PackInput, type PackPlacement, type CutStrategy, type Cut, type PackProgress } from './packRect';
+import { packMulti, isBetter, countFreedParts, isCncStrategy, isGuillotineStrategy, migrateCutStrategy, type LayoutScore, type PackInput, type PackPlacement, type CutStrategy, type Cut, type PackProgress } from './packRect';
 import { packCnc, polyArea, type CncInput, type CncSheet } from './cncNest';
 import { packMultiParallel, packCncParallel, packCncDeep } from './optPool';
 
@@ -217,7 +217,7 @@ export function runNest(parts: NestPart[], config: NestConfig): NestResult {
   if (usableW <= 0 || usableL <= 0) {
     throw new Error('Sheet margin leaves no usable area.');
   }
-  const restarts = Math.max(4, config.restarts ?? 8);
+  const restarts = config.restarts ?? 8;
 
   // Group by rounded thickness — 0.5 mm bucket.
   // STEP tessellation introduces sub-millimetre float noise, so a tighter
@@ -274,6 +274,7 @@ export function runNest(parts: NestPart[], config: NestConfig): NestResult {
     const winner = packMulti(
       { items, sheetW: usableL, sheetH: usableW, kerf, cutStrategy: config.cutStrategy },
       restarts,
+      config.seed ?? 0,
     );
     const winnerSheetW = sheetL;
     const winnerSheetL = sheetW;
@@ -361,7 +362,7 @@ export async function runNestAnimated(
   const usableW = sheetW - 2 * margin;
   const usableL = sheetL - 2 * margin;
   if (usableW <= 0 || usableL <= 0) throw new Error('Sheet margin leaves no usable area.');
-  const restarts = Math.max(4, config.restarts ?? 8);
+  const restarts = config.restarts ?? 8;
 
   const buckets = new Map<number, NestPart[]>();
   for (const p of parts) {
@@ -576,21 +577,23 @@ function positionToLetter(i: number): string {
 }
 
 /**
- * Pick the better of two pack tries:
- *   1. fewer unplaced wins
- *   2. fewer sheets wins
- *   3. higher fill on the last sheet wins
- * Returns true if A is at least as good as B.
+ * Compare final layouts with the same strategy objective used by the search.
+ * Reconstruct separation from the cut tree so manually edited sheets work too.
  */
-function compareTries(
-  a: { sheets: { usedArea: number }[]; unplaced: unknown[] },
-  b: { sheets: { usedArea: number }[]; unplaced: unknown[] },
-): boolean {
-  if (a.unplaced.length !== b.unplaced.length) return a.unplaced.length < b.unplaced.length;
-  if (a.sheets.length !== b.sheets.length) return a.sheets.length < b.sheets.length;
-  const aLast = a.sheets.length ? a.sheets[a.sheets.length - 1].usedArea : 0;
-  const bLast = b.sheets.length ? b.sheets[b.sheets.length - 1].usedArea : 0;
-  return aLast >= bLast;
+export function isBetterNest(a: NestResult, b: NestResult, strategy: CutStrategy): boolean {
+  const score = (r: NestResult): LayoutScore => ({
+    unplaced: r.groups.flatMap((g) => g.unplaced),
+    sheets: r.groups.flatMap((g) => g.sheets.map((s) => {
+      const root = s.cuts[0];
+      return {
+        usedArea: s.usedArea, cuts: s.cuts, largestFree: s.largestFree,
+        fullySeparated: countFreedParts(s.cuts, s.parts,
+          root?.parentW ?? s.sheetW, root?.parentH ?? s.sheetL,
+          root?.parentX ?? 0, root?.parentY ?? 0),
+      };
+    })),
+  });
+  return isBetter(score(a), score(b), strategy);
 }
 
 // ---------------------------------------------------------------------------

@@ -33,6 +33,15 @@ Open <http://localhost:5173/>.
 
 Requires Node 18 or newer.
 
+Run optimizer, thickness-correction, and STEP round-trip tests with `npm test` from `app/`. To benchmark a
+local model using the same STEP analysis and nesting pipeline, run
+`node tests/step_bench.mjs "path/to/model.stp" 256` from the repository root.
+Results are saved under `tests/_output/`; saw-setting counts exclude reference trims.
+For thickness correction and corrected-CAD verification, run
+`node tests/thickness_bench.mjs "path/to/model.stp" 18`.
+This writes a corrected STEP and before/after report under `tests/_output/`,
+then re-imports the STEP to check dimensions, contacts, and outside references.
+
 ### Update notice
 On launch the app asks GitHub how the running build compares to the repo's
 `master`, and if it is behind, shows a strip under the title with the number
@@ -85,22 +94,50 @@ job leaves the machine.
 - **Auto-orient** rotates the outline polygon so its dominant edge
   direction is axis-aligned with the sheet — angled cuts are minimized.
 
+### Measured stock thickness correction
+Open the **Thickness** workspace beside Cut planning and Analysis, select a cabinet and its source stock group,
+enter the actual thickness in millimetres, and choose **Analyse corrections**.
+The solver finds face contacts, holds the outside outline and exposed recess
+references, and resizes or shifts the connected boards to retain the joints.
+For 19.05 mm stock changing to 18 mm, an intervening rail may grow by 2.10 mm;
+the allowance follows the actual assembly, including stacked board layers.
+
+Review the searchable table of **Old size**, **New size**, and **Movement**;
+expand a board name for the joint explanation. Stock settings, a large 3D view,
+and the change report have their own areas. Apply, reset, and export stay visible
+while the report scrolls. Preview the proposal in 3D, then **Apply correction**.
+Switching workspaces clears the temporary preview but keeps the proposal.
+The viewer and cutting inputs update together;
+stale nesting and structural results are cleared. **Reset to imported** restores
+the source geometry. Each analysis starts from that original baseline, and
+applying replaces the previous correction for that cabinet.
+
+**Download STEP** exports the applied panel assembly in its source
+coordinates, undoing the viewer's display offsets. The source file is untouched.
+Automatic edits currently support verified rectangular solids sharing an
+orthogonal assembly frame. Shaped joinery, unsupported solids, conflicting
+outside constraints, and ambiguous anchors block application for CAD review.
+Zero-thickness reference surfaces are listed and excluded from panel-solid export.
+Internal clear openings may change as the stock changes.
+
 ### Cut sheet nesting
-- **Three cut strategies**:
+- **Four cut strategies**:
   - **Min cuts** — guillotine packing (shelf + SAS trials plus a beam
     search over cut trees). Every cut goes edge-to-edge — producible
     with a track saw or panel saw.
   - **Max utilization** — MaxRects bin packer (Jukka Jylänki), best
     yield, cuts may be any shape.
+  - **Repeated long rips** — cuts equal-width strips along the sheet's
+    full length first, then crosscuts them to finished part lengths.
+    Parts sharing a rip width occupy the same strips. Selecting it also
+    selects the parallel-guide sequence. Sheet count comes first among
+    these strip layouts; this workflow can use more stock than other modes.
   - **CNC nest** — true-shape any-angle nesting for router / waterjet.
-- **The remnant is saved on the last sheet of each size, always.** Every
-  strategy finishes by moving the least-full sheet of a thickness group
-  to the end and clustering its parts into one corner, so what is left
-  over is a clean rectangle worth keeping rather than scrap scattered
-  across the job. It is pure post-processing — same parts, same sheet
-  count, same cuts — so it costs nothing, which is why it is a default
-  and not a mode. Measured at +0.75 sheets over the area lower bound
-  either way.
+- **Save a usable remnant.** Every strategy moves the least-full sheet
+  of each thickness group to the end. Corner packing is kept only when
+  it improves the selected objective. Saw modes preserve full cut-tree
+  separation, and CNC finishing measures the remaining rectangle before
+  accepting a changed layout.
 - **Parallel-guide-friendly cut sequence** — cuts are ordered so repeat
   cuts at the same flip-stop setting run back-to-back ("same setting"
   notes in the PDF), rip↔crosscut rotations are minimized, big reusable
@@ -111,13 +148,16 @@ job leaves the machine.
   frees the leftover and squares the edge. Main datum: top-left corner.
 - **Per-thickness grouping** with 0.5 mm bucket tolerance so float-noise
   copies of the same part don't split into multiple sheet stacks.
-- **Auto-orient sheet** (landscape vs portrait) — the nester tries both
-  bin orientations per thickness group and keeps the winner.
+- **Consistent landscape sheet orientation** across layouts and exports.
 - **Grain → orientation**: `grain=length` aligns the part's long edge
   along the sheet's length axis; `grain=width` aligns it across.
-- **Multi-restart optimizer** (configurable 1 – 256 tries). Each try
+- **Multi-restart optimizer** (configurable 1 – 1,024 tries). Each try
   combines a different (heuristic × insertion-order) pair; the best
-  result is kept by (fewest unplaced → fewest sheets → tightest fill).
+  result is kept by fewest unplaced → fewest sheets → placed area → the
+  selected cut/offcut objective. The trial budget is respected, including
+  one-try runs. **Optimize further** accepts better cuts and offcuts even
+  when the sheet count stays the same. Worker results use deterministic
+  tie-breaking; worker failure retains the seed when falling back.
 
 ### Outputs
 - **2D layout** SVG in the right pane (and PDF) with darker plywood

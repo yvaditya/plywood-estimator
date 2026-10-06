@@ -169,6 +169,8 @@ export class Viewer {
   private root = new THREE.Group();
   private grainGroup = new THREE.Group();
   private nonSheetGroup = new THREE.Group();
+  private correctionPreview: THREE.Group | null = null;
+  private correctionVisibility = new Map<number, boolean>();
   /** Overlays for the structural-analysis feature: deflection heatmap meshes,
    *  force arrows, joint contact lines, floor glyphs, and the "weak panel"
    *  outline tints. Cleared via the clear* helpers so they never permanently
@@ -1207,12 +1209,14 @@ export class Viewer {
   }
 
   clear() {
+    this.showThicknessPreview(null);
     for (const b of this.bodies) {
       this.root.remove(b.mesh);
       b.mesh.geometry.dispose();
       (b.mesh.material as THREE.Material).dispose();
     }
     this.bodies = [];
+    for (const child of [...this.nonSheetGroup.children]) { this.nonSheetGroup.remove(child); disposeObject3D(child); }
     this.selection.clear();
     this.hovered = null;
     this.outlinePass.selectedObjects = [];
@@ -1262,6 +1266,62 @@ export class Viewer {
     const mesh = this.meshFromOcct(m, id, hex);
     this.root.add(mesh);
     this.bodies.push({ id, name, mesh, hexColor: hex });
+    this.invalidate();
+  }
+
+  /** Replace body geometry atomically while keeping identities and selection. */
+  updateOcctMeshes(updates: { id: number; mesh: OcctMesh }[]) {
+    this.showThicknessPreview(null);
+    for (const update of updates) {
+      const body = this.bodies.find(b => b.id === update.id);
+      if (!body) continue;
+      const old = body.mesh;
+      body.mesh = this.meshFromOcct(update.mesh, body.id, body.hexColor);
+      body.mesh.visible = old.visible;
+      this.root.remove(old);
+      disposeObject3D(old);
+      this.root.add(body.mesh);
+    }
+    this.refreshColors();
+    this.rebuildPartLabels();
+    this.invalidate();
+  }
+
+  /** Corrected solids in amber, imported edges in grey. Live bodies and cut
+   * inputs stay untouched until the caller explicitly applies the proposal. */
+  showThicknessPreview(updates: { id: number; mesh: OcctMesh; original: OcctMesh }[] | null) {
+    if (this.correctionPreview) {
+      this.root.remove(this.correctionPreview);
+      disposeObject3D(this.correctionPreview);
+      this.correctionPreview = null;
+    }
+    for (const b of this.bodies) {
+      const visible = this.correctionVisibility.get(b.id);
+      if (visible !== undefined) b.mesh.visible = visible;
+    }
+    this.correctionVisibility.clear();
+    if (updates?.length) {
+      const group = new THREE.Group();
+      for (const update of updates) {
+        const body = this.bodies.find(b => b.id === update.id);
+        if (!body || !body.mesh.visible) continue;
+        this.correctionVisibility.set(body.id, body.mesh.visible);
+        body.mesh.visible = false;
+        const corrected = this.meshFromOcct(update.mesh, body.id, '#c87929');
+        group.add(corrected);
+        const geometry = new THREE.BufferGeometry();
+        geometry.setAttribute('position', new THREE.Float32BufferAttribute(update.original.attributes.position.array, 3));
+        geometry.setIndex(update.original.index.array);
+        const edgeGeometry = new THREE.EdgesGeometry(geometry, 25);
+        geometry.dispose();
+        const original = new THREE.LineSegments(edgeGeometry, new THREE.LineBasicMaterial({color:'#59636c',transparent:true,opacity:0.6,depthTest:false}));
+        original.renderOrder = 5;
+        group.add(original);
+      }
+      this.root.add(group);
+      this.correctionPreview = group;
+    }
+    this.refreshOutlines();
     this.invalidate();
   }
 

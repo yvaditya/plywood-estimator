@@ -27,6 +27,7 @@
  */
 
 import type { Vec2 } from './geometry';
+import { isBetter } from './packRect';
 
 export interface CncInput {
   /** Unique instance id, e.g. "<partId>#3". */
@@ -734,15 +735,8 @@ function leastFilledArea(lives: LiveSheet[]): number {
  * remnant is the largest, cleanest reusable offcut.
  */
 function passBetter(a: PassResult, b: PassResult, saveLast = false): boolean {
-  if (a.unplaced.length !== b.unplaced.length) return a.unplaced.length < b.unplaced.length;
-  if (a.lives.length !== b.lives.length) return a.lives.length < b.lives.length;
-  if (saveLast && a.lives.length > 1) {
-    const la = leastFilledArea(a.lives), lb = leastFilledArea(b.lives);
-    if (Math.abs(la - lb) > 1e-6) return la < lb;
-  }
-  const ua = a.lives.reduce((s, l) => s + l.usedArea, 0);
-  const ub = b.lives.reduce((s, l) => s + l.usedArea, 0);
-  return ua > ub;
+  return serialPassBetter({ sheets: a.lives, unplaced: a.unplaced },
+    { sheets: b.lives, unplaced: b.unplaced }, saveLast);
 }
 
 /**
@@ -853,19 +847,29 @@ function finalSqueeze(
   byId: Map<string, CncInput>,
   saveLast: boolean,
 ): LiveSheet[] {
+  const betterRemnant = (a: LiveSheet[], b: LiveSheet[]) => {
+    const score = (ls: LiveSheet[]) => ({ unplaced: [], sheets: livesToSheets(ls, res, true)
+      .map((s) => ({ ...s, cuts: [], fullySeparated: 0 })) });
+    return isBetter(score(a), score(b), 'cnc');
+  };
   let working = consolidate(lives, getMask, res, byId);
   for (let round = 0; round < 2; round++) {
     const shaken = shakeSheets(working, gw, gh, getMask, res, byId);
     const after = consolidate(shaken, getMask, res, byId);
     if (after.length >= working.length) {
-      // No sheet saved this round. Keep the shaken layout only if it kept
-      // the same count (it's denser per sheet); then stop.
-      if (after.length === working.length) working = after;
+      if (after.length === working.length && betterRemnant(after, working)) working = after;
       break;
     }
     working = after;
   }
-  if (saveLast) working = compactLastSheet(working, gw, gh, getMask, res, byId);
+  if (saveLast) {
+    const compacted = compactLastSheet(working, gw, gh, getMask, res, byId);
+    if (betterRemnant(compacted, working)) working = compacted;
+    // Sheet order is cosmetic; park the remnant sheet last even if the
+    // proposed corner packing was worse than the winning placement.
+    const leanest = working.reduce((best, s, i) => s.usedArea < working[best].usedArea ? i : best, 0);
+    working = working.filter((_, i) => i !== leanest).concat(working[leanest] ? [working[leanest]] : []);
+  }
   return working;
 }
 
@@ -948,7 +952,7 @@ function buildOrderings(items: CncInput[], passes: number, seed = 0): Ordering[]
   // Deterministic shuffles fill any remaining budget (reproducible runs;
   // `seed` shifts the stream for re-runs).
   let s = (0x9e3779b1 ^ Math.imul(seed + 1, 0x85ebca6b)) >>> 0;
-  const rand = () => { s = (s * 1664525 + 1013904223) >>> 0; return s / 0xffffffff; };
+  const rand = () => { s = (s * 1664525 + 1013904223) >>> 0; return s / 0x100000000; };
   while (out.length < passes) {
     const sh = sorted(byArea);
     for (let k = sh.length - 1; k > 0; k--) { const j = Math.floor(rand() * (k + 1)); [sh[k], sh[j]] = [sh[j], sh[k]]; }
@@ -982,6 +986,7 @@ function livesToSheets(lives: LiveSheet[], res: number, withFree: boolean): CncS
  *  assume the multicore pool (optPool.ts) — the sequential generator also
  *  carries a hard wall-clock budget that bails out of excess passes. */
 export function cncAttemptCount(nItems: number, restarts: number, extraEffort = false): number {
+  restarts = Number.isFinite(restarts) ? Math.max(1, Math.floor(restarts)) : 8;
   const boost = extraEffort ? 2 : 1;
   const cap = (nItems <= 12 ? 96 : nItems <= 25 ? 48 : nItems <= 50 ? 24 : 10) * boost;
   // A job with few parts only HAS n!·2·2 distinct (ordering × scan-direction
@@ -1004,13 +1009,15 @@ export interface CncSerialPass { sheets: CncSerialSheet[]; unplaced: string[] }
 export function serialPassBetter(a: CncSerialPass, b: CncSerialPass, saveLast = false): boolean {
   if (a.unplaced.length !== b.unplaced.length) return a.unplaced.length < b.unplaced.length;
   if (a.sheets.length !== b.sheets.length) return a.sheets.length < b.sheets.length;
+  const used = (p: CncSerialPass) => p.sheets.reduce((s, sh) => s + sh.usedArea, 0);
+  const ua = used(a), ub = used(b);
+  if (Math.abs(ua - ub) > 1e-6) return ua > ub;
   const least = (p: CncSerialPass) => p.sheets.reduce((m, s) => Math.min(m, s.usedArea), Infinity);
   if (saveLast && a.sheets.length > 1) {
     const la = least(a), lb = least(b);
     if (Math.abs(la - lb) > 1e-6) return la < lb;
   }
-  const used = (p: CncSerialPass) => p.sheets.reduce((s, sh) => s + sh.usedArea, 0);
-  return used(a) > used(b);
+  return false;
 }
 
 interface CncSetup { res: number; gw: number; gh: number; getMask: MaskFn; byId: Map<string, CncInput> }

@@ -9,7 +9,7 @@
 //            --platform=node --outfile=tests/_output/packrect_bundle.mjs
 // Run:     node tests/nest_bench.mjs [restarts]
 
-import { packMulti, effectiveJob, finishPack } from './_output/packrect_bundle.mjs';
+import { packMulti } from './_output/packrect_bundle.mjs';
 
 const RESTARTS = Number(process.argv[2] || 256);
 const SHEET_W = 2438, SHEET_L = 1219, MARGIN = 12.7, KERF = 1.8;
@@ -65,7 +65,7 @@ function run(strategy, items) {
     cutStrategy: strategy,
   };
   const t0 = performance.now();
-  const res = finishPack(job, packMulti(effectiveJob(job), RESTARTS));
+  const res = packMulti(job, RESTARTS);
   const ms = performance.now() - t0;
   const sheets = res.sheets.length;
   const used = res.sheets.reduce((s, sh) => s + sh.placements.reduce((t, p) => t + p.w * p.h, 0), 0);

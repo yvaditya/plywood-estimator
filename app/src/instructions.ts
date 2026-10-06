@@ -10,6 +10,7 @@
  */
 
 import type { NestResult, NestSheet, Cut } from './nest';
+import { SETTING_TOL } from './packRect';
 
 export interface PartLabel {
   partId: string;
@@ -512,7 +513,7 @@ export function cutStepsForSheet(
   const markSameSetting = (all: CutStep[]): CutStep[] => {
     for (let i = 1; i < all.length; i++) {
       const p = all[i - 1], c = all[i];
-      if (c.axis === p.axis && Math.abs(c.distance - p.distance) < 0.5) c.sameSetting = true;
+      c.sameSetting = c.axis === p.axis && Math.abs(c.distance - p.distance) <= SETTING_TOL;
     }
     return all;
   };

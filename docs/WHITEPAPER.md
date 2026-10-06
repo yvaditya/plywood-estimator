@@ -93,10 +93,9 @@ the work yields to the browser so the page never freezes.
 
 | Strategy | Machine | Packer | Objective |
 |---|---|---|---|
-| Max yield | anything | MaxRects | highest material use |
-| **Min cuts** (default) | track / panel saw | Shelf (FFDH) + SAS | fewest edge-to-edge cuts |
-| Min cuts+ | track / panel saw | Min cuts + beam search | fewest cuts, exhaustive (slower) |
-| Max yield, save last sheet | anything | MaxRects + corner repack | clean reusable remnant |
+| Max utilization | anything | MaxRects | material use, cut separation, reusable offcut |
+| **Min cuts** (default) | track / panel saw | Shelf + SAS + beam search | balance saw setups, awkward cuts and offcut value |
+| **Repeated long rips** | track / panel saw | Shelves sharing exact rip widths | full-length strips first, then crosscuts |
 | **CNC nest** | router / waterjet | raster true-shape | fewest sheets, any angle |
 
 The saw strategies pack each part's **bounding rectangle** (saws cut
@@ -108,6 +107,18 @@ continuous contours.
 Parts are grouped by thickness (0.5 mm tolerance — float noise in
 tessellation would otherwise split identical panels) and each thickness
 group nests into its own stack of sheets.
+
+Every mode ranks fewer unplaced parts and fewer sheets first. Repeated long
+rips groups parts by their dimension perpendicular to the sheet length,
+with a 0.01 mm numerical tolerance. All full-length rip cuts precede the
+crosscuts. It favors fewer rip-width settings and changes before comparing
+crosscut settings, cuts and offcuts. It selects the parallel-guide sequence.
+Requiring full-length strips can use more stock than unrestricted layouts.
+
+The selected trial budget limits the search; larger Min cuts budgets include
+the more expensive beam trials. Finishing preserves full-length rip strips,
+and only accepts a better arrangement in other modes,
+and **Optimize further** uses the same objective as the underlying search.
 
 ---
 
@@ -284,12 +295,12 @@ reassembled from its labelled segments:
   split-and-shelve layout; every shelf boundary is one full-sheet rip and
   every part boundary one crosscut — the fewest cuts a panel saw can
   typically achieve with a fast, greedy pass.
-- **Min cuts+**: the same fewest-cuts objective, but adds a **beam search**
+- **Beam search** (within the saw modes when the trial budget permits): searches
   over possible cut trees — at each step it keeps the several most promising
   partial layouts instead of committing to one, branching on which part to
   cut next, which way to turn it, and which direction the next full-span
-  cut runs. It also still runs the full Min cuts trial pool alongside the
-  beam and only has to beat it. Slower, but it sometimes finds a layout with
+  cut runs. It competes with the greedy trials under the selected objective.
+  Slower, but it sometimes finds a layout with
   fewer cuts than the greedy pass settles for.
 - **Skip-on-fail**: when a part doesn't fit the current sheet, the packer
   tries the *next part* rather than closing the sheet — one tall part

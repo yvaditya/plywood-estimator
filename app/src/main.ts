@@ -10,12 +10,15 @@
 import './style.css';
 
 import * as THREE from 'three';
-import { parseStep, preloadOcct, type OcctResult } from './stepLoader';
+import { parseStep, preloadOcct, type OcctResult, type OcctMesh } from './stepLoader';
 import { Viewer, bodyColor } from './viewer';
 import { analyzeBody, type BodyAnalysis } from './geometry';
+import { mountThicknessCorrection, type ThicknessCabinet } from './thicknessCorrectionUI';
+import { correctedPanelAnalysis, type CorrectionProposal } from './thicknessCorrection';
 import {
   runNest,
   runNestAnimated,
+  isBetterNest,
   type GrainLock,
   type RotationMode,
   type NestPart,
@@ -666,6 +669,11 @@ function setStatus(msg: string, kind: 'info' | 'ok' | 'error' = 'info') {
  */
 let nextBodyId = 0;
 let cumulativeRightX = 0;
+let nextReferenceId = -1;
+const thicknessCabinets: ThicknessCabinet[] = [];
+let thicknessUI: ReturnType<typeof mountThicknessCorrection> | null = null;
+let geometryBusy = false;
+const modelBusy = () => geometryBusy || !!document.querySelector('button.busy');
 /** Gap (mm) between auto-laid-out files in the 3D view. */
 const FILE_GAP = 100;
 
@@ -718,6 +726,7 @@ const uiYield = () => new Promise<void>((r) => setTimeout(r, 0));
 const PARSE_SHARE = 0.4;
 
 async function handleFiles(files: FileList | File[]) {
+  if (modelBusy()) { setStatus('Finish the current operation before importing another model.', 'error'); return; }
   const list = Array.from(files).filter((f) => {
     const n = f.name.toLowerCase();
     return n.endsWith('.step') || n.endsWith('.stp');
@@ -728,6 +737,8 @@ async function handleFiles(files: FileList | File[]) {
   }
 
   setStatus(`Loading ${list.length} file${list.length > 1 ? 's' : ''} …`);
+  geometryBusy = true;
+  thicknessUI?.refresh();
   let totalRaw = 0;
   let totalAdded = 0;
   let totalSkippedNotSheet = 0;
@@ -745,6 +756,7 @@ async function handleFiles(files: FileList | File[]) {
       const buf = await file.arrayBuffer();
       const tP0 = performance.now();
       const res = await parseStep(buf);
+      const sourceOffset: [number, number, number] = [0, 0, 0];
       tParse += performance.now() - tP0;
       showLoadProgress(fileBase + PARSE_SHARE / list.length,
         `${fileTagLabel}analyzing ${res.meshes.length} bodies …`);
@@ -758,6 +770,7 @@ async function handleFiles(files: FileList | File[]) {
       const zBbox = meshesAabbAxis(res.meshes, 2);
       if (zBbox && zBbox.min !== 0) {
         shiftMeshesAxis(res.meshes, 2, -zBbox.min);
+        sourceOffset[2] = -zBbox.min;
       }
 
       // Auto-translate this file along +X so it sits to the right of any
@@ -773,12 +786,16 @@ async function handleFiles(files: FileList | File[]) {
         } else {
           const dx = (cumulativeRightX + FILE_GAP) - bbox.min;
           if (dx !== 0) shiftMeshesX(res.meshes, dx);
+          sourceOffset[0] = dx;
           cumulativeRightX = bbox.max + dx;
         }
       }
 
       // Strip path/extension for display.
-      const tag = file.name.replace(/\.(step|stp)$/i, '');
+      const baseTag = file.name.replace(/\.(step|stp)$/i, '');
+      let tag = baseTag, suffix = 2;
+      while (thicknessCabinets.some(c => c.key === tag)) tag = `${baseTag} (${suffix++})`;
+      const correctionCabinet: ThicknessCabinet = { key: tag, name: tag, inputs: [], sourceOffset, applied: null };
       // Use the next-color slot per body so each new file's colors continue.
       const colorBase = state.bodies.length;
       // Bodies list starts COLLAPSED at the file level — opens on a click.
@@ -787,6 +804,8 @@ async function handleFiles(files: FileList | File[]) {
       let perFileValid = 0;
       for (let meshIdx = 0; meshIdx < res.meshes.length; meshIdx++) {
         const m = res.meshes[meshIdx];
+        const source = { id: nextReferenceId--, name: m.name?.trim() || `Body ${meshIdx + 1}`, mesh: structuredClone(m), editable: false };
+        correctionCabinet.inputs.push(source);
         // Keep the bar moving and the page responsive: analyzeBody +
         // viewer mesh construction are synchronous and can take tens of
         // ms per body on dense tessellations.
@@ -821,6 +840,9 @@ async function handleFiles(files: FileList | File[]) {
           const id = nextBodyId++;
           const baseName = m.name && m.name.trim() ? m.name : `Body ${meshIdx + 1}`;
           const displayName = list.length === 1 ? baseName : `${tag} / ${baseName}`;
+          source.id = id;
+          source.name = displayName;
+          source.editable = true;
           const hex = bodyColor(colorBase + perFileValid);
           state.bodies.push({
             id,
@@ -843,6 +865,7 @@ async function handleFiles(files: FileList | File[]) {
           console.warn(`Failed to analyze body in ${file.name}:`, e);
         }
       }
+      thicknessCabinets.push(correctionCabinet);
     }
 
     viewer.finishLoad();
@@ -878,15 +901,20 @@ async function handleFiles(files: FileList | File[]) {
     setStatus(err.message || 'Failed to parse STEP file.', 'error');
   } finally {
     hideLoadProgress();
+    geometryBusy = false;
+    thicknessUI?.refresh();
   }
 }
 
 function clearAll() {
+  if (modelBusy()) return;
   state.bodies = [];
   state.result = null;
   state.nonSheetCount = 0;
   state.partLabels = new Map();
   nextBodyId = 0;
+  nextReferenceId = -1;
+  thicknessCabinets.length = 0;
   cumulativeRightX = 0;
   // Keep the user's mesh + display preferences across a Clear; only the model
   // (cabinet, joints, loads, results) resets.
@@ -897,9 +925,11 @@ function clearAll() {
   };
   viewer.clearAssemblyOverlay();
   viewer.clear();
+  invalidateCorrectedResults();
   renderBodyList();
   updateNestBtn();
   setStatus('');
+  thicknessUI?.refresh();
 }
 
 dropzone.addEventListener('dragover', (e) => {
@@ -1510,6 +1540,8 @@ function ensureAsmCabinet() {
 
 /** Detect joints for the current cabinet and populate the list. */
 function detectAssemblyJoints() {
+  if (modelBusy()) return;
+  thicknessUI?.clearPreview();
   // First analysis action — bring the PyNite sidecar up in the background so
   // it's listening by the time Solve asks for it. Detection itself is pure
   // local geometry and must not wait on the spawn.
@@ -2440,6 +2472,7 @@ function wireAnalysisSection() {
 
 /** Standalone Assembly-analysis PDF for the current cabinet. */
 function exportAssemblyPdf() {
+  thicknessUI?.clearPreview();
   const an = state.asm.analysis;
   if (!an) return;
   const doc = buildAssemblyAnalysisPdf(toAsmPdf(an), {
@@ -2509,11 +2542,13 @@ asmPresetClear.addEventListener('click', () => {
   renderAnalysisSection();
 });
 asmSolveBtn.addEventListener('click', async () => {
+  if (modelBusy()) return;
   asmSolveBtn.disabled = true;
   // Progress bar inside the button, matching the PDF export pattern. Each stage
   // yields a frame so the bar actually paints between the (fast) heavy phases.
   const originalLabel = asmSolveBtn.innerHTML;
   asmSolveBtn.classList.add('busy');
+  thicknessUI?.refresh();
   const setStage = async (label: string, pct: number) => {
     asmSolveBtn.innerHTML =
       `<span class="progress-bar"><span class="progress-fill" style="width:${pct.toFixed(0)}%"></span></span>` +
@@ -2532,6 +2567,7 @@ asmSolveBtn.addEventListener('click', async () => {
   asmSolveBtn.innerHTML = originalLabel;
   asmSolveBtn.textContent = 'Solve assembly';
   asmSolveBtn.disabled = false;
+  thicknessUI?.refresh();
 });
 asmClearBtn.addEventListener('click', () => clearAssembly());
 asmExportBtn.addEventListener('click', () => exportAssemblyPdf());
@@ -2540,23 +2576,42 @@ asmExportBtn.addEventListener('click', () => exportAssemblyPdf());
 const sidebarEl = $('sidebar');
 const modeCutBtn = $<HTMLButtonElement>('modeCutBtn');
 const modeAnalysisBtn = $<HTMLButtonElement>('modeAnalysisBtn');
+const modeThicknessBtn = $<HTMLButtonElement>('modeThicknessBtn');
 const modeAnalysisDot = $('modeAnalysisDot');
 const MODE_KEY = 'plywood.sidebarMode';
-type SidebarMode = 'cut' | 'analysis';
+type SidebarMode = 'cut' | 'analysis' | 'thickness';
+let sidebarMode: SidebarMode = 'cut';
 
 function applySidebarMode(mode: SidebarMode) {
-  sidebarEl.classList.toggle('mode-cut', mode === 'cut');
-  sidebarEl.classList.toggle('mode-analysis', mode === 'analysis');
-  modeCutBtn.classList.toggle('active', mode === 'cut');
-  modeAnalysisBtn.classList.toggle('active', mode === 'analysis');
-  modeCutBtn.setAttribute('aria-selected', String(mode === 'cut'));
-  modeAnalysisBtn.setAttribute('aria-selected', String(mode === 'analysis'));
-  // Analysis mode has nothing to say about cut sheets, so the layout half goes
-  // away and the 3D view — which is the entire output of this mode — takes the
-  // full pane. `#workArea` drives it in CSS; the viewer needs a resize because
-  // its canvas dimensions changed.
+  // Solves and PDF captures share the live viewer. Enter only after their
+  // final paint/capture, so late analysis graphics cannot replace this preview.
+  if (mode === 'thickness' && modelBusy()) return;
+  const previous = sidebarMode;
+  sidebarMode = mode;
+  for (const [key, button] of [['cut', modeCutBtn], ['thickness', modeThicknessBtn], ['analysis', modeAnalysisBtn]] as const) {
+    sidebarEl.classList.toggle(`mode-${key}`, mode === key);
+    button.classList.toggle('active', mode === key);
+    button.setAttribute('aria-selected', String(mode === key));
+    button.tabIndex = mode === key ? 0 : -1;
+  }
+  if (mode !== 'thickness') thicknessUI?.clearPreview();
+  $('app').classList.toggle('workspace-thickness', mode === 'thickness');
+  $('thicknessWorkspaceHeader').hidden = mode !== 'thickness';
+  $('thicknessReview').hidden = mode !== 'thickness';
+  $('modelPaneTitle').textContent = mode === 'thickness' ? 'Assembly preview' : '3D model';
+  workArea.classList.remove('viewer-max', 'layout-max');
   workArea.classList.toggle('analysis-full', mode === 'analysis');
-  requestAnimationFrame(() => viewer.resize(viewerEl));
+  workArea.classList.toggle('thickness-full', mode === 'thickness');
+  if (mode === 'thickness') {
+    // Hide analysis graphics without discarding its joints, loads, or solution.
+    viewer.clearAssemblyOverlay();
+    caeLegend.update(null);
+  } else if (previous === 'thickness' && state.asm.detected) paintAssemblyPreview();
+  thicknessUI?.refresh();
+  requestAnimationFrame(() => {
+    viewer.resize(viewerEl);
+    if (mode === 'thickness' && previous !== mode && state.bodies.length) viewer.frameAll();
+  });
   try { localStorage.setItem(MODE_KEY, mode); } catch {}
 }
 
@@ -2566,13 +2621,30 @@ function refreshSolvedDot() {
 }
 
 modeCutBtn.addEventListener('click', () => applySidebarMode('cut'));
+modeThicknessBtn.addEventListener('click', () => applySidebarMode('thickness'));
+$('thicknessBackBtn').addEventListener('click', () => { applySidebarMode('cut'); modeCutBtn.focus(); });
+const workspaceTabs = [modeCutBtn, modeThicknessBtn, modeAnalysisBtn];
+workspaceTabs.forEach((button, index) => button.addEventListener('keydown', event => {
+  const available = workspaceTabs.filter(tab => !tab.disabled);
+  const current = available.indexOf(workspaceTabs[index]);
+  const next = event.key === 'ArrowRight' ? (current + 1) % available.length
+    : event.key === 'ArrowLeft' ? (current + available.length - 1) % available.length
+    : event.key === 'Home' ? 0 : event.key === 'End' ? available.length - 1 : -1;
+  if (next < 0) return;
+  event.preventDefault();
+  available[next].click();
+  available[next].focus();
+}));
 modeAnalysisBtn.addEventListener('click', () => {
   applySidebarMode('analysis');
   // Ensure the section is populated for the current selection.
   renderAnalysisSection();
 });
 applySidebarMode(((): SidebarMode => {
-  try { return localStorage.getItem(MODE_KEY) === 'analysis' ? 'analysis' : 'cut'; } catch { return 'cut'; }
+  try {
+    const saved = localStorage.getItem(MODE_KEY);
+    return saved === 'analysis' || saved === 'thickness' ? saved : 'cut';
+  } catch { return 'cut'; }
 })());
 
 function syncViewerSelectionFromState() {
@@ -2776,6 +2848,12 @@ sequenceStyleSelect.addEventListener('change', () => {
   try { localStorage.setItem(SEQSTYLE_KEY, state.sequenceStyle); } catch { /* quota */ }
   if (state.lastNest) renderResults();
 });
+cutStrategySelect.addEventListener('change', () => {
+  if (cutStrategySelect.value === 'repeated') {
+    sequenceStyleSelect.value = 'optimized';
+    sequenceStyleSelect.dispatchEvent(new Event('change'));
+  }
+});
 
 // --------------------------------------------------------------------------
 // Shopping list UI — auto-generated from the latest nest result.
@@ -2875,6 +2953,7 @@ renderShoppingList();
  * stream for the saw strategies) seeded differently on every click.
  */
 async function runEstimate(opts: { seed?: number; deepSearch?: boolean } = {}) {
+  if (modelBusy()) return;
   const selected = state.bodies.filter((b) => b.selected);
   if (selected.length === 0) return;
   const sheetW = readFieldMm(sheetWInput);
@@ -2932,6 +3011,8 @@ async function runEstimate(opts: { seed?: number; deepSearch?: boolean } = {}) {
     state.splitInfo = split.splits;
   }
 
+  geometryBusy = true;
+  thicknessUI?.refresh();
   try {
     const result = await runNestAnimated(nestParts, {
       sheetW, sheetL, margin, kerf,
@@ -2993,9 +3074,11 @@ async function runEstimate(opts: { seed?: number; deepSearch?: boolean } = {}) {
     resultsEmpty.textContent = err.message || 'Nesting failed.';
     console.error(err);
   } finally {
+    geometryBusy = false;
     nestBtn.disabled = false;
     nestBtn.textContent = 'Estimate cut sheets';
     optimizeMoreBtn.disabled = !state.lastNest;
+    thicknessUI?.refresh();
   }
 }
 
@@ -3018,15 +3101,15 @@ optimizeMoreBtn.addEventListener('click', async () => {
   await runEstimate({ seed: ++optimizeSeed, deepSearch: true });
   const next = state.lastNest;
   if (!next || next === prev.nest) return; // estimate failed — nothing to compare
-  const better =
-    totalUnplacedOf(next) < prevUnplaced ||
-    (totalUnplacedOf(next) === prevUnplaced && (
-      next.totalSheets < prev.nest.totalSheets ||
-      (next.totalSheets === prev.nest.totalSheets && next.yield > prev.nest.yield + 1e-9)));
+  const better = isBetterNest(next, prev.nest, state.lastStrategy);
   if (better) {
     const sheetsMsg = next.totalSheets < prev.nest.totalSheets
       ? `${prev.nest.totalSheets} → ${next.totalSheets} sheets`
-      : `yield ${(prev.nest.yield * 100).toFixed(1)}% → ${(next.yield * 100).toFixed(1)}%`;
+      : totalUnplacedOf(next) < prevUnplaced ? 'more parts placed'
+      : next.yield > prev.nest.yield + 1e-9
+        ? `yield ${(prev.nest.yield * 100).toFixed(1)}% → ${(next.yield * 100).toFixed(1)}%`
+        : state.lastStrategy === 'repeated' ? 'better full-length rip strips or offcut'
+        : 'better cutting layout or reusable offcut';
     detailSub.textContent = `Improved: ${sheetsMsg}`;
   } else {
     // Restore the previous (better or equal) layout.
@@ -3053,9 +3136,11 @@ let replayHandle: { stop: boolean } | null = null;
 replayBtn.addEventListener('click', async () => {
   if (replayHandle) { replayHandle.stop = true; return; }
   if (state.lastTrialFrames.length === 0) return;
+  thicknessUI?.clearPreview();
   const handle = { stop: false };
   replayHandle = handle;
   replayBtn.classList.add('busy');
+  thicknessUI?.refresh();
   const frames = state.lastTrialFrames;
   const FRAME_MS = 1000 / 25;
   const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
@@ -3069,6 +3154,7 @@ replayBtn.addEventListener('click', async () => {
   }
   replayHandle = null;
   replayBtn.classList.remove('busy');
+  thicknessUI?.refresh();
   // Restore the final state.
   if (state.lastNest) renderResults();
 });
@@ -3844,6 +3930,7 @@ downloadCutDxfBtn.addEventListener('click', () => {
 // Shared by the PDF button (paper format from the settings dropdown) and the
 // Phone PDF button (forces the one-cut-per-page mobile format).
 async function exportPdf(btn: HTMLButtonElement, paper: string) {
+  thicknessUI?.clearPreview();
   if (!state.lastNest || !state.lastSheet) return;
   // Mark the button busy + show a progress indicator so the user knows the
   // (multi-second) snapshot capture + PDF assembly is running. We yield to
@@ -3854,6 +3941,7 @@ async function exportPdf(btn: HTMLButtonElement, paper: string) {
   downloadPhonePdfBtn.disabled = true;
   downloadCutlistPdfBtn.disabled = true;
   btn.classList.add('busy');
+  thicknessUI?.refresh();
   const setProgress = (label: string, pct: number) => {
     btn.innerHTML = `<span class="progress-bar"><span class="progress-fill" style="width:${pct.toFixed(0)}%"></span></span><span class="progress-label">${label}</span>`;
   };
@@ -4082,6 +4170,7 @@ async function exportPdf(btn: HTMLButtonElement, paper: string) {
   // Restore buttons
   btn.innerHTML = originalLabel;
   btn.classList.remove('busy');
+  thicknessUI?.refresh();
   downloadPdfBtn.disabled = false;
   downloadPhonePdfBtn.disabled = false;
   downloadCutlistPdfBtn.disabled = false;
@@ -4181,6 +4270,7 @@ function currentSections(): import('./pdf').PdfSections {
 // balloons on the panels. The snapshots are synchronous captures — none of
 // the job PDF's per-cabinet progress plumbing.
 downloadCutlistPdfBtn.addEventListener('click', () => {
+  thicknessUI?.clearPreview();
   if (!state.lastNest || !state.lastSheet) return;
   // Panel ids per source body — partId IS the source body id, so the
   // balloons on the assembly views carry the same "1a" codes as the sheets.
@@ -4271,3 +4361,79 @@ function escapeHtml(s: string): string {
 function escapeHtmlAttr(s: string): string {
   return escapeHtml(s);
 }
+
+// --------------------------------------------------------------------------
+// Apply thickness proposals only after every replacement has been analysed.
+// All nesting/export inputs and the viewer switch in the same synchronous turn.
+// --------------------------------------------------------------------------
+function invalidateCorrectedResults() {
+  if (replayHandle) replayHandle.stop = true;
+  cancelDrag();
+  beginRearrangeRender(null);
+  staging.length = 0;
+  rearrangeOn = false;
+  rearrangeBtn.classList.remove('is-active');
+  rearrangeBtn.setAttribute('aria-pressed', 'false');
+  stagingArea.hidden = true;
+  state.lastNest = null;
+  state.lastSheet = null;
+  state.currentSheetKey = null;
+  state.lastTrialFrames = [];
+  state.lastTrialMetrics = [];
+  state.splitSegmentGeo.clear();
+  state.splitInfo = [];
+  state.partLabels.clear();
+  state.shopping = [];
+  viewer.setPartLabels([]);
+  resultsDetail.hidden = true;
+  resultsEmpty.hidden = false;
+  resultsEmpty.textContent = 'Estimate cut sheets to use the current board dimensions.';
+  detailSvg.innerHTML = '';
+  convergenceChart.innerHTML = '';
+  for (const button of [downloadDxfBtn, downloadCutDxfBtn, downloadPdfBtn, downloadPhonePdfBtn,
+    downloadCutlistPdfBtn, optimizeMoreBtn, replayBtn, rearrangeBtn]) button.disabled = true;
+  renderShoppingList();
+  state.asm.preview = null;
+  clearAssembly();
+}
+
+function installCorrectedGeometry(cabinet: ThicknessCabinet, proposal: CorrectionProposal | null) {
+  if (modelBusy()) throw new Error('Finish the current operation before changing the assembly.');
+  if (proposal && !proposal.ok) throw new Error('Resolve the correction issues before applying.');
+  const replacements = (proposal ? proposal.panels : cabinet.inputs).flatMap(input => {
+    const body = state.bodies.find(b => b.id === input.id && b.fileTag === cabinet.key);
+    if (!body) return [];
+    const corrected = proposal?.panels.find(p => p.id === input.id);
+    const analysis = corrected && proposal ? correctedPanelAnalysis(corrected, proposal.frame) : analyzeBody(input.mesh);
+    if (!analysis) throw new Error(`${body.name}: the corrected shape is no longer a supported sheet panel.`);
+    return [{ body, analysis, mesh: input.mesh }];
+  });
+  viewer.showThicknessPreview(null);
+  viewer.updateOcctMeshes(replacements.map(r => ({ id: r.body.id, mesh: r.mesh })));
+  for (const r of replacements) r.body.analysis = r.analysis;
+  cabinet.applied = proposal;
+  thicknessOverrideSelect.value = '';
+  invalidateCorrectedResults();
+  pushAllGrainToViewer();
+  refreshWeakBodies();
+  renderBodyList();
+  syncViewerSelectionFromState();
+  updateNestBtn();
+  setStatus(proposal
+    ? `Applied ${proposal.targetThickness} mm stock to ${cabinet.name}. Outside outline and ${proposal.contacts.length} joints verified.`
+    : `Restored imported geometry for ${cabinet.name}.`, 'ok');
+}
+
+thicknessUI = mountThicknessCorrection({
+  getCabinets: () => thicknessCabinets,
+  isBusy: modelBusy,
+  onPreview: proposal => {
+    const originals = new Map(thicknessCabinets.flatMap(c => c.inputs.map(p => [p.id, p.mesh] as const)));
+    // A proposal starts from the import. Include unchanged baseline panels too:
+    // an earlier applied correction may have altered those live bodies.
+    viewer.showThicknessPreview(proposal ? proposal.panels
+      .map(p => ({ id: p.id, mesh: p.mesh, original: originals.get(p.id)! })) : null);
+  },
+  onApply: (cabinet, proposal) => installCorrectedGeometry(cabinet, proposal),
+  onReset: cabinet => installCorrectedGeometry(cabinet, null),
+});

@@ -41,9 +41,10 @@
           </div>
         </header>
 
-        <!-- Mode switch: Cut planning vs whole-cabinet structural Analysis -->
-        <div class="mode-switch" role="tablist" aria-label="Sidebar mode">
+        <!-- Dedicated workspaces share the same imported assembly. -->
+        <div class="mode-switch" role="tablist" aria-label="Workspace">
           <button id="modeCutBtn" class="mode-tab active" role="tab" type="button" aria-selected="true">Cut planning</button>
+          <button id="modeThicknessBtn" class="mode-tab" role="tab" type="button" aria-selected="false">Thickness</button>
           <button id="modeAnalysisBtn" class="mode-tab" role="tab" type="button" aria-selected="false">
             Analysis<span id="modeAnalysisDot" class="mode-solved-dot" hidden aria-hidden="true"></span>
           </button>
@@ -121,6 +122,7 @@
             <label style="grid-column: 1 / -1">Cut strategy
               <select id="cutStrategy">
                 <option value="guillotine" selected>Min cuts (track saw / panel saw)</option>
+                <option value="repeated">Repeated long rips (equal-width strips)</option>
                 <option value="free">Max utilization (any cuts)</option>
                 <option value="cnc">CNC nest (any angle · router / waterjet)</option>
               </select>
@@ -166,6 +168,39 @@
               <span>Auto-split oversize parts (dovetail joints)</span>
             </label>
           </div>
+        </section>
+
+        <section id="thicknessCorrection" class="panel panel--group thickness-panel" data-group="thickness" data-modes="thickness" aria-labelledby="thicknessSetupTitle">
+              <div class="thickness-eyebrow">01 / Stock setup</div>
+              <h2 id="thicknessSetupTitle">Match your plywood</h2>
+              <p class="thickness-note">Enter the thickness you measured. Connected boards adjust to keep the cabinet’s outside outline and joints.</p>
+              <div class="grid2">
+                <label class="thickness-wide">Cabinet
+                  <select id="thicknessCabinet" disabled aria-describedby="thicknessOriginalNote"><option value="">Load a STEP cabinet</option></select>
+                </label>
+                <label class="thickness-wide">Designed for
+                  <select id="thicknessSource" disabled><option value="">No source panels</option></select>
+                </label>
+                <label class="thickness-wide thickness-target-label">Your plywood <span class="thickness-input-unit">millimetres</span>
+                  <input id="thicknessTarget" type="number" inputmode="decimal" min="0.001" step="any" value="18" disabled />
+                </label>
+              </div>
+              <p id="thicknessStockSummary" class="thickness-stock-summary">Measure your stock before applying a correction.</p>
+              <details class="thickness-advanced">
+                <summary>Contact tolerance</summary>
+                <div class="grid2">
+                  <label class="thickness-wide">Tolerance (mm)
+                    <input id="thicknessTolerance" type="number" inputmode="decimal" min="0.000001" max="0.5" step="any" value="0.05" disabled aria-describedby="thicknessToleranceNote" />
+                  </label>
+                </div>
+                <p id="thicknessToleranceNote" class="thickness-note">Match faces and the source stock group within this distance. Maximum 0.5 mm.</p>
+              </details>
+              <button id="thicknessAnalyseBtn" type="button" class="primary thickness-analyse" disabled>Analyse corrections <span aria-hidden="true">→</span></button>
+              <details class="thickness-method">
+                <summary>How boards are adjusted</summary>
+                <p id="thicknessOriginalNote" class="thickness-note">Only the chosen stock group changes thickness; connected boards may resize to keep their joints. Each analysis starts from the imported geometry. Applying replaces this cabinet’s previous correction. Internal openings may change.</p>
+                <p class="thickness-note">For rectangular board assemblies. Unsupported joinery and conflicting constraints are flagged before you apply.</p>
+              </details>
         </section>
 
         <section class="panel panel--group" data-group="parts" data-modes="both">
@@ -373,13 +408,17 @@
 
       <!-- RIGHT: 3D | 2D side-by-side, with thumbnails strip below -->
       <main id="main">
+        <header id="thicknessWorkspaceHeader" class="thickness-workspace-header" hidden>
+          <div><span class="thickness-eyebrow">Assembly tools</span><h1>Thickness correction</h1><p>Adapt the assembly to the stock you have.</p></div>
+          <button id="thicknessBackBtn" type="button" class="ghost">Back to cut planning <span aria-hidden="true">↗</span></button>
+        </header>
         <div id="workArea">
           <!-- 3D pane -->
           <div class="work-pane" id="viewerPane">
             <header class="pane-header">
               <span class="pane-title">
                 <span class="panel-dot" aria-hidden="true"></span>
-                3D model
+                <span id="modelPaneTitle">3D model</span>
               </span>
               <div class="row-gap">
                 <button id="recenterBtn" class="pane-max" title="Recenter view on model" disabled>
@@ -397,12 +436,33 @@
             </header>
             <div id="viewerWrap">
               <div id="viewer"></div>
+              <div id="thicknessPreviewLegend" class="thickness-preview-legend" hidden><span><i class="thickness-swatch-proposed"></i>Proposed boards</span><span><i class="thickness-swatch-original"></i>Imported edges</span><strong>Preview · not applied</strong></div>
               <div id="viewerHud">
                 <span class="hud-dot" aria-hidden="true"></span>
                 <span id="hudHint">Click a body · drag to orbit · scroll to zoom</span>
               </div>
             </div>
           </div>
+
+          <section id="thicknessReview" class="work-pane thickness-review" aria-labelledby="thicknessReviewTitle" hidden>
+            <header class="thickness-review-header"><div class="thickness-eyebrow">02 / Review &amp; apply</div><h2 id="thicknessReviewTitle">Correction review</h2><p>Check the fit before changing your model.</p></header>
+            <div id="thicknessReviewScroll" class="thickness-review-scroll">
+              <div id="thicknessStatus" class="thickness-status" role="status" aria-live="polite">Load a STEP cabinet to begin.</div>
+              <div id="thicknessApplied" class="thickness-applied" hidden></div>
+              <div id="thicknessReviewEmpty" class="thickness-review-empty">
+                <svg viewBox="0 0 160 90" width="160" height="90" fill="none" aria-hidden="true"><path d="M23 16h114v58H23z" stroke="currentColor" stroke-width="1" stroke-dasharray="3 4"/><path d="M29 16v58M131 16v58M29 22h102M29 68h102" stroke="currentColor" stroke-width="5"/><path d="M52 45h56m-50-5-6 5 6 5m44-10 6 5-6 5" stroke="currentColor" stroke-width="1.5"/></svg>
+                <h3>A clear view of every change</h3><p>Analyse your cabinet to see which boards resize or move, and how the joints and outside outline are preserved.</p>
+              </div>
+              <div id="thicknessReportTools" class="thickness-report-tools" hidden><div class="row-between"><h3>Board changes</h3><span id="thicknessChangeCount" class="count-pill"></span></div><label class="thickness-search-label"><span class="thickness-visually-hidden">Find a board</span><input id="thicknessSearch" type="search" placeholder="Find a board…" /></label><p>Length × width × thickness · mm</p></div>
+              <div id="thicknessChanges" class="thickness-changes" hidden></div>
+            </div>
+            <footer class="thickness-review-footer">
+              <label class="thickness-preview"><input id="thicknessPreview" type="checkbox" disabled /><span>Preview changes in 3D</span><span class="thickness-preview-key" aria-hidden="true"></span></label>
+              <button id="thicknessApplyBtn" type="button" class="primary" disabled>Apply correction</button>
+              <div class="thickness-export-actions"><button id="thicknessResetBtn" type="button" class="ghost" disabled>Reset to imported</button><button id="thicknessExportBtn" type="button" class="ghost" disabled>Download STEP <span aria-hidden="true">↓</span></button></div>
+              <p class="thickness-note thickness-export-note">Downloads the applied panel assembly. Your source file stays unchanged.</p>
+            </footer>
+          </section>
 
           <!-- Drag handle between panes -->
           <div id="paneDivider" class="pane-divider" title="Drag to resize" aria-label="Resize panes">

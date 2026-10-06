@@ -27,6 +27,8 @@ export type Heuristic = 'BSSF' | 'BLSF' | 'BAF' | 'BL';
  * 'guillotine'  = "Min cuts" — shelf/SAS packers plus a beam search over
  *                  guillotine cut trees, all edge-to-edge cuts, track-saw and
  *                  panel-saw friendly.
+ * 'repeated'    = "Repeated long rips" — full-length equal-width strips,
+ *                  ripped first, then crosscut to finished part lengths.
  * 'free'        = "Max utilization" — MaxRects, any cut, highest yield.
  * 'cnc'         = "CNC nest" — true-shape any-angle nesting for router /
  *                  waterjet (handled by cncNest.ts, NOT this rectangle
@@ -43,11 +45,11 @@ export type Heuristic = 'BSSF' | 'BLSF' | 'BAF' | 'BL';
  *     thickness group. It is a post-process and costs nothing: measured at
  *     the same +0.75 sheets over the area bound as 'free'.
  */
-export type CutStrategy = 'free' | 'guillotine' | 'cnc';
+export type CutStrategy = 'free' | 'guillotine' | 'repeated' | 'cnc';
 
 /** Legacy persisted values → the strategy that absorbed them. */
 export function migrateCutStrategy(s: string | null | undefined): CutStrategy {
-  if (s === 'guillotine' || s === 'free' || s === 'cnc') return s;
+  if (s === 'guillotine' || s === 'repeated' || s === 'free' || s === 'cnc') return s;
   if (s === 'guillotine-exact') return 'guillotine';
   if (s === 'save-last') return 'free';
   return 'guillotine';
@@ -60,7 +62,7 @@ export function isCncStrategy(s: CutStrategy): boolean {
 
 /** True for the min-cuts (panel-saw) strategy. */
 export function isGuillotineStrategy(s: CutStrategy | undefined): boolean {
-  return s === 'guillotine';
+  return s === 'guillotine' || s === 'repeated';
 }
 
 export interface PackInput {
@@ -242,7 +244,7 @@ class ShelfBin implements BinPacker {
   /** Per-placement: which shelf and (x, w) along it. Used by finalize(). */
   private partsByShelf: { shelf: number; x: number; w: number }[][] = [];
 
-  constructor(w: number, h: number) {
+  constructor(w: number, h: number, private matchingWidths = false) {
     this.binW = w;
     this.binH = h;
   }
@@ -254,8 +256,10 @@ class ShelfBin implements BinPacker {
     //    in a tall part that wastes vertical space on the rest of the row.
     for (let i = 0; i < this.shelves.length; i++) {
       const sh = this.shelves[i];
-      const okUnrot = sh.usedW + w <= this.binW && h <= sh.h;
-      const okRot   = allowRotate && sh.usedW + h <= this.binW && w <= sh.h;
+      const okUnrot = sh.usedW + w <= this.binW && h <= sh.h
+        && (!this.matchingWidths || Math.abs(h - sh.h) <= SETTING_TOL);
+      const okRot   = allowRotate && sh.usedW + h <= this.binW && w <= sh.h
+        && (!this.matchingWidths || Math.abs(w - sh.h) <= SETTING_TOL);
       if (!okUnrot && !okRot) continue;
       // When both fit, prefer the orientation that uses LESS shelf width —
       // packs more parts per shelf, reducing per-shelf vertical cuts.
@@ -394,10 +398,10 @@ class ShelfBinV implements BinPacker {
   cuts: Cut[] = [];
   private inner: ShelfBin;
 
-  constructor(w: number, h: number) {
+  constructor(w: number, h: number, matchingWidths = false) {
     this.binW = w;
     this.binH = h;
-    this.inner = new ShelfBin(h, w);
+    this.inner = new ShelfBin(h, w, matchingWidths);
   }
 
   insert(w: number, h: number, allowRotate: boolean, heur: Heuristic): PackPlacement | null {
@@ -624,7 +628,7 @@ const AWKWARD_MM = 150;
 
 
 /** Two cut distances this close are the same flip-stop setting (mm). */
-const SETTING_TOL = 1.0;
+export const SETTING_TOL = 0.01;
 
 /**
  * The largest single RECTANGLE of stock left over — not the leftover area.
@@ -646,42 +650,59 @@ const SETTING_TOL = 1.0;
  *
  * `rects` are kerf-inflated footprints in bin coordinates.
  */
-function largestEmptyRect(
+export function largestEmptyRect(
   rects: Rect[], binW: number, binH: number,
 ): { w: number; h: number } | null {
   if (binW <= 0 || binH <= 0) return null;
-  const EPS = 0.01;
   const uniq = (vals: number[], hi: number) =>
-    [...new Set(vals.filter((v) => v > EPS && v < hi - EPS).concat([0, hi]))]
+    [...new Set(vals.filter((v) => v > 0 && v < hi).concat([0, hi]))]
       .sort((p, q) => p - q);
   const xs = uniq(rects.flatMap((r) => [r.x, r.x + r.w]), binW);
   const ys = uniq(rects.flatMap((r) => [r.y, r.y + r.h]), binH);
   const nx = xs.length - 1, ny = ys.length - 1;
   if (nx <= 0 || ny <= 0) return null;
 
-  const heights = new Array<number>(nx).fill(0);
-  const colW = Array.from({ length: nx }, (_, c) => xs[c + 1] - xs[c]);
+  // Coordinate compression plus a 2D difference grid marks occupied cells
+  // in O(n²), without checking every part against every cell.
+  const stride = nx + 1;
+  const occupied = new Int32Array(stride * (ny + 1));
+  const xi = new Map(xs.map((x, i) => [x, i]));
+  const yi = new Map(ys.map((y, i) => [y, i]));
+  for (const q of rects) {
+    const l = xi.get(Math.max(0, Math.min(binW, q.x)))!;
+    const r = xi.get(Math.max(0, Math.min(binW, q.x + q.w)))!;
+    const t = yi.get(Math.max(0, Math.min(binH, q.y)))!;
+    const b = yi.get(Math.max(0, Math.min(binH, q.y + q.h)))!;
+    occupied[t * stride + l]++;
+    occupied[t * stride + r]--;
+    occupied[b * stride + l]--;
+    occupied[b * stride + r]++;
+  }
+  const heights = new Float64Array(nx);
   let best: { w: number; h: number } | null = null;
   let bestArea = 0;
   for (let r = 0; r < ny; r++) {
-    const cy = (ys[r] + ys[r + 1]) / 2;
     const rowH = ys[r + 1] - ys[r];
     for (let c = 0; c < nx; c++) {
-      const cx = (xs[c] + xs[c + 1]) / 2;
-      const occupied = rects.some(
-        (q) => cx > q.x && cx < q.x + q.w && cy > q.y && cy < q.y + q.h);
-      heights[c] = occupied ? 0 : heights[c] + rowH;
+      const i = r * stride + c;
+      occupied[i] += (r ? occupied[i - stride] : 0) + (c ? occupied[i - 1] : 0)
+        - (r && c ? occupied[i - stride - 1] : 0);
+      heights[c] = occupied[i] ? 0 : heights[c] + rowH;
     }
-    for (let c = 0; c < nx; c++) {
-      if (heights[c] === 0) continue;
-      let h = heights[c];
-      let w = 0;
-      for (let d = c; d < nx && heights[d] > 0; d++) {
-        h = Math.min(h, heights[d]);
-        w += colW[d];
-        const area = w * h;
-        if (area > bestArea) { bestArea = area; best = { w, h }; }
+    // Largest rectangle under a variable-width histogram, linear per row.
+    const stack: { start: number; h: number }[] = [];
+    for (let c = 0; c <= nx; c++) {
+      const h = c === nx ? 0 : heights[c];
+      let start = c;
+      while (stack.length && stack[stack.length - 1].h > h) {
+        const top = stack.pop()!;
+        const w = xs[c] - xs[top.start], area = w * top.h;
+        if (area > bestArea || (area === bestArea && best && Math.min(w, top.h) > Math.min(best.w, best.h))) {
+          bestArea = area; best = { w, h: top.h };
+        }
+        start = top.start;
       }
+      if (h > 0 && (!stack.length || stack[stack.length - 1].h < h)) stack.push({ start, h });
     }
   }
   return bestArea > 1 ? best : null;
@@ -694,8 +715,8 @@ function largestEmptyRect(
  */
 const AWKWARD_SETUPS = 1;
 /**
- * How much leftover rectangle buys one setup (mm²). 0.1 m² per setup: half a
- * square metre of recovered panel is worth about five setup changes, which is
+ * How much leftover rectangle buys one setup (mm²). 0.05 m² per setup: half a
+ * square metre of recovered panel is worth about ten setup changes, which is
  * roughly the trade the user makes by hand.
  */
 const REMNANT_PER_SETUP = 50_000;
@@ -963,10 +984,10 @@ export function deriveGuillotineCuts(rects: Rect[], binW: number, binH: number):
  * in a non-guillotine block. Works for any tree (shelf or recovered), so it
  * lets the optimiser compare strategies on a common "cuttability" axis.
  */
-function countFreedParts(cuts: Cut[], rects: Rect[], binW: number, binH: number): number {
+export function countFreedParts(cuts: Cut[], rects: Rect[], binW: number, binH: number, binX = 0, binY = 0): number {
   const EPS = 0.5;
   interface Reg { x: number; y: number; w: number; h: number; items: number[] }
-  let regions: Reg[] = [{ x: 0, y: 0, w: binW, h: binH, items: rects.map((_, i) => i) }];
+  let regions: Reg[] = [{ x: binX, y: binY, w: binW, h: binH, items: rects.map((_, i) => i) }];
   for (const c of cuts) {
     const next: Reg[] = [];
     for (const r of regions) {
@@ -993,6 +1014,85 @@ function countFreedParts(cuts: Cut[], rects: Rect[], binW: number, binH: number)
   let freed = 0;
   for (const r of regions) if (r.items.length === 1) freed++;
   return freed;
+}
+
+/** Two-stage strip plan: every primary rip spans the stock's long edge.
+ * Run the full-length rips first; only then crosscut the individual strips.
+ * Generic tree recovery can trim stock shorter first, losing that workflow. */
+function deriveRipCuts(rects: Rect[], binW: number, binH: number): Cut[] {
+  if (binH > binW) {
+    return deriveRipCuts(rects.map((r) => ({ x: r.y, y: r.x, w: r.h, h: r.w })), binH, binW)
+      .map((c) => ({ ...c, parentX: c.parentY, parentY: c.parentX,
+        parentW: c.parentH, parentH: c.parentW, axis: c.axis === 'H' ? 'V' : 'H' }));
+  }
+  const eps = 1e-6;
+  const boundaries = [...new Set(rects.map((r) => r.y + r.h))]
+    .filter((y) => !rects.some((r) => r.y < y - eps && r.y + r.h > y + eps))
+    .sort((a, b) => a - b);
+  const cuts: Cut[] = [];
+  const strips: { y: number; h: number; depth: number; rects: Rect[] }[] = [];
+  let y = 0;
+  for (const end of boundaries) {
+    if (end <= y + eps) continue;
+    const inside = rects.filter((r) => r.y >= y - eps && r.y + r.h <= end + eps);
+    if (inside.length === 0) continue;
+    const depth = cuts.length;
+    if (end < binH - eps) cuts.push({ parentX: 0, parentY: y, parentW: binW,
+      parentH: binH - y, axis: 'H', distance: end - y, depth });
+    strips.push({ y, h: end - y, depth: depth + 1, rects: inside });
+    y = end;
+  }
+  for (const strip of strips) {
+    const local = strip.rects.map((r) => ({ ...r, y: r.y - strip.y }));
+    cuts.push(...deriveGuillotineCuts(local, binW, strip.h)
+      .map((c) => ({ ...c, parentY: c.parentY + strip.y, depth: c.depth + strip.depth })));
+  }
+  return cuts;
+}
+
+/** Reusable stock must survive the planned cuts as a single empty leaf. */
+function largestCutOffcut(cuts: Cut[], rects: Rect[], binW: number, binH: number): { w: number; h: number } | null {
+  const eps = 1e-6;
+  const regions: Rect[] = [{ x: 0, y: 0, w: binW, h: binH }];
+  for (const c of cuts) {
+    const index = regions.findIndex((r) => Math.abs(r.x - c.parentX) <= eps &&
+      Math.abs(r.y - c.parentY) <= eps && Math.abs(r.w - c.parentW) <= eps && Math.abs(r.h - c.parentH) <= eps);
+    // Do not promise a remnant if the sequence cannot be replayed.
+    if (index < 0) return null;
+    const r = regions.splice(index, 1)[0];
+    if (c.axis === 'H') {
+      regions.push({ ...r, h: c.distance }, { ...r, y: r.y + c.distance, h: r.h - c.distance });
+    } else {
+      regions.push({ ...r, w: c.distance }, { ...r, x: r.x + c.distance, w: r.w - c.distance });
+    }
+  }
+  let best: Rect | null = null;
+  for (const r of regions) {
+    if (r.w <= eps || r.h <= eps || rects.some((p) =>
+      p.x < r.x + r.w - eps && p.x + p.w > r.x + eps &&
+      p.y < r.y + r.h - eps && p.y + p.h > r.y + eps)) continue;
+    const area = r.w * r.h, bestArea = best ? best.w * best.h : 0;
+    if (area > bestArea + eps || (best && Math.abs(area - bestArea) <= eps &&
+      Math.min(r.w, r.h) > Math.min(best.w, best.h))) best = r;
+  }
+  return best ? { w: best.w, h: best.h } : null;
+}
+
+/** Full-length rip settings, excluding crosscuts and local strip trimming. */
+export function longRipStats(cuts: Cut[]): { settings: number; changes: number; rips: number; repeated: number } {
+  const root = cuts[0];
+  if (!root) return { settings: 0, changes: 0, rips: 0, repeated: 0 };
+  const horizontal = root.parentW >= root.parentH;
+  const rips = cuts.filter((c) => horizontal
+    ? c.axis === 'H' && Math.abs(c.parentW - root.parentW) <= SETTING_TOL
+    : c.axis === 'V' && Math.abs(c.parentH - root.parentH) <= SETTING_TOL);
+  const settings: number[] = [];
+  let changes = 0;
+  rips.forEach((c, i) => {
+    if (!settings.some((d) => Math.abs(d - c.distance) <= SETTING_TOL)) settings.push(c.distance);
+    if (i === 0 || Math.abs(c.distance - rips[i - 1].distance) > SETTING_TOL) changes++;
+  });
+  return { settings: settings.length, changes, rips: rips.length, repeated: rips.length - changes };
 }
 
 // ---------------------------------------------------------------------------
@@ -1141,7 +1241,7 @@ export interface MultiSheetResult {
  */
 export function packOne(job: PackJob, heur: Heuristic, order: PackInput[], binKind?: BinKind): MultiSheetResult {
   const guillotine = isGuillotineStrategy(job.cutStrategy);
-  const kind: BinKind = binKind ?? (guillotine ? 'shelf' : 'maxrects');
+  const kind: BinKind = binKind ?? (job.cutStrategy === 'repeated' ? 'rip-shelf' : guillotine ? 'shelf' : 'maxrects');
   if (kind.startsWith('beam')) {
     return packBeam(job, order, parseInt(kind.slice(4), 10) || 24);
   }
@@ -1179,6 +1279,8 @@ export function packOne(job: PackJob, heur: Heuristic, order: PackInput[], binKi
 
   while (remaining.length > 0) {
     const bin: BinPacker =
+      kind === 'rip-shelf' ? (job.sheetW >= job.sheetH
+        ? new ShelfBin(job.sheetW, job.sheetH, true) : new ShelfBinV(job.sheetW, job.sheetH, true)) :
       kind === 'shelf'   ? new ShelfBin(job.sheetW, job.sheetH) :
       kind === 'shelf-v' ? new ShelfBinV(job.sheetW, job.sheetH) :
       kind === 'sas'     ? new GuillotineBin(job.sheetW, job.sheetH) :
@@ -1277,10 +1379,14 @@ export function packOne(job: PackJob, heur: Heuristic, order: PackInput[], binKi
       // that align across strips become one through-cut and adjacent waste
       // merges into one fragment (fewer cuts, the human sequence).
       thinStripsTop(cur.placements, placedInflated, job.sheetH);
-      bin.cuts = deriveGuillotineCuts(placedInflated, job.sheetW, job.sheetH);
-      // Largest single leftover RECTANGLE, measured from the placements
-      // rather than read off the bin's free list — see largestEmptyRect.
-      cur.largestFree = largestEmptyRect(placedInflated, job.sheetW, job.sheetH);
+      bin.cuts = job.cutStrategy === 'repeated'
+        ? deriveRipCuts(placedInflated, job.sheetW, job.sheetH)
+        : deriveGuillotineCuts(placedInflated, job.sheetW, job.sheetH);
+      // Full-length rips can divide a geometrically empty rectangle into
+      // separate pieces. Score only the offcuts that survive those cuts.
+      cur.largestFree = job.cutStrategy === 'repeated'
+        ? largestCutOffcut(bin.cuts, placedInflated, job.sheetW, job.sheetH)
+        : largestEmptyRect(placedInflated, job.sheetW, job.sheetH);
       // Keep the derived tree's depth-first order — it IS the physical
       // top-to-bottom work sequence (see deriveGuillotineCuts).
       cur.cuts = bin.cuts.slice();
@@ -1652,7 +1758,7 @@ function consolidateSheets(result: MultiSheetResult, job: PackJob): MultiSheetRe
 
       const hosts = working
         .filter((_, i) => i !== vi)
-        .map((s) => ({ placements: s.placements.slice(), bin: rebuild(s) }));
+        .map((s) => ({ placements: s.placements.map((p) => ({ ...p })), bin: rebuild(s) }));
       let allFit = true;
       for (const item of sorted) {
         let placed = false;
@@ -1696,18 +1802,20 @@ function consolidateSheets(result: MultiSheetResult, job: PackJob): MultiSheetRe
  * identical parts" pattern a human uses. 'guillotine-exact' adds beam-search
  * trials on top (see packBeam).
  */
-export type BinKind = 'maxrects' | 'maxrects-g' | 'shelf' | 'shelf-v' | 'sas' | `beam${number}`;
+export type BinKind = 'maxrects' | 'maxrects-g' | 'shelf' | 'shelf-v' | 'rip-shelf' | 'sas' | `beam${number}`;
 
 export interface PackTrial { order: PackInput[]; heur: Heuristic; binKind?: BinKind }
 
 export function buildTrialSchedule(job: PackJob, restarts: number, seedOffset = 0): PackTrial[] {
+  validatePackJob(job);
+  restarts = Number.isFinite(restarts) ? Math.max(1, Math.floor(restarts)) : 8;
   const heuristics: Heuristic[] = ['BSSF', 'BLSF', 'BAF', 'BL'];
   const baseline = job.items.slice().sort((a, b) => b.w * b.h - a.w * a.h);
   const bySide = job.items.slice().sort((a, b) => Math.max(b.w, b.h) - Math.max(a.w, a.h));
   const trials: PackTrial[] = [];
 
   let seed = (0x9e3779b1 ^ Math.imul(seedOffset + 1, 0x85ebca6b)) >>> 0;
-  const rand = () => { seed = (seed * 1664525 + 1013904223) >>> 0; return seed / 0xffffffff; };
+  const rand = () => { seed = (seed * 1664525 + 1013904223) >>> 0; return seed / 0x100000000; };
   const shuffle = (): PackInput[] => {
     const shuffled = baseline.slice();
     for (let k = shuffled.length - 1; k > 0; k--) {
@@ -1716,6 +1824,39 @@ export function buildTrialSchedule(job: PackJob, restarts: number, seedOffset = 
     }
     return shuffled;
   };
+  const scheduled = (): PackTrial[] => {
+    const selected = trials.slice(0, restarts);
+    // Small budgets can contain only deterministic starters. Still explore
+    // new orders on Optimize further; retain most of the known good prefix.
+    if (seedOffset !== 0) {
+      const count = Math.max(1, Math.floor(selected.length / 4));
+      for (let i = selected.length - count; i < selected.length; i++) {
+        selected[i] = { ...selected[i], order: shuffle() };
+      }
+    }
+    return selected;
+  };
+
+  if (job.cutStrategy === 'repeated') {
+    // Rip width is perpendicular to the STOCK length, not the part's
+    // finished length. Free parts run lengthwise; locked grain stays locked.
+    const width = (p: PackInput) => p.allowRotate ? Math.min(p.w, p.h)
+      : job.sheetW >= job.sheetH ? p.h : p.w;
+    const groups = new Map<number, PackInput[]>();
+    for (const item of job.items) {
+      const key = Math.round(width(item) / SETTING_TOL);
+      const group = groups.get(key) ?? [];
+      group.push(item); groups.set(key, group);
+    }
+    const banded = [...groups.values()].sort((a, b) => b.length - a.length || width(b[0]) - width(a[0]))
+      .flatMap((g) => g.sort((a, b) => b.w * b.h - a.w * a.h));
+    const byRipWidth = job.items.slice().sort((a, b) => width(b) - width(a) || b.w * b.h - a.w * a.h);
+    for (const order of [banded, byRipWidth, baseline, bySide]) {
+      trials.push({ order, heur: 'BSSF', binKind: 'rip-shelf' });
+    }
+    while (trials.length < restarts) trials.push({ order: shuffle(), heur: 'BSSF', binKind: 'rip-shelf' });
+    return scheduled();
+  }
 
   if (isGuillotineStrategy(job.cutStrategy)) {
     // Dimension-grouped orders: equal heights (or widths) adjacent → they
@@ -1760,7 +1901,7 @@ export function buildTrialSchedule(job: PackJob, restarts: number, seedOffset = 
       const kind = kinds[i % kinds.length];
       trials.push({ order: shuffle(), heur: kind === 'sas' ? heuristics[i % heuristics.length] : 'BSSF', binKind: kind });
     }
-    return trials;
+    return scheduled();
   }
 
   for (const h of heuristics) trials.push({ order: baseline, heur: h });
@@ -1771,7 +1912,7 @@ export function buildTrialSchedule(job: PackJob, restarts: number, seedOffset = 
   for (let i = 0; i < phase3; i++) {
     trials.push({ order: shuffle(), heur: heuristics[i % heuristics.length] });
   }
-  return trials;
+  return scheduled();
 }
 
 /** Kept as the single place packing-vs-objective strategy could diverge.
@@ -1781,18 +1922,34 @@ export function effectiveJob(job: PackJob): PackJob {
   return job;
 }
 
+export function validatePackJob(job: PackJob): void {
+  if (![job.sheetW, job.sheetH].every((v) => Number.isFinite(v) && v > 0)) {
+    throw new Error('Sheet dimensions must be finite and positive.');
+  }
+  if (!Number.isFinite(job.kerf) || job.kerf < 0) throw new Error('Kerf must be finite and nonnegative.');
+  const ids = new Set<string>();
+  for (const item of job.items) {
+    if (![item.w, item.h].every((v) => Number.isFinite(v) && v > 0)) {
+      throw new Error(`Part ${item.id} dimensions must be finite and positive.`);
+    }
+    if (ids.has(item.id)) throw new Error(`Duplicate part instance: ${item.id}`);
+    ids.add(item.id);
+  }
+}
+
 /**
  * Post-search finishing shared by all drivers: dissolve consolidatable
  * sheets, then (save-last) corner-cluster the last sheet.
  */
 export function finishPack(job: PackJob, best: MultiSheetResult): MultiSheetResult {
-  const result = consolidateSheets(best, effectiveJob(job));
+  const consolidated = consolidateSheets(best, effectiveJob(job));
+  // Never mutate a trial retained by progress/replay or the caller.
+  const result = { ...consolidated, sheets: consolidated.sheets.slice() };
   // Cluster the LAST sheet's parts into one corner so what is left over is a
   // clean rectangle worth keeping. Default for every strategy now, not an
-  // option: it is pure post-processing — the parts and the sheet count are
-  // unchanged, only their arrangement on that one sheet — so it cannot cost
-  // anything. `nest.ts` packs each thickness group separately, so this lands
-  // on the last sheet OF EACH SIZE.
+  // option. Repacking can change cut complexity and the remnant, so retain
+  // it only when it improves the selected objective. `nest.ts` packs each
+  // thickness group separately, so this targets the last sheet of each size.
   if (result.sheets.length > 0) {
     // Put the EMPTIEST sheet last first. Which sheet ends up last is an
     // artefact of the objective — 'free' and 'cnc' happen to leave the
@@ -1809,10 +1966,17 @@ export function finishPack(job: PackJob, best: MultiSheetResult): MultiSheetResu
       const [s] = result.sheets.splice(leanest, 1);
       result.sheets.push(s);
     }
+    // Corner packing can break full-length strips or put crosscuts first.
+    // This mode keeps its two-stage rip plan intact.
+    if (job.cutStrategy === 'repeated') return result;
     const meta = new Map<string, { id: string; w: number; h: number; allowRotate: boolean }>();
     for (const it of job.items) meta.set(it.id, { id: it.id, w: it.w, h: it.h, allowRotate: it.allowRotate });
     const repacked = repackLastSheetCorner(result.sheets[result.sheets.length - 1], job, meta);
-    if (repacked) result.sheets[result.sheets.length - 1] = repacked;
+    if (repacked && (!isGuillotineStrategy(job.cutStrategy)
+      || repacked.fullySeparated === repacked.placements.length)) {
+      const candidate = { ...result, sheets: [...result.sheets.slice(0, -1), repacked] };
+      if (isBetter(candidate, result, job.cutStrategy)) return candidate;
+    }
   }
   return result;
 }
@@ -1820,13 +1984,13 @@ export function finishPack(job: PackJob, best: MultiSheetResult): MultiSheetResu
 /**
  * Multi-restart optimizer: shuffles insertion order + tries different
  * heuristics, keeps the best result by (fewest unplaced → fewest sheets
- * → highest fill on last sheet).
+ * → placed area → strategy-specific cuts and usable remnant).
  */
-export function packMulti(job: PackJob, restarts: number): MultiSheetResult {
+export function packMulti(job: PackJob, restarts: number, seedOffset = 0): MultiSheetResult {
   const optJob = effectiveJob(job);
   const objectiveStrategy: CutStrategy = job.cutStrategy ?? 'free';
   let best: MultiSheetResult | null = null;
-  for (const t of buildTrialSchedule(job, restarts)) {
+  for (const t of buildTrialSchedule(job, restarts, seedOffset)) {
     const r = packOne(optJob, t.heur, t.order, t.binKind);
     if (!best || isBetter(r, best, objectiveStrategy)) best = r;
   }
@@ -1883,16 +2047,27 @@ export async function packMultiAnimated(
  * for. Two-tier prelude is the same for all: fewer unplaced → fewer
  * sheets. The tiebreaker differs per strategy.
  */
-export function isBetter(a: MultiSheetResult, b: MultiSheetResult, strategy: CutStrategy = 'free'): boolean {
+export interface LayoutScore {
+  sheets: Pick<PackedSheet, 'usedArea' | 'largestFree' | 'cuts' | 'fullySeparated'>[];
+  unplaced: unknown[];
+}
+
+export function isBetter(a: LayoutScore, b: LayoutScore, strategy: CutStrategy = 'free'): boolean {
   if (a.unplaced.length !== b.unplaced.length) return a.unplaced.length < b.unplaced.length;
   if (a.sheets.length !== b.sheets.length) return a.sheets.length < b.sheets.length;
 
-  const totalUsed = (r: MultiSheetResult) => r.sheets.reduce((s, sh) => s + sh.usedArea, 0);
-  const lastUsed = (r: MultiSheetResult) => (r.sheets.length ? r.sheets[r.sheets.length - 1].usedArea : 0);
-  const totalCuts = (r: MultiSheetResult) => r.sheets.reduce((s, sh) => s + (sh.cuts?.length ?? 0), 0);
+  const totalUsed = (r: LayoutScore) => r.sheets.reduce((s, sh) => s + sh.usedArea, 0);
+  const lastUsed = (r: LayoutScore) => r.sheets.reduce((m, sh) => Math.min(m, sh.usedArea), Infinity);
+  const totalCuts = (r: LayoutScore) => r.sheets.reduce((s, sh) => s + (sh.cuts?.length ?? 0), 0);
   // Parts the cut tree fully frees, job-wide. Higher = more cleanly
   // guillotine-cuttable (fewer parts left joined in a non-guillotine block).
-  const freed = (r: MultiSheetResult) => r.sheets.reduce((s, sh) => s + (sh.fullySeparated ?? 0), 0);
+  const freed = (r: LayoutScore) => r.sheets.reduce((s, sh) => s + (sh.fullySeparated ?? 0), 0);
+
+  // The same placed parts can sum in a different order; rounding noise must
+  // never defeat the cut/offcut objective. If different parts are unplaced,
+  // favor the layout that actually recovers more material.
+  const at = totalUsed(a), bt = totalUsed(b);
+  if (Math.abs(at - bt) > 1e-6) return at > bt;
 
   /**
    * Distinct flip-stop SETTINGS a layout needs.
@@ -1906,7 +2081,7 @@ export function isBetter(a: MultiSheetResult, b: MultiSheetResult, strategy: Cut
    * Counted per sheet and summed. Cutting sheet 2 does not preserve sheet 1's
    * setting once you have moved on, so sharing across sheets is not credited.
    */
-  const settings = (r: MultiSheetResult) => {
+  const settings = (r: LayoutScore) => {
     let n = 0;
     for (const sh of r.sheets) {
       const seen: { axis: 'H' | 'V'; d: number }[] = [];
@@ -1927,7 +2102,7 @@ export function isBetter(a: MultiSheetResult, b: MultiSheetResult, strategy: Cut
    * sheets rather than the last one — finishPack moves the leanest sheet to
    * the end afterwards, so during the search "last" is not yet meaningful.
    */
-  const bestFree = (r: MultiSheetResult) => {
+  const bestFree = (r: LayoutScore) => {
     let area = 0, short = 0;
     for (const sh of r.sheets) {
       const f = sh.largestFree;
@@ -1947,10 +2122,33 @@ export function isBetter(a: MultiSheetResult, b: MultiSheetResult, strategy: Cut
     const fa = bestFree(a), fb = bestFree(b);
     if (Math.abs(fa.area - fb.area) > 1) return fa.area > fb.area;
     if (Math.abs(fa.short - fb.short) > 1) return fa.short > fb.short;
-    return lastUsed(a) < lastUsed(b);
+    return lastUsed(a) < lastUsed(b) - 1e-6;
   };
 
   switch (strategy) {
+    case 'cnc':
+      return leavesMore();
+    case 'repeated': {
+      const af = freed(a), bf = freed(b);
+      if (af !== bf) return af > bf;
+      const ripTotals = (r: LayoutScore) => r.sheets.reduce((sum, sh) => {
+        const stats = longRipStats(sh.cuts);
+        return { settings: sum.settings + stats.settings, changes: sum.changes + stats.changes };
+      }, { settings: 0, changes: 0 });
+      const ra = ripTotals(a), rb = ripTotals(b);
+      if (ra.settings !== rb.settings) return ra.settings < rb.settings;
+      if (ra.changes !== rb.changes) return ra.changes < rb.changes;
+      const sa = settings(a), sb = settings(b);
+      if (sa !== sb) return sa < sb;
+      // Fewer returns to a setting makes longer uninterrupted cut runs.
+      const changes = (r: LayoutScore) => r.sheets.reduce((sum, sh) => sum + sh.cuts.filter((c, i) =>
+        i === 0 || c.axis !== sh.cuts[i - 1].axis || Math.abs(c.distance - sh.cuts[i - 1].distance) > SETTING_TOL).length, 0);
+      const ca = changes(a), cb = changes(b);
+      if (ca !== cb) return ca < cb;
+      const ac = totalCuts(a), bc = totalCuts(b);
+      if (ac !== bc) return ac < bc;
+      return leavesMore();
+    }
     case 'guillotine': {
       // Track-saw practical. Everything here is a COST in setups, traded off
       // against each other rather than ranked absolutely — which is the
@@ -1961,7 +2159,9 @@ export function isBetter(a: MultiSheetResult, b: MultiSheetResult, strategy: Cut
       // layout is full of awkward cuts — two 63mm backs sharing 128mm of
       // stock, four 63mm strips stacked at 65mm pitch — so avoiding them is
       // plainly worth something, but not everything.
-      const awkward = (r: MultiSheetResult) => {
+      const afreed = freed(a), bfreed = freed(b);
+      if (afreed !== bfreed) return afreed > bfreed;
+      const awkward = (r: LayoutScore) => {
         let n = 0;
         for (const sh of r.sheets) for (const c of sh.cuts) {
           if (Math.min(c.parentW, c.parentH) < AWKWARD_MM) n++;
@@ -1971,7 +2171,7 @@ export function isBetter(a: MultiSheetResult, b: MultiSheetResult, strategy: Cut
       // Setups, plus one setup per awkward cut, minus what the offcut is
       // worth. REMNANT_PER_SETUP says how much rectangle buys one setup, so
       // the whole thing is denominated in setups and directly comparable.
-      const cost = (r: MultiSheetResult) =>
+      const cost = (r: LayoutScore) =>
         settings(r) + awkward(r) * AWKWARD_SETUPS
         - bestFree(r).area / REMNANT_PER_SETUP;
       const ca = cost(a), cb = cost(b);
@@ -1981,9 +2181,7 @@ export function isBetter(a: MultiSheetResult, b: MultiSheetResult, strategy: Cut
       if (Math.abs(fa.short - fb.short) > 25) return fa.short > fb.short;
       const ac = totalCuts(a), bc = totalCuts(b);
       if (ac !== bc) return ac < bc;
-      const at = totalUsed(a), bt = totalUsed(b);
-      if (at !== bt) return at > bt;
-      const narrowest = (r: MultiSheetResult) => {
+      const narrowest = (r: LayoutScore) => {
         let m = Infinity;
         for (const sh of r.sheets) for (const c of sh.cuts) m = Math.min(m, c.parentW, c.parentH);
         return m;
@@ -1995,8 +2193,6 @@ export function isBetter(a: MultiSheetResult, b: MultiSheetResult, strategy: Cut
     case 'free':
     default: {
       // Max yield: prefer HIGHER total used area (= highest overall fill).
-      const at = totalUsed(a), bt = totalUsed(b);
-      if (at !== bt) return at > bt;
       // At equal yield (the common case when everything fits), prefer the
       // layout that's most cleanly guillotine-cuttable — this steers 'free'
       // away from pinwheel/staircase nests whose cut sequence can't separate

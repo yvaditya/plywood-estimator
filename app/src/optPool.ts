@@ -10,9 +10,9 @@
  * (rebuilding raster grids is not cheap).
  *
  * Progress callbacks fire per completed trial in ARRIVAL order, so the
- * replay frames and convergence chart keep working; arrival order — and
- * therefore which of two objective-equal layouts wins — can vary run to
- * run. The sequential drivers remain the deterministic fallback, used
+ * replay frames and convergence chart keep working. Final selection replays
+ * the results in schedule order so ties are reproducible. Sequential drivers
+ * retain the search seed on fallback, used
  * automatically when Workers are unavailable or a worker errors.
  */
 
@@ -39,6 +39,7 @@ import {
   type CncSerialPass,
   type CncSheet,
 } from './cncNest';
+import type { OptWorkerMsg } from './optWorker';
 
 const makeWorker = () =>
   new Worker(new URL('./optWorker.ts', import.meta.url), { type: 'module' });
@@ -49,6 +50,73 @@ function poolSize(jobs: number): number {
 }
 
 const workersAvailable = () => typeof Worker !== 'undefined';
+
+type WorkerReply =
+  | { kind: 'rect-trial'; idx: number; result: MultiSheetResult }
+  | { kind: 'cnc-pass'; idx: number; pass: CncSerialPass }
+  | { kind: 'cnc-finished'; result: CncResult }
+  | { kind: 'done' };
+
+/** Own every worker in a search and drain progress in arrival order. A done
+ * message cannot overtake an async callback, and one failure stops all peers. */
+class WorkerBatch {
+  private workers = new Map<Worker, (reason: unknown) => void>();
+  private queue: Promise<void> = Promise.resolve();
+  private stopped = false;
+  callbackFailed = false;
+
+  async drain(): Promise<void> { await this.queue; }
+
+  cancel(reason: unknown): void {
+    this.stopped = true;
+    for (const [worker, reject] of this.workers) {
+      worker.onmessage = null;
+      worker.onerror = null;
+      worker.onmessageerror = null;
+      worker.terminate();
+      reject(reason);
+    }
+    this.workers.clear();
+  }
+
+  run(message: OptWorkerMsg, receive: (data: WorkerReply) => void | Promise<void>,
+    terminal: WorkerReply['kind'] = 'done'): Promise<void> {
+    return new Promise((resolve, reject) => {
+      if (this.stopped) { reject(new Error('Worker batch stopped')); return; }
+      try {
+        const worker = makeWorker();
+        this.workers.set(worker, reject);
+        worker.onerror = (event) => this.cancel(event);
+        worker.onmessageerror = (event) => this.cancel(event);
+        worker.onmessage = (event: MessageEvent<WorkerReply>) => {
+          this.queue = this.queue.then(async () => {
+            if (this.stopped) return;
+            await receive(event.data);
+            if (event.data.kind === terminal) {
+              worker.onmessage = null;
+              worker.terminate();
+              this.workers.delete(worker);
+              resolve();
+            }
+          }).catch((err) => { this.callbackFailed = true; this.cancel(err); });
+        };
+        worker.postMessage(message);
+      } catch (err) {
+        this.cancel(err);
+        reject(err);
+      }
+    });
+  }
+
+  async finish(message: OptWorkerMsg): Promise<CncResult> {
+    let result: CncResult | undefined;
+    await this.run(message, (data) => {
+      if (data.kind === 'cnc-finished') result = data.result;
+    }, 'cnc-finished');
+    if (!result) throw new Error('Worker returned no CNC result');
+    return result;
+  }
+}
 
 /** Round-robin split of `items` into `n` chunks. */
 function chunk<T>(items: T[], n: number): T[][] {
@@ -70,7 +138,8 @@ export async function packMultiParallel(
 
   const optJob = effectiveJob(job);
   const objective: CutStrategy = job.cutStrategy ?? 'free';
-  const specs = buildTrialSchedule(job, restarts, seedOffset).map((t) => ({
+  const specs = buildTrialSchedule(job, restarts, seedOffset).map((t, idx) => ({
+    idx,
     orderIds: t.order.map((o) => o.id),
     heur: t.heur,
     binKind: t.binKind,
@@ -79,31 +148,30 @@ export async function packMultiParallel(
   const chunks = chunk(specs, poolSize(total));
 
   let best: MultiSheetResult | null = null;
+  const results: MultiSheetResult[] = [];
+  const batch = new WorkerBatch();
   let completed = 0;
   try {
-    await Promise.all(chunks.map((c) => new Promise<void>((resolve, reject) => {
-      const w = makeWorker();
-      const fail = (err: unknown) => { w.terminate(); reject(err); };
-      w.onerror = fail;
-      w.onmessage = async (e) => {
-        try {
-          if (e.data.kind === 'rect-trial') {
-            const current = e.data.result as MultiSheetResult;
-            const isNewBest = !best || isBetter(current, best, objective);
-            if (isNewBest) best = current;
-            await onProgress({ i: completed++, total, current, best: best!, isNewBest });
-          } else if (e.data.kind === 'done') {
-            w.terminate();
-            resolve();
-          }
-        } catch (err) { fail(err); }
-      };
-      w.postMessage({ kind: 'rect', job: optJob, trials: c });
+    await Promise.all(chunks.map((c) => batch.run({ kind: 'rect', job: optJob, trials: c }, async (data) => {
+      if (data.kind === 'rect-trial') {
+        const current = data.result;
+        results[data.idx] = current;
+        const isNewBest = !best || isBetter(current, best, objective);
+        if (isNewBest) best = current;
+        await onProgress({ i: completed++, total, current, best: best!, isNewBest });
+      }
     })));
   } catch (err) {
+    batch.cancel(err);
+    await batch.drain();
+    if (batch.callbackFailed) throw err;
     console.warn('Worker pool failed — falling back to single-core optimiser.', err);
-    return packMultiAnimated(job, restarts, onProgress);
+    return packMultiAnimated(job, restarts, onProgress, 4, seedOffset);
   }
+  // Replay in schedule order so equal-quality ties have the same winner as
+  // the sequential search, independently of CPU/worker completion order.
+  best = null;
+  for (const current of results) if (current && (!best || isBetter(current, best, objective))) best = current;
   return finishPack(job, best!);
 }
 
@@ -145,47 +213,30 @@ export async function packCncParallel(
   const saveLast = opt.saveLast ?? false;
 
   let best: CncSerialPass | null = null;
+  const results: CncSerialPass[] = [];
+  const batch = new WorkerBatch();
   let completed = 0;
   try {
-    await Promise.all(idxChunks.map((idxs) => new Promise<void>((resolve, reject) => {
-      const w = makeWorker();
-      const fail = (err: unknown) => { w.terminate(); reject(err); };
-      w.onerror = fail;
-      w.onmessage = async (e) => {
-        try {
-          if (e.data.kind === 'cnc-pass') {
-            const pass = e.data.pass as CncSerialPass;
-            const isNewBest = !best || serialPassBetter(pass, best, saveLast);
-            if (isNewBest) best = pass;
-            await onProgress({
-              trial: completed++,
-              total: totalSteps,
-              current: serialToSheets(pass),
-              best: serialToSheets(best!),
-              isNewBest,
-            });
-          } else if (e.data.kind === 'done') {
-            w.terminate();
-            resolve();
-          }
-        } catch (err) { fail(err); }
-      };
-      w.postMessage({ kind: 'cnc-passes', items, sheetW, sheetH, kerf, opt: wopt, attempts, orderingIdxs: idxs });
+    await Promise.all(idxChunks.map((idxs) => batch.run(
+      { kind: 'cnc-passes', items, sheetW, sheetH, kerf, opt: wopt, attempts, orderingIdxs: idxs }, async (data) => {
+        if (data.kind === 'cnc-pass') {
+          const pass = data.pass;
+          results[data.idx] = pass;
+          const isNewBest = !best || serialPassBetter(pass, best, saveLast);
+          if (isNewBest) best = pass;
+          await onProgress({
+            trial: completed++, total: totalSteps,
+            current: serialToSheets(pass), best: serialToSheets(best!), isNewBest,
+          });
+        }
     })));
 
+    best = null;
+    for (const pass of results) if (pass && (!best || serialPassBetter(pass, best, saveLast))) best = pass;
+    if (!best) throw new Error('Worker returned no CNC passes');
+
     // Consolidation + (save-last) compaction on one worker.
-    const result = await new Promise<CncResult>((resolve, reject) => {
-      const w = makeWorker();
-      const fail = (err: unknown) => { w.terminate(); reject(err); };
-      w.onerror = fail;
-      w.onmessage = (e) => {
-        if (e.data.kind === 'cnc-finished') {
-          w.terminate();
-          resolve(e.data.result as CncResult);
-        }
-      };
-      w.postMessage({ kind: 'cnc-finish', items, sheetW, sheetH, kerf, opt: wopt, winner: best! });
-    });
+    const result = await batch.finish({ kind: 'cnc-finish', items, sheetW, sheetH, kerf, opt: wopt, winner: best });
 
     await onProgress({
       trial: attempts,
@@ -196,8 +247,11 @@ export async function packCncParallel(
     });
     return result;
   } catch (err) {
+    batch.cancel(err);
+    await batch.drain();
+    if (batch.callbackFailed) throw err;
     console.warn('Worker pool failed — falling back to single-core CNC nest.', err);
-    return packCncAnimated(items, sheetW, sheetH, kerf, onProgress, opt);
+    return packCncAnimated(items, sheetW, sheetH, kerf, onProgress, wopt);
   }
 }
 
@@ -236,7 +290,7 @@ export async function packCncDeep(
   };
   const saveLast = opt.saveLast ?? false;
   let s = (0x9e3779b1 ^ Math.imul(seed + 7, 0xc2b2ae35)) >>> 0;
-  const rand = () => { s = (s * 1664525 + 1013904223) >>> 0; return s / 0xffffffff; };
+  const rand = () => { s = (s * 1664525 + 1013904223) >>> 0; return s / 0x100000000; };
 
   // Seed population: size-structured orders (the canonical search's best
   // openers) + shuffles, under alternating scan/placement policies.
@@ -298,27 +352,21 @@ export async function packCncDeep(
 
   // Evaluate one generation across the pool (contiguous chunks so the
   // worker's pass index maps back to a genome).
+  const batch = new WorkerBatch();
   const evalGen = async (genomes: CncOrderSpec[]): Promise<(CncSerialPass | null)[]> => {
     const n = Math.min(poolSize(genomes.length), genomes.length);
     const per = Math.ceil(genomes.length / n);
     const results: (CncSerialPass | null)[] = genomes.map(() => null);
-    await Promise.all(Array.from({ length: n }, (_, wi) => new Promise<void>((resolve, reject) => {
+    await Promise.all(Array.from({ length: n }, (_, wi) => {
       const lo = wi * per;
       const chunkOrders = genomes.slice(lo, lo + per);
-      if (chunkOrders.length === 0) { resolve(); return; }
-      const w = makeWorker();
-      const fail = (err: unknown) => { w.terminate(); reject(err); };
-      w.onerror = fail;
-      w.onmessage = (e) => {
-        if (e.data.kind === 'cnc-pass') {
-          results[lo + e.data.idx] = e.data.pass as CncSerialPass;
-        } else if (e.data.kind === 'done') {
-          w.terminate();
-          resolve();
+      if (chunkOrders.length === 0) return Promise.resolve();
+      return batch.run({ kind: 'cnc-orders', items, sheetW, sheetH, kerf, opt: wopt, orders: chunkOrders }, (data) => {
+        if (data.kind === 'cnc-pass') {
+          results[lo + data.idx] = data.pass;
         }
-      };
-      w.postMessage({ kind: 'cnc-orders', items, sheetW, sheetH, kerf, opt: wopt, orders: chunkOrders });
-    })));
+      });
+    }));
     return results;
   };
 
@@ -347,7 +395,8 @@ export async function packCncDeep(
       if (scored.length === 0 || Date.now() - startMs > GA_BUDGET_MS || gen === GA_GENS - 1) break;
       // Breed the next generation: rank, keep the elite, recombine the rest
       // with rank-weighted parents.
-      scored.sort((A, B) => (serialPassBetter(A.pass, B.pass, saveLast) ? -1 : 1));
+      scored.sort((A, B) => serialPassBetter(A.pass, B.pass, saveLast) ? -1
+        : serialPassBetter(B.pass, A.pass, saveLast) ? 1 : 0);
       const pick = (): CncOrderSpec => {
         const r = Math.floor(Math.pow(rand(), 2) * scored.length); // rank-biased
         return scored[Math.min(r, scored.length - 1)].g;
@@ -362,18 +411,7 @@ export async function packCncDeep(
     if (!best) throw new Error('GA produced no feasible pass');
 
     // Final squeeze on a worker, same as the canonical path.
-    const result = await new Promise<CncResult>((resolve, reject) => {
-      const w = makeWorker();
-      const fail = (err: unknown) => { w.terminate(); reject(err); };
-      w.onerror = fail;
-      w.onmessage = (e) => {
-        if (e.data.kind === 'cnc-finished') {
-          w.terminate();
-          resolve(e.data.result as CncResult);
-        }
-      };
-      w.postMessage({ kind: 'cnc-finish', items, sheetW, sheetH, kerf, opt: wopt, winner: best! });
-    });
+    const result = await batch.finish({ kind: 'cnc-finish', items, sheetW, sheetH, kerf, opt: wopt, winner: best });
     await onProgress({
       trial: totalSteps - 1,
       total: totalSteps,
@@ -383,7 +421,10 @@ export async function packCncDeep(
     });
     return result;
   } catch (err) {
+    batch.cancel(err);
+    await batch.drain();
+    if (batch.callbackFailed) throw err;
     console.warn('GA worker pool failed — falling back to single-core CNC nest.', err);
-    return packCncAnimated(items, sheetW, sheetH, kerf, onProgress, { ...opt, seed, extraEffort: true });
+    return packCncAnimated(items, sheetW, sheetH, kerf, onProgress, { ...wopt, seed, extraEffort: true });
   }
 }

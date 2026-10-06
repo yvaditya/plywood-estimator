@@ -217,8 +217,17 @@ animated path routes through the **multicore worker pool** (`optPool.ts` →
 5. **Multi-restart optimiser** (`buildTrialSchedule` + `packMulti` /
    `packMultiParallel`): every heuristic (BSSF, BLSF, BAF, BL) × area-desc
    and longest-side-desc orders, then seeded shuffles up to the restarts
-   budget. `seedOffset` shifts the shuffle stream for "Optimize further"
-   re-runs. The best result wins by the strategy-aware `isBetter`.
+   budget (including 1). `seedOffset` shifts the shuffle stream for
+   "Optimize further", also varying small-budget searches. The best result
+   wins by `isBetter`: unplaced → sheets → placed area, then the strategy's
+   objective. Area differences below 1e-6 mm² are rounding noise.
+   `repeated` uses `rip-shelf`: shelves accept parts with matching strip
+   widths and follow the stock's longer axis. `deriveRipCuts` emits all
+   full-length rips before recovering crosscuts inside each strip. It ranks
+   rip settings and changes first, then total settings, cuts and offcut.
+   Its reusable offcut is measured from empty leaves of the emitted cut
+   tree, so separate strip remnants cannot be counted as one large panel.
+   Corner repacking is skipped to preserve this two-stage strip layout.
 
 6. **Per-attempt packer** (`packOne`):
    The cabinet-builder fix here is critical — when a part doesn't fit
@@ -232,15 +241,15 @@ animated path routes through the **multicore worker pool** (`optPool.ts` →
    - **`ShelfBin`** — FFDH shelves; the min-cuts strategy (`guillotine`).
    - **`GuillotineBin`** (SAS splitter) — one of the bin kinds `guillotine`
      trials sweep, alongside shelf/shelf-v.
-   - **`packBeam`** — beam search over guillotine cut trees, always part of
-     the `guillotine` trial pool: keeps the K most promising partial
+   - **`packBeam`** — beam search over guillotine cut trees, included when
+     the saw-mode trial budget reaches the beam trials: keeps the K most promising partial
      layouts and branches on which part to cut next, its orientation, and the
      axis of the next full-span cut, discarding regions to waste when that's
      the better local call. One sheet is searched at a time (maximise area
      placed, then fewest cuts); it also runs the full greedy trial pool
      alongside it and only has to beat it. Slower than the greedy shelf/SAS
      trials, often finds fewer cuts. This was the separate
-     `guillotine-exact` strategy; it is unconditional now because on
+     `guillotine-exact` strategy. On
      `tests/nest_bench.mjs` it bought 0.10 sheets for 7x the time
      (506ms vs 75ms) — worth spending once, not worth asking the user
      to predict.
@@ -248,8 +257,9 @@ animated path routes through the **multicore worker pool** (`optPool.ts` →
 8. **Finish** (`finishPack`): `consolidateSheets` rebuilds live bins from
    finished sheets and tries to dissolve the least-filled sheet into the
    others' free space. Then, for EVERY strategy, the least-full remaining
-   sheet is moved to the end of the group and its parts corner-packed, so
-   the leftover is one clean rectangle.
+   sheet is moved to the end of the group. Its parts are corner-packed
+   only if the new arrangement improves the strategy's objective and,
+   for a saw mode, every panel remains separable by the cut tree.
 
    Both halves matter. Which sheet ends up last is an artefact of the
    objective — `free` and `cnc` happen to leave their slack there, while
@@ -259,13 +269,11 @@ animated path routes through the **multicore worker pool** (`optPool.ts` →
    free. Since `nest.ts` packs each thickness group separately, this lands
    on the last sheet OF EACH SIZE.
 
-   This replaced the `save-last` strategy. It is post-processing — same
-   parts, same sheet count, same cuts — so it cannot cost anything, which
-   is what makes it safe as a default. Benchmarked at +0.75 sheets over
-   the area bound with or without it. The matching `isBetter` preference
-   (leave less on the last sheet) sits at the BOTTOM of every strategy's
-   comparison chain, below sheets, cuts and yield, so it can never buy a
-   tidier remnant with a extra sheet.
+   Finishing does not mutate retained trial results. Consolidation clones
+   placements before mirroring; corner packing is scored before acceptance.
+   Offcut calculation uses coordinate compression and a histogram stack,
+   O(n²) over part edges instead of repeated all-part/all-span scans.
+   Sheet reordering does not affect quality comparisons.
 
 ### CNC path (`cnc`) — `cncNest.ts`
 
@@ -592,7 +600,8 @@ live part positions — a move invalidates them on its own.
 `#optimizeMoreBtn` re-runs `runEstimate({ seed: ++n, deepSearch: true })`:
 CNC routes to the genetic search (`packCncDeep`), saw strategies get
 doubled restarts + a fresh shuffle stream. The new result replaces
-`state.lastNest` only if strictly better (unplaced → sheets → yield);
+`state.lastNest` only if `isBetterNest` finds a strict improvement under
+the selected strategy, including better cuts or offcuts at equal yield;
 otherwise the previous layout is restored and the verdict shown in
 `detailSub`. Every click increments the seed — repeated clicks mine
 different regions of the search space.

@@ -5,6 +5,7 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
+    "test": "node --test ../tests/optimizer.test.mjs ../tests/thickness.test.mjs ../tests/stepExport.test.mjs",
     "build": "tsc -b && vite build",
     "preview": "vite preview"
   },

@@ -11,7 +11,7 @@
  * orientation (a valid closed manifold shell), which CAD/CAM importers accept.
  */
 
-import type { Vec2 } from './geometry';
+import type { Vec2, Vec3 } from './geometry';
 
 export interface StepPart {
   name: string;
@@ -21,6 +21,15 @@ export interface StepPart {
   holes: Vec2[][];
   /** Panel thickness, mm. */
   thickness: number;
+}
+
+export interface PlacedStepPart extends StepPart {
+  /** World position of local (0, 0, 0), in mm. */
+  origin: Vec3;
+  /** Orthonormal, right-handed local axes in world coordinates. */
+  uAxis: Vec3;
+  vAxis: Vec3;
+  normal: Vec3;
 }
 
 class StepWriter {
@@ -52,19 +61,84 @@ function unit(dx: number, dy: number, dz: number): [number, number, number] {
   return [dx / l, dy / l, dz / l];
 }
 
+/** STEP strings escape apostrophes by doubling them. Remove controls and
+ *  backslashes so a supplied name cannot introduce a STEP encoding directive. */
+function stepString(value: string): string {
+  return value.replace(/[\u0000-\u001f\u007f\\]/g, ' ').replace(/'/g, "''");
+}
+
+function assemblyReal(n: number): string {
+  if (!Number.isFinite(n)) throw new Error('Panel world geometry must be finite.');
+  const [mantissa, exponent] = String(n).split('e');
+  return (mantissa.includes('.') ? mantissa : `${mantissa}.0`) + (exponent ? `E${exponent}` : '');
+}
+
+function validatePlacedPart(part: PlacedStepPart): void {
+  const finiteVector = (v: number[], size: number) =>
+    Array.isArray(v) && v.length === size && v.every(Number.isFinite);
+  if (![part.origin, part.uAxis, part.vAxis, part.normal].every(v => finiteVector(v, 3))) {
+    throw new Error(`Panel "${part.name}" requires finite origin and frame vectors.`);
+  }
+  const dot = (a: Vec3, b: Vec3) => a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+  const u = part.uAxis, v = part.vAxis, n = part.normal;
+  const cross: Vec3 = [u[1] * v[2] - u[2] * v[1], u[2] * v[0] - u[0] * v[2], u[0] * v[1] - u[1] * v[0]];
+  const tolerance = 1e-8;
+  if ([u, v, n].some(axis => Math.abs(dot(axis, axis) - 1) > tolerance)
+    || Math.abs(dot(u, v)) > tolerance || Math.abs(dot(u, n)) > tolerance || Math.abs(dot(v, n)) > tolerance
+    || Math.hypot(cross[0] - n[0], cross[1] - n[1], cross[2] - n[2]) > tolerance) {
+    throw new Error(`Panel "${part.name}" requires an orthonormal right-handed frame.`);
+  }
+  if (!Number.isFinite(part.thickness) || part.thickness <= 0) {
+    throw new Error(`Panel "${part.name}" thickness must be finite and positive.`);
+  }
+  let area = 0;
+  for (const [index, ring] of [part.outer, ...part.holes].entries()) {
+    if (ring.length < 3 || !ring.every(p => finiteVector(p, 2))) {
+      throw new Error(`Panel "${part.name}" rings need at least three finite points.`);
+    }
+    let twiceArea = 0;
+    for (let i = 0; i < ring.length; i++) {
+      const a = ring[i], b = ring[(i + 1) % ring.length];
+      if (a[0] === b[0] && a[1] === b[1]) throw new Error(`Panel "${part.name}" ring has a zero-length edge.`);
+      twiceArea += (a[0] - ring[0][0]) * (b[1] - ring[0][1]) - (b[0] - ring[0][0]) * (a[1] - ring[0][1]);
+    }
+    if (!Number.isFinite(twiceArea) || (index === 0 ? twiceArea <= 0 : twiceArea >= 0)) {
+      throw new Error(`Panel "${part.name}" rings need positive area, with CCW outer and CW holes.`);
+    }
+    area += twiceArea / 2;
+  }
+  if (!(area > 0) || !Number.isFinite(area * part.thickness)) {
+    throw new Error(`Panel "${part.name}" geometry must have finite, positive volume.`);
+  }
+}
+
 /** Emit the topology + geometry for one extruded ring set and return the
  *  manifold_solid_brep id. */
-function emitPrism(w: StepWriter, part: StepPart, dx: number): number {
+function emitPrism(w: StepWriter, part: StepPart, dx: number, frame?: PlacedStepPart): number {
   const t = part.thickness > 0 ? part.thickness : 1;
   const rings: { pts: Vec2[] }[] = [
     { pts: part.outer },
     ...part.holes.map((h) => ({ pts: h })),
   ];
 
-  // Shared direction/point primitives.
-  const dirZ = w.e('DIRECTION(\'\',(0.0,0.0,1.0))');
-  const dirNZ = w.e('DIRECTION(\'\',(0.0,0.0,-1.0))');
-  const dirX = w.e('DIRECTION(\'\',(1.0,0.0,0.0))');
+  // Apply the same rigid frame to vertices, edge curves, and supporting planes.
+  // Legacy layout keeps its original six-decimal formatting.
+  const real = frame ? assemblyReal : f;
+  const vector = (x: number, y: number, z: number): Vec3 => frame ? [
+    frame.uAxis[0] * x + frame.vAxis[0] * y + frame.normal[0] * z,
+    frame.uAxis[1] * x + frame.vAxis[1] * y + frame.normal[1] * z,
+    frame.uAxis[2] * x + frame.vAxis[2] * y + frame.normal[2] * z,
+  ] : [x, y, z];
+  const direction = (x: number, y: number, z: number): number =>
+    w.e(`DIRECTION('',(${vector(x, y, z).map(real).join(',')}))`);
+  const point = (x: number, y: number, z: number): number => {
+    const p = vector(x, y, z);
+    if (frame) for (let axis = 0; axis < 3; axis++) p[axis] += frame.origin[axis];
+    return w.e(`CARTESIAN_POINT('',(${p.map(real).join(',')}))`);
+  };
+  const dirZ = direction(0, 0, 1);
+  const dirNZ = direction(0, 0, -1);
+  const dirX = direction(1, 0, 0);
 
   interface RingTopo { vb: number[]; vt: number[]; eb: number[]; et: number[]; ev: number[]; }
   const topos: RingTopo[] = [];
@@ -74,15 +148,15 @@ function emitPrism(w: StepWriter, part: StepPart, dx: number): number {
     const n = pts.length;
     const vb: number[] = [], vt: number[] = [];
     for (const [x, y] of pts) {
-      const pb = w.e(`CARTESIAN_POINT('',(${f(x + dx)},${f(y)},0.0))`);
-      const pt = w.e(`CARTESIAN_POINT('',(${f(x + dx)},${f(y)},${f(t)}))`);
+      const pb = point(x + dx, y, 0);
+      const pt = point(x + dx, y, t);
       vb.push(w.e(`VERTEX_POINT('',#${pb})`));
       vt.push(w.e(`VERTEX_POINT('',#${pt})`));
     }
     const mkEdge = (pa: number, pbV: number, ax: number, ay: number, az: number, ox: number, oy: number, oz: number): number => {
-      const d = w.e(`DIRECTION('',(${f(ax)},${f(ay)},${f(az)}))`);
+      const d = direction(ax, ay, az);
       const v = w.e(`VECTOR('',#${d},1.0)`);
-      const p = w.e(`CARTESIAN_POINT('',(${f(ox)},${f(oy)},${f(oz)}))`);
+      const p = point(ox, oy, oz);
       const line = w.e(`LINE('',#${p},#${v})`);
       return w.e(`EDGE_CURVE('',#${pa},#${pbV},#${line},.T.)`);
     };
@@ -113,7 +187,7 @@ function emitPrism(w: StepWriter, part: StepPart, dx: number): number {
 
   // Top cap (normal +Z): outer bound + hole bounds, all forward.
   {
-    const loc = w.e('CARTESIAN_POINT(\'\',(0.0,0.0,' + f(t) + '))');
+    const loc = point(0, 0, t);
     const ax = w.e(`AXIS2_PLACEMENT_3D('',#${loc},#${dirZ},#${dirX})`);
     const plane = w.e(`PLANE('',#${ax})`);
     const bounds: number[] = [];
@@ -125,7 +199,7 @@ function emitPrism(w: StepWriter, part: StepPart, dx: number): number {
   }
   // Bottom cap (normal -Z): outer bound + hole bounds, all reversed.
   {
-    const loc = w.e('CARTESIAN_POINT(\'\',(0.0,0.0,0.0))');
+    const loc = point(0, 0, 0);
     const ax = w.e(`AXIS2_PLACEMENT_3D('',#${loc},#${dirNZ},#${dirX})`);
     const plane = w.e(`PLANE('',#${ax})`);
     const bounds: number[] = [];
@@ -145,8 +219,8 @@ function emitPrism(w: StepWriter, part: StepPart, dx: number): number {
       const [x1, y1] = pts[i], [x2, y2] = pts[j];
       const [ux, uy] = unit(x2 - x1, y2 - y1, 0);
       // Outward (loop right-hand) normal for edge Bi->B(i+1): (uy,-ux,0).
-      const nrm = w.e(`DIRECTION('',(${f(uy)},${f(-ux)},0.0))`);
-      const loc = w.e(`CARTESIAN_POINT('',(${f(x1 + dx)},${f(y1)},0.0))`);
+      const nrm = direction(uy, -ux, 0);
+      const loc = point(x1 + dx, y1, 0);
       const ax = w.e(`AXIS2_PLACEMENT_3D('',#${loc},#${nrm},#${dirZ})`);
       const plane = w.e(`PLANE('',#${ax})`);
       const oe = [
@@ -162,7 +236,7 @@ function emitPrism(w: StepWriter, part: StepPart, dx: number): number {
   }
 
   const shell = w.e(`CLOSED_SHELL('',${w.refs(faces)})`);
-  const safeName = part.name.replace(/['\\]/g, ' ');
+  const safeName = frame ? stepString(part.name) : part.name.replace(/['\\]/g, ' ');
   return w.e(`MANIFOLD_SOLID_BREP('${safeName}',#${shell})`);
 }
 
@@ -171,6 +245,18 @@ function emitPrism(w: StepWriter, part: StepPart, dx: number): number {
  * Parts are spread along X so they don't overlap.
  */
 export function buildStep(parts: StepPart[], isoDate: string): string {
+  return buildStepDocument(parts, isoDate);
+}
+
+/** Export corrected panel solids in their assembly positions. Local footprint
+ *  (x, y) extrudes from z=0 to thickness along the supplied normal. */
+export function buildAssemblyStep(parts: PlacedStepPart[], isoDate: string, name = 'corrected_assembly'): string {
+  if (parts.length === 0) throw new Error('A corrected assembly needs at least one panel.');
+  parts.forEach(validatePlacedPart);
+  return buildStepDocument(parts, isoDate, { parts, name });
+}
+
+function buildStepDocument(parts: StepPart[], isoDate: string, assembly?: { parts: PlacedStepPart[]; name: string }): string {
   const w = new StepWriter();
 
   // Geometric context with mm units.
@@ -183,10 +269,15 @@ export function buildStep(parts: StepPart[], isoDate: string): string {
     `GLOBAL_UNIT_ASSIGNED_CONTEXT((#${lenUnit},#${angUnit},#${solUnit}))REPRESENTATION_CONTEXT('',''))`,
   );
 
-  // One solid per part, offset along X.
+  // One solid per part: preserve world placement for assemblies, or spread
+  // unplaced cutting parts along X using the existing layout.
   const solids: number[] = [];
   let dx = 0;
-  for (const p of parts) {
+  for (const [index, p] of parts.entries()) {
+    if (assembly) {
+      solids.push(emitPrism(w, p, 0, assembly.parts[index]));
+      continue;
+    }
     let minX = Infinity, maxX = -Infinity;
     for (const [x] of p.outer) { if (x < minX) minX = x; if (x > maxX) maxX = x; }
     if (!isFinite(minX)) { minX = 0; maxX = 0; }
@@ -205,7 +296,8 @@ export function buildStep(parts: StepPart[], isoDate: string): string {
   const appCtx = w.e('APPLICATION_CONTEXT(\'core data for automotive mechanical design processes\')');
   w.e(`APPLICATION_PROTOCOL_DEFINITION('international standard','automotive_design',2000,#${appCtx})`);
   const prodCtx = w.e(`PRODUCT_CONTEXT('',#${appCtx},'mechanical')`);
-  const prod = w.e(`PRODUCT('unplaced_parts','unplaced_parts','',(#${prodCtx}))`);
+  const productName = assembly ? stepString(assembly.name) : 'unplaced_parts';
+  const prod = w.e(`PRODUCT('${productName}','${productName}','',(#${prodCtx}))`);
   const prodDefCtx = w.e(`PRODUCT_DEFINITION_CONTEXT('part definition',#${appCtx},'design')`);
   const formation = w.e(`PRODUCT_DEFINITION_FORMATION('','',#${prod})`);
   const prodDef = w.e(`PRODUCT_DEFINITION('design','',#${formation},#${prodDefCtx})`);
@@ -217,8 +309,9 @@ export function buildStep(parts: StepPart[], isoDate: string): string {
   return [
     'ISO-10303-21;',
     'HEADER;',
-    "FILE_DESCRIPTION(('Unplaced parts from woodworking-companion'),'2;1');",
-    `FILE_NAME('unplaced-parts.step','${isoDate}',(''),(''),'woodworking-companion','woodworking-companion','');`,
+    assembly ? "FILE_DESCRIPTION(('Corrected panel assembly from woodworking-companion'),'2;1');"
+      : "FILE_DESCRIPTION(('Unplaced parts from woodworking-companion'),'2;1');",
+    `FILE_NAME('${assembly ? 'corrected-assembly' : 'unplaced-parts'}.step','${assembly ? stepString(isoDate) : isoDate}',(''),(''),'woodworking-companion','woodworking-companion','');`,
     "FILE_SCHEMA(('AUTOMOTIVE_DESIGN { 1 0 10303 214 1 1 1 1 }'));",
     'ENDSEC;',
     'DATA;',

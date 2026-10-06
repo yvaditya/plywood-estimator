@@ -25,7 +25,7 @@ import {
 export interface RectJobMsg {
   kind: 'rect';
   job: PackJob;
-  trials: { orderIds: string[]; heur: Heuristic; binKind?: BinKind }[];
+  trials: { idx: number; orderIds: string[]; heur: Heuristic; binKind?: BinKind }[];
 }
 export interface CncPassesMsg {
   kind: 'cnc-passes';
@@ -64,7 +64,7 @@ self.onmessage = (e: MessageEvent<OptWorkerMsg>) => {
     for (const t of msg.trials) {
       const order = t.orderIds.map((id) => byId.get(id)).filter(Boolean) as PackInput[];
       const result = packOne(msg.job, t.heur, order, t.binKind);
-      self.postMessage({ kind: 'rect-trial', result });
+      self.postMessage({ kind: 'rect-trial', idx: t.idx, result });
     }
     self.postMessage({ kind: 'done' });
   } else if (msg.kind === 'cnc-passes') {
