@@ -2,7 +2,7 @@
  * Geometry analysis for solid bodies extracted from STEP files.
  *
  * Pipeline per body:
- *   1. PCA-based oriented bounding box → axes + extents.
+ *   1. PCA-based oriented bounding box, refined to a source face plane.
  *   2. Smallest extent = thickness. The other two axes define the sheet plane.
  *   3. Filter triangles whose normal is parallel to the thickness axis
  *      and facing the same direction (top face).
@@ -35,12 +35,25 @@ export interface PolygonOutline {
   area: number;
 }
 
+export interface OutlineFrame {
+  /** World position of outline (0, 0) on the selected outward face. */
+  origin: Vec3;
+  /** Orthonormal axes, with cross(uAxis, vAxis) = normal. */
+  uAxis: Vec3;
+  vAxis: Vec3;
+  normal: Vec3;
+}
+
 export interface BodyAnalysis {
   thickness: number;      // mm
   width: number;          // mm  (smaller of the two non-thickness extents)
   length: number;         // mm  (larger of the two non-thickness extents)
   volume: number;         // mm³ (OBB volume — coarse estimate)
   outline: PolygonOutline;
+  /** Exact inverse of outline projection, auto-rotation, and origin shift. */
+  outlineFrame?: OutlineFrame;
+  /** Present when the source cannot be solved as a flat, constant-thickness board. */
+  caeUnsupportedReason?: string;
   /** Centroid of the body's AABB in world coords (for arrow anchors). */
   centerWorld: Vec3;
   /** DEPRECATED: kept for backwards compat with main.ts. Use faceCenter. */
@@ -199,6 +212,45 @@ function computeObb(positions: number[]): Obb {
   };
 }
 
+/** PCA depends on tessellation density. Recover the actual face plane from a
+ * source triangle, retaining the PCA in-plane direction for grain behaviour. */
+function alignObbToFace(positions: number[], indices: number[], obb: Obb): Obb {
+  const order = [0, 1, 2].sort((a, b) => obb.extents[a] - obb.extents[b]);
+  const [t, w, l] = order;
+  const reference = obb.axes[t];
+  let faceNormal = reference, largestArea = 0;
+  for (let i = 0; i < indices.length; i += 3) {
+    const point = (index: number): Vec3 => positions.slice(index * 3, index * 3 + 3) as Vec3;
+    const a = point(indices[i]), b = point(indices[i + 1]), c = point(indices[i + 2]);
+    const n = cross(sub(b, a), sub(c, a));
+    const area2 = Math.hypot(...n);
+    if (area2 <= largestArea) continue;
+    const alignment = dot(n, reference) / area2;
+    if (Math.abs(alignment) < 0.92) continue;
+    largestArea = area2;
+    faceNormal = n.map(value => value / area2 * Math.sign(alignment)) as Vec3;
+  }
+  if (!largestArea) return obb;
+  const along = dot(obb.axes[l], faceNormal);
+  const lengthAxis = norm(obb.axes[l].map((value, i) => value - along * faceNormal[i]) as Vec3);
+  let widthAxis = norm(cross(faceNormal, lengthAxis));
+  if (dot(widthAxis, obb.axes[w]) < 0) widthAxis = widthAxis.map(value => -value) as Vec3;
+  const axes = [...obb.axes] as [Vec3, Vec3, Vec3];
+  axes[t] = faceNormal; axes[l] = lengthAxis; axes[w] = widthAxis;
+  const mins: Vec3 = [Infinity, Infinity, Infinity], maxs: Vec3 = [-Infinity, -Infinity, -Infinity];
+  for (let i = 0; i < positions.length; i += 3) {
+    const p = sub(positions.slice(i, i + 3) as Vec3, obb.center);
+    for (let k = 0; k < 3; k++) {
+      const distance = dot(p, axes[k]);
+      mins[k] = Math.min(mins[k], distance); maxs[k] = Math.max(maxs[k], distance);
+    }
+  }
+  const center = [...obb.center] as Vec3;
+  for (let k = 0; k < 3; k++) for (let j = 0; j < 3; j++)
+    center[j] += axes[k][j] * (mins[k] + maxs[k]) / 2;
+  return { center, axes, extents: mins.map((value, k) => (maxs[k] - value) / 2) as Vec3 };
+}
+
 // ---------------------------------------------------------------------------
 // Boundary loop extraction from a triangle set.
 // ---------------------------------------------------------------------------
@@ -348,7 +400,7 @@ export function analyzeBody(mesh: OcctMesh): BodyAnalysis | null {
     worldThickness <= SHEET_THICKNESS_MAX_MM;
 
   // Always compute the PCA-OBB so we can sanity-check the world thickness.
-  const obb = computeObb(positions);
+  const obb = alignObbToFace(positions, indices, computeObb(positions));
   const obbIdxs = [0, 1, 2].sort((a, b) => obb.extents[a] - obb.extents[b]) as [number, number, number];
   const obbThin = obb.extents[obbIdxs[0]] * 2;
   const obbMid = obb.extents[obbIdxs[1]] * 2;
@@ -361,8 +413,8 @@ export function analyzeBody(mesh: OcctMesh): BodyAnalysis | null {
   // Tilt correction. The world AABB measures thickness along a world axis, so a
   // panel that leans even a couple of degrees has its thin extent inflated by a
   // slice of its own length/width (e.g. a 1/2" panel reads as 7/8" and gets
-  // split onto its own sheet). The OBB's least-variance axis stays perpendicular
-  // to the panel face regardless of tilt, so it recovers the true thickness.
+  // split onto its own sheet). Refining the OBB to a source face normal keeps
+  // its thin axis perpendicular to that face and recovers the true thickness.
   // When the OBB finds a meaningfully thinner — and still sheet-valid —
   // thickness, trust it over the (inflated) world reading.
   //
@@ -370,18 +422,88 @@ export function analyzeBody(mesh: OcctMesh): BodyAnalysis | null {
   // fires; the 0.9 guard also absorbs minor PCA/numerical wobble.
   const tiltInflated = obbIsSheet && obbThin < worldThickness * 0.9;
 
-  if (worldIsSheet && !tiltInflated) {
-    return analyzeAxisAligned(positions, indices, aabb, ext, thinIdx, bigIdx, midIdx);
+  const faceIsWorldAligned = Math.abs(obb.axes[obbIdxs[0]][thinIdx]) > 1 - 1e-10;
+  let analysis: BodyAnalysis;
+  if (worldIsSheet && ((!tiltInflated && faceIsWorldAligned) || !obbIsSheet)) {
+    analysis = analyzeAxisAligned(positions, indices, aabb, ext, thinIdx, bigIdx, midIdx);
+  } else if (obbIsSheet) {
+    // Use the actual face plane even for slight tilts whose AABB still looks
+    // like stock thickness. AABB centring cannot undo that projection error.
+    analysis = analyzeObb(positions, indices, obb);
+  } else {
+    // Not a sheet good (round leg, dowel, block, hardware, etc.) → skip.
+    return null;
   }
+  analysis.caeUnsupportedReason = planarExtrusionProblem(positions, indices, analysis);
+  return analysis;
+}
 
-  // Either the world axes don't show a sheet, or they over-report a tilted
-  // panel's thickness — use the OBB (handles tilted panels correctly).
-  if (obbIsSheet) {
-    return analyzeObb(positions, indices);
+/** A sheet-shaped bounding box alone is not evidence of a flat board. Check
+ * the source triangles, including side walls and both parallel end faces,
+ * before allowing CAE to extrude the extracted outline. */
+function planarExtrusionProblem(positions: number[], indices: number[], analysis: BodyAnalysis): string | undefined {
+  const frame = analysis.outlineFrame;
+  if (!frame || analysis.outline.area <= 0)
+    return 'CAE requires a closed planar board with two parallel faces and constant thickness.';
+  const normal = frame.normal;
+  const aabb = computeAabb(positions);
+  const span = Math.max(...sub(aabb.max, aabb.min));
+  // OCCT can supply float-precision tessellation coordinates. This tolerance
+  // allows that noise; the importer's 0.1 mm curve chord tolerance is separate.
+  const tolerance = Math.max(1e-5, span * 1e-6);
+  const points: Vec3[] = [], depths: number[] = [], vertexKeys: string[] = [];
+  let minDepth = Infinity, maxDepth = -Infinity;
+  for (let i = 0; i < positions.length; i += 3) {
+    const point = positions.slice(i, i + 3) as Vec3;
+    if (point.length !== 3 || point.some(value => !Number.isFinite(value)))
+      return 'The source solid contains invalid vertex coordinates.';
+    points.push(point);
+    const depth = dot(sub(point, frame.origin), normal);
+    depths.push(depth);
+    minDepth = Math.min(minDepth, depth); maxDepth = Math.max(maxDepth, depth);
+    vertexKeys.push(point.map((value, k) => Math.round((value - aabb.min[k]) / tolerance)).join(','));
   }
-
-  // Not a sheet good (round leg, dowel, block, hardware, etc.) → skip.
-  return null;
+  if (indices.length % 3) return 'The source solid has incomplete triangle data.';
+  const edges = new Map<string, { count: number; direction: number }>();
+  let topArea = 0, bottomArea = 0;
+  for (let i = 0; i < indices.length; i += 3) {
+    const tri = indices.slice(i, i + 3);
+    const [a, b, c] = tri.map(index => points[index]);
+    if (!a || !b || !c) return 'The source solid has invalid triangle indices.';
+    const ab = sub(b, a), ac = sub(c, a);
+    const n = cross(ab, ac), area2 = Math.hypot(...n);
+    if (area2 <= tolerance * tolerance) continue;
+    const normalArea2 = dot(n, normal);
+    const atTop = tri.every(index => Math.abs(depths[index] - maxDepth) <= tolerance);
+    const atBottom = tri.every(index => Math.abs(depths[index] - minDepth) <= tolerance);
+    if (atTop) {
+      if (normalArea2 <= 0) return 'The source solid has inconsistent outward face orientation.';
+      topArea += normalArea2 / 2;
+    } else if (atBottom) {
+      if (normalArea2 >= 0) return 'The source solid has inconsistent outward face orientation.';
+      bottomArea -= normalArea2 / 2;
+    } else if (Math.abs(normalArea2) > tolerance * Math.max(Math.hypot(...ab), Math.hypot(...ac))) {
+      return 'CAE supports only planar, constant-thickness boards; this solid has bevels, bent faces, or varying thickness.';
+    }
+    // STEP shares positions across face seams through separate vertex indices.
+    // Weld by geometry so real face seams do not look like open solid edges.
+    for (let j = 0; j < 3; j++) {
+      const from = vertexKeys[tri[j]], to = vertexKeys[tri[(j + 1) % 3]];
+      const forward = from < to, key = forward ? `${from}/${to}` : `${to}/${from}`;
+      const edge = edges.get(key) ?? { count: 0, direction: 0 };
+      edge.count++; edge.direction += forward ? 1 : -1;
+      edges.set(key, edge);
+    }
+  }
+  if ([...edges.values()].some(edge => edge.count !== 2 || edge.direction !== 0))
+    return 'The source solid is not closed: faces are missing, overlapping, or inconsistently connected.';
+  const areaTolerance = Math.max(tolerance * span * 4, analysis.outline.area * 1e-5);
+  if (topArea <= areaTolerance || bottomArea <= areaTolerance
+    || Math.abs(topArea - bottomArea) > areaTolerance
+    || Math.abs(topArea - analysis.outline.area) > areaTolerance) {
+    return 'CAE requires matching parallel planar faces with the same outline and through-holes.';
+  }
+  return undefined;
 }
 
 // ---------------------------------------------------------------------------
@@ -441,6 +563,7 @@ function analyzeAxisAligned(
   }
 
   let outline: PolygonOutline;
+  let outlineFrame: OutlineFrame | undefined;
   if (topTris.length < 1) {
     const outer: Vec2[] = [
       [0, 0],
@@ -450,7 +573,7 @@ function analyzeAxisAligned(
     ];
     outline = { outer, holes: [], bbox: { w: length, h: width }, area: length * width };
   } else {
-    outline = buildOutline(positions, topTris, lengthDir, widthDir);
+    ({ outline, outlineFrame } = buildOutline(positions, topTris, lengthDir, widthDir, faceNormal));
   }
 
   // AABB centroid (volume center)
@@ -470,7 +593,7 @@ function analyzeAxisAligned(
   return {
     thickness, width, length,
     volume: thickness * width * length,
-    outline,
+    outline, outlineFrame,
     centerWorld,
     topZ: aabb.max[2], // legacy
     lengthAxisIsX: bigIdx === 0, // legacy
@@ -484,8 +607,7 @@ function analyzeAxisAligned(
 // ---------------------------------------------------------------------------
 // OBB fallback (for parts that aren't aligned with Z up)
 // ---------------------------------------------------------------------------
-function analyzeObb(positions: number[], indices: number[]): BodyAnalysis {
-  const obb = computeObb(positions);
+function analyzeObb(positions: number[], indices: number[], obb: Obb): BodyAnalysis {
   const idxs = [0, 1, 2].sort((a, b) => obb.extents[a] - obb.extents[b]);
   const tAxisIdx = idxs[0];
   const wAxisIdx = idxs[1];
@@ -514,6 +636,7 @@ function analyzeObb(positions: number[], indices: number[]): BodyAnalysis {
   }
 
   let outline: PolygonOutline;
+  let outlineFrame: OutlineFrame | undefined;
   if (topTris.length < 1) {
     const outer: Vec2[] = [
       [0, 0],
@@ -523,7 +646,7 @@ function analyzeObb(positions: number[], indices: number[]): BodyAnalysis {
     ];
     outline = { outer, holes: [], bbox: { w: length, h: width }, area: length * width };
   } else {
-    outline = buildOutline(positions, topTris, lAxis, wAxis);
+    ({ outline, outlineFrame } = buildOutline(positions, topTris, lAxis, wAxis, tAxis));
   }
 
   // World-axis AABB for arrow placement (OBB axes for face vectors below).
@@ -538,15 +661,15 @@ function analyzeObb(positions: number[], indices: number[]): BodyAnalysis {
   const cx = (minX + maxX) / 2;
   const cy = (minY + maxY) / 2;
   const cz = (minZ + maxZ) / 2;
-  const halfThick = thickness / 2;
+  const toFace = dot(obb.center, tAxis) + thickness / 2 - dot([cx, cy, cz], tAxis);
   return {
     thickness, width, length,
     volume: thickness * width * length,
-    outline,
+    outline, outlineFrame,
     centerWorld: [cx, cy, cz],
     topZ: maxZ,
     lengthAxisIsX: (maxX - minX) >= (maxY - minY),
-    faceCenter: [cx + tAxis[0] * halfThick, cy + tAxis[1] * halfThick, cz + tAxis[2] * halfThick],
+    faceCenter: [cx + tAxis[0] * toFace, cy + tAxis[1] * toFace, cz + tAxis[2] * toFace],
     faceNormal: tAxis,
     lengthDir: lAxis,
     widthDir: wAxis,
@@ -558,8 +681,25 @@ function buildOutline(
   topTris: number[][],
   uAxis: Vec3, // becomes 2D X
   vAxis: Vec3, // becomes 2D Y
-): PolygonOutline {
-  const loops3 = buildBoundaryLoops(topTris);
+  normal: Vec3,
+): { outline: PolygonOutline; outlineFrame?: OutlineFrame } {
+  // An outward face and CCW outline must form a right-handed solver frame.
+  // The legacy length/width axes can have either handedness (e.g. a +Y face).
+  if (dot(cross(uAxis, vAxis), normal) < 0) vAxis = vAxis.map(value => -value) as Vec3;
+  // OCCT stores separate vertex indices on adjacent BREP faces. Weld their
+  // coincident vertices before removing internal edges of a split planar cap.
+  const bounds = computeAabb(positions);
+  const tolerance = Math.max(1e-5, Math.max(...sub(bounds.max, bounds.min)) * 1e-6);
+  const representatives = new Map<string, number>();
+  const weldedTris = topTris.map(tri => tri.map(index => {
+    const key = positions.slice(index * 3, index * 3 + 3)
+      .map((value, k) => Math.round((value - bounds.min[k]) / tolerance)).join(',');
+    const existing = representatives.get(key);
+    if (existing !== undefined) return existing;
+    representatives.set(key, index);
+    return index;
+  }));
+  const loops3 = buildBoundaryLoops(weldedTris);
 
   // Project each vertex of each loop onto the (u, v) plane.
   const project = (vi: number): Vec2 => {
@@ -572,7 +712,7 @@ function buildOutline(
   rings = rings.map((r) => simplifyRing(r, 1e-3)).filter((r) => r.length >= 3);
 
   if (rings.length === 0) {
-    return { outer: [], holes: [], bbox: { w: 0, h: 0 }, area: 0 };
+    return { outline: { outer: [], holes: [], bbox: { w: 0, h: 0 }, area: 0 } };
   }
 
   // Choose outer = ring with the largest |signed area|
@@ -604,6 +744,10 @@ function buildOutline(
     const rad = -rotateBy * Math.PI / 180;
     outer = rotateRing2(outer, rad);
     holesNorm = holesNorm.map((h) => rotateRing2(h, rad));
+    const c = Math.cos(rad), s = Math.sin(rad);
+    const previousU = uAxis;
+    uAxis = uAxis.map((value, i) => c * value - s * vAxis[i]) as Vec3;
+    vAxis = vAxis.map((value, i) => s * previousU[i] + c * value) as Vec3;
   }
 
   // Shift so outer ring sits in positive quadrant anchored at (0,0).
@@ -625,12 +769,15 @@ function buildOutline(
   let area = Math.abs(signedArea(outer));
   for (const hole of shiftedHoles) area -= Math.abs(signedArea(hole));
 
-  return {
+  const first = topTris[0][0] * 3;
+  const faceDistance = dot(positions.slice(first, first + 3) as Vec3, normal);
+  const origin = normal.map((value, i) => value * faceDistance + minX * uAxis[i] + minY * vAxis[i]) as Vec3;
+  return { outline: {
     outer,
     holes: shiftedHoles,
     bbox: { w, h },
     area: Math.max(area, 0),
-  };
+  }, outlineFrame: { origin, uAxis, vAxis, normal } };
 }
 
 /**
@@ -643,8 +790,9 @@ function buildOutline(
  * Diamond rotated 45° → 45°.
  */
 function dominantEdgeAngleMod90(outer: Vec2[]): number {
-  const BINS = 180; // 0.5° resolution
+  const BINS = 180; // 0.5° grouping, without quantizing the recovered direction
   const hist = new Float64Array(BINS);
+  const angleTotals = new Float64Array(BINS);
   const n = outer.length;
   for (let i = 0; i < n; i++) {
     const [x1, y1] = outer[i];
@@ -656,10 +804,13 @@ function dominantEdgeAngleMod90(outer: Vec2[]): number {
     a = ((a % 90) + 90) % 90; // fold to [0, 90)
     const bin = Math.min(BINS - 1, Math.floor(a * (BINS / 90)));
     hist[bin] += len;
+    angleTotals[bin] += len * a;
   }
   let maxBin = 0;
   for (let i = 1; i < BINS; i++) if (hist[i] > hist[maxBin]) maxBin = i;
-  return maxBin * (90 / BINS);
+  // A rectangle at 23.3° must recover its real edges and dimensions, rather
+  // than inherit a 23.0° material frame from the lower edge of the bin.
+  return hist[maxBin] > 0 ? angleTotals[maxBin] / hist[maxBin] : 0;
 }
 
 function rotateRing2(ring: Vec2[], rad: number): Vec2[] {

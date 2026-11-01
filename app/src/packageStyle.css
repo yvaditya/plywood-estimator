@@ -1,0 +1,324 @@
+:root{--paper:#f5f5f7;--ink:#1d1d1f;--muted:#6e6e73;--line:#e5e5ea;--blue:#0071e3;--accent:#0071e3;--white:#fff;font-family:'Helvetica Neue',Helvetica,-apple-system,BlinkMacSystemFont,'Segoe UI',Arial,sans-serif;color:var(--ink);background:var(--paper);font-synthesis:none;-webkit-font-smoothing:antialiased;text-rendering:optimizeLegibility}
+*{box-sizing:border-box}
+body{margin:0}
+button,input,select{font:inherit}
+button,select,input[type=search]{border:1px solid var(--line);border-radius:10px;background:var(--white);color:var(--ink);min-height:44px}
+button{cursor:pointer;padding:9px 13px;font-weight:600;transition:background .15s}
+button:hover{background:#f0f0f4}
+button:disabled{opacity:.45;cursor:default}
+button:focus-visible,input:focus-visible,select:focus-visible,.sheet-part:focus-visible{outline:3px solid #0071e380;outline-offset:3px}
+input[type=checkbox]{width:22px;height:22px;accent-color:var(--blue);cursor:pointer}
+input[type=range]{accent-color:var(--blue);min-width:50px;min-height:44px;cursor:pointer}
+h1,h2,h3,p{margin:0}
+h1{font-size:clamp(24px,2.5vw,34px);font-weight:400;line-height:1.15;overflow-wrap:anywhere}
+h2{font-size:30px;font-weight:400;letter-spacing:-.5px}
+h3{font-size:19px;letter-spacing:-.3px}
+.eyebrow{font-size:10px;letter-spacing:1.6px;font-weight:700;color:var(--muted);line-height:1.5;margin-bottom:5px}
+.muted,.fine-print{color:var(--muted);font-size:12px;line-height:1.55}
+.fine-print{margin-top:12px}
+.job-header{display:flex;align-items:center;gap:19px;padding:26px 36px 22px;border-bottom:1px solid var(--line)}
+.brand-mark{border:1px solid var(--ink);padding:10px 9px;font-size:20px;letter-spacing:-2px;white-space:nowrap}
+.brand-mark span{color:#0071e3;padding:0 3px}
+.job-heading{min-width:0;flex:1}
+.job-meta{display:flex;flex-direction:column;gap:6px;font-size:11px;color:var(--muted);text-align:right}
+.job-meta strong{color:var(--ink);font-size:13px;font-weight:600}
+.job-meta strong span{padding:0 9px;color:var(--muted)}
+.workflow{display:flex;align-items:center;gap:12px;padding:15px 36px;border-bottom:1px solid var(--line);background:#ececef}
+.stage{display:flex;gap:13px;align-items:center;border-color:transparent;background:transparent;text-align:left;padding:10px 20px}
+.stage.active{background:var(--blue);color:white}
+.stage-number{font-size:26px;font-weight:500;font-variant-numeric:tabular-nums;opacity:.7}
+.stage strong{display:block;font-size:15px}
+.stage small{display:block;font-size:11px;font-weight:400;opacity:.75;margin-top:3px}
+.stage-arrow{color:#aeaeb2}
+.job-progress{margin-left:auto;display:flex;flex-direction:column;gap:7px;font-size:11px;color:var(--muted)}
+progress{width:200px;height:5px;border:0;border-radius:12px;overflow:hidden;accent-color:var(--blue)}
+progress::-webkit-progress-bar{background:#d6d6dc}
+progress::-webkit-progress-value{background:var(--blue)}
+.stage-intro{display:flex;justify-content:space-between;gap:25px;align-items:center;padding:25px 36px 21px}
+.stage-intro>p{max-width:380px;color:var(--muted);font-size:12px;line-height:1.7}
+.panel{min-width:0;background:var(--white);border:1px solid var(--line);border-radius:20px;padding:20px}
+.panel-heading{display:flex;justify-content:space-between;align-items:center;gap:10px;margin-bottom:13px}
+.panel-heading select{max-width:48%;padding:7px;font-size:12px}
+.panel-heading button{font-size:12px}
+.panel-heading .eyebrow{font-size:9px;letter-spacing:1.3px}
+#workspace{display:grid;grid-template-columns:minmax(0,1fr) minmax(400px,.93fr);gap:18px;padding:0 36px}
+.drawing-panel{grid-row:span 2}
+.selected-details{grid-column:2}
+#assembly-panel{display:none}
+#workspace[data-stage=assembly] #cuts-panel{display:none}
+#workspace[data-stage=assembly] #assembly-panel{display:block}
+.table-scroll{overflow:auto;max-height:380px;border:1px solid var(--line);border-radius:12px}
+.inventory-table{border-collapse:collapse;width:100%;font-size:12px}
+.inventory-table thead{position:sticky;top:0;z-index:1;background:#f5f5f7}
+.inventory-table thead th{font-size:9px;text-transform:uppercase;letter-spacing:.6px;white-space:nowrap;color:var(--muted);padding:10px 8px;text-align:left}
+.inventory-table tbody th,.inventory-table td{border-top:1px solid var(--line);padding:9px 7px;text-align:left}
+.inventory-table tbody th{font-weight:400;min-width:142px}
+.inventory-table tr.selected{background:#edf5ff}
+.inventory-table td.numeric{text-align:center}
+.dimensions{font-variant-numeric:tabular-nums;font-size:11px;white-space:nowrap;line-height:1.5}
+.dimensions span{color:var(--muted)}
+.part-select{display:flex;gap:9px;align-items:center;text-align:left;padding:0;background:none;border:0;min-height:44px;width:100%;font-weight:500}
+.part-select:hover{background:none}
+.part-code{display:inline-flex;align-items:center;justify-content:center;flex-shrink:0;min-width:31px;min-height:32px;background:#fff;border:1px solid var(--line);border-left:4px solid var(--part-color);border-radius:10px;padding:3px 6px;font-size:12px;font-weight:600;font-variant-numeric:tabular-nums;color:var(--ink)}
+.part-name{font-size:12px;overflow-wrap:anywhere}
+.part-name small{display:block;font-size:10px;line-height:1.4;color:var(--muted);margin-top:3px}
+.inventory-tools{display:flex;gap:8px;margin-bottom:13px}
+.inventory-tools input{min-width:0;width:100%;padding:9px 11px;font-size:12px}
+.inventory-tools select{font-size:11px;max-width:130px;padding:5px}
+.count-badge{border:1px solid var(--line);font-size:14px;font-variant-numeric:tabular-nums;padding:6px 9px;border-radius:4px}
+.detail-title{display:flex;align-items:center;gap:13px}
+.detail-title>.part-code{font-size:18px;min-width:48px;min-height:51px}
+.detail-title h3{overflow-wrap:anywhere}
+.detail-title .muted{font-size:11px}
+.part-facts{display:flex;gap:16px;flex-wrap:wrap;margin:18px 0}
+.part-facts dt{font-size:9px;color:var(--muted);text-transform:uppercase;letter-spacing:.5px;margin-bottom:5px}
+.part-facts dd{font-size:12px;font-variant-numeric:tabular-nums;margin:0}
+.detail-actions{display:flex;flex-wrap:wrap;gap:8px}
+.detail-actions button{font-size:11px}
+.primary{background:var(--blue);color:white;border-color:var(--blue)}
+.primary:hover{background:#0077ed}
+.segment-note{font-size:12px;background:#fbf2d7;padding:9px;margin-bottom:12px;line-height:1.5}
+.drawing-tools{display:flex;align-items:center;gap:7px;margin:12px 0;font-size:11px}
+.drawing-tools button{padding:5px 12px;min-height:36px}
+.drawing-tools>span:last-child{margin-left:auto;color:var(--muted);font-size:10px;max-width:130px;line-height:1.4}
+#sheet-scroll{overflow:auto;height:450px;background:#f7f7f9;border:1px solid var(--line);border-radius:12px}
+#sheet-drawing{height:100%;padding:18px;min-width:100%}
+#sheet-drawing svg{width:100%;height:100%;display:block;overflow:visible}
+#sheet-drawing[style*="150"] svg,#sheet-drawing[style*="200"] svg,#sheet-drawing[style*="250"] svg,#sheet-drawing[style*="300"] svg,#sheet-drawing[style*="350"] svg,#sheet-drawing[style*="400"] svg{height:auto;min-height:100%}
+.sheet-part{cursor:pointer}
+.sheet-part path{stroke:#65656d;stroke-width:.8;vector-effect:non-scaling-stroke;fill-opacity:.62}
+.sheet-part text{pointer-events:none;font-family:inherit;font-variant-numeric:tabular-nums;font-weight:700;fill:#1d1d1f;paint-order:stroke;stroke:#fff;stroke-width:2;stroke-linejoin:round}
+.sheet-part.selected path{stroke:#0071e3;stroke-width:3;fill-opacity:1}
+.sheet-part:hover path{fill-opacity:1}
+.cut-overlay{pointer-events:none}
+.cut-step{display:flex;align-items:center;gap:16px;padding:17px 0;min-height:104px}
+.cut-number{font-size:26px;font-weight:500;font-variant-numeric:tabular-nums;color:#0071e3;min-width:36px}
+.cut-step strong{font-size:20px;font-weight:600;letter-spacing:-.4px}
+.cut-step p:not(.eyebrow){font-size:11px;color:var(--muted);margin-top:6px;line-height:1.5}
+.cut-controls{display:flex;gap:8px}
+.cut-controls select{flex:1;min-width:0;font-size:12px;padding:6px}
+.cut-controls button{font-size:11px;white-space:nowrap}
+#model{position:relative;min-height:330px;height:480px;border:1px solid var(--line);border-radius:10px;overflow:hidden;background:radial-gradient(ellipse at 50% 35%,#fff,#f0f1f5)}
+#model canvas{display:block;width:100%;height:100%;touch-action:none}
+.model-hint{position:absolute;left:12px;right:12px;bottom:12px;z-index:1;font-size:10px;color:#6e6e73;text-align:center;pointer-events:none}
+.model-controls{display:flex;align-items:center;gap:12px;padding:12px 0}
+.model-controls label{font-size:12px;font-weight:600}
+.model-controls input{flex:1}
+.model-controls output{font-size:12px;font-variant-numeric:tabular-nums;width:36px}
+.model-actions{display:flex;gap:8px}
+.model-actions button{font-size:12px}
+button[aria-pressed=true]:not(.stage){background:#edf5ff;border-color:#c8dff9}
+.model-error{position:absolute;left:15px;right:15px;top:30%;padding:20px;border:1px solid var(--line);background:var(--white);line-height:1.7;font-size:13px;text-align:center}
+.empty{padding:30px;color:var(--muted);font-size:13px}
+.package-footer{display:flex;justify-content:space-between;gap:20px;padding:22px 36px;color:var(--muted);font-size:10px;line-height:1.6}
+.mobile-switch{display:none}
+.sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}
+
+@media(max-width:1100px){#workspace{grid-template-columns:minmax(0,1fr);padding:0 24px}
+.drawing-panel{grid-row:auto}
+.selected-details{grid-column:1}
+#inventory-panel{grid-row:auto}
+.table-scroll{max-height:360px}
+.job-header,.workflow{padding-left:24px;padding-right:24px}
+.stage-intro{padding-left:24px;padding-right:24px}
+.stage-intro>p{max-width:300px}
+#sheet-scroll{height:440px}
+.package-footer{padding-left:24px;padding-right:24px}
+.stage{padding:10px 14px}
+.job-progress progress{width:140px}
+}
+
+html[data-layout=phone] .brand-mark{display:none}
+html[data-layout=phone] .job-header{padding:20px 18px 16px;align-items:flex-start}
+html[data-layout=phone] .job-meta{font-size:9px;max-width:90px}
+html[data-layout=phone] .job-meta strong{font-size:10px;line-height:1.5}
+html[data-layout=phone] .job-meta strong span{padding:0 2px}
+html[data-layout=phone] h1{font-size:25px}
+html[data-layout=phone] .job-heading .eyebrow{font-size:8px;letter-spacing:1.1px}
+html[data-layout=phone] .workflow{padding:10px 12px;gap:8px;flex-wrap:wrap;position:sticky;top:0;z-index:3}
+html[data-layout=phone] .stage{flex:1;gap:9px;padding:10px;min-width:130px}
+html[data-layout=phone] .stage-number{font-size:22px}
+html[data-layout=phone] .stage strong{font-size:13px}
+html[data-layout=phone] .stage small{font-size:9px}
+html[data-layout=phone] .stage-arrow{display:none}
+html[data-layout=phone] .job-progress{flex-basis:100%;flex-direction:row;align-items:center;justify-content:space-between;padding:2px 2px 0;font-size:10px}
+html[data-layout=phone] .job-progress progress{width:95px}
+html[data-layout=phone] .stage-intro{padding:19px 18px 15px;display:block}
+html[data-layout=phone] h2{font-size:27px}
+html[data-layout=phone] .stage-intro>p{max-width:none;font-size:11px;line-height:1.6;margin-top:8px}
+html[data-layout=phone] .mobile-switch{display:flex;gap:8px;padding:0 12px 12px}
+html[data-layout=phone] .mobile-switch button{flex:1;font-size:12px}
+html[data-layout=phone] body[data-stage=assembly] .mobile-switch{display:none}
+html[data-layout=phone] #workspace{display:flex;flex-direction:column;padding:0 12px;gap:12px}
+html[data-layout=phone] .panel{padding:15px;border-radius:10px}
+html[data-layout=phone] #workspace[data-stage=cutting][data-mobile-view=cuts] #inventory-panel{display:none}
+html[data-layout=phone] #workspace[data-stage=cutting][data-mobile-view=parts] #cuts-panel{display:none}
+html[data-layout=phone] #workspace[data-stage=assembly] #inventory-panel{display:block}
+html[data-layout=phone] #workspace[data-stage=assembly] #selected-details{order:1}
+html[data-layout=phone] #workspace[data-stage=assembly] #inventory-panel{order:2}
+html[data-layout=phone] .panel-heading h3{font-size:18px}
+html[data-layout=phone] .panel-heading .eyebrow{font-size:8px}
+html[data-layout=phone] #sheet-scroll{height:360px}
+html[data-layout=phone] .cut-controls{gap:5px}
+html[data-layout=phone] .cut-controls button{padding:8px;font-size:11px}
+html[data-layout=phone] .drawing-tools>span:last-child{font-size:9px;max-width:104px}
+html[data-layout=phone] .drawing-tools button{min-height:44px;padding:6px 11px}
+html[data-layout=phone] .cut-step strong{font-size:18px}
+html[data-layout=phone] #model{height:390px;min-height:260px}
+html[data-layout=phone] .model-controls{gap:7px}
+html[data-layout=phone] .model-controls label{font-size:11px}
+html[data-layout=phone] .inventory-table{min-width:490px}
+html[data-layout=phone] .table-scroll{max-height:440px}
+html[data-layout=phone] .part-facts{gap:14px}
+html[data-layout=phone] .package-footer{padding:17px 18px max(22px,env(safe-area-inset-bottom));display:block}
+html[data-layout=phone] .package-footer span{display:block;margin-top:5px}
+html[data-layout=phone] .detail-actions button{flex-grow:1}
+html[data-layout=phone] .inventory-tools select{max-width:110px}
+html[data-layout=phone] .selected-details{scroll-margin-top:120px}
+html[data-layout=phone] .drawing-panel{scroll-margin-top:120px}
+
+@media(max-width:600px){html[data-layout=pc] .job-meta{display:none}
+html[data-layout=pc] .stage-intro{display:block}
+html[data-layout=pc] .stage-intro>p{margin-top:10px}
+html[data-layout=pc] .job-progress{display:none}
+html[data-layout=pc] .workflow{gap:3px;padding:10px}
+html[data-layout=pc] .stage{flex:1;padding:9px}
+html[data-layout=pc] #workspace{padding:0 10px}
+html[data-layout=pc] .inventory-table{min-width:470px}
+}
+
+@media(prefers-reduced-motion:reduce){*{transition:none!important;scroll-behavior:auto!important}
+}
+
+@media print{.workflow,.mobile-switch,.inventory-tools,.drawing-tools,.cut-controls,.detail-actions,.model-controls,.model-actions,.package-footer{display:none!important}
+.job-header,.stage-intro{padding:12px}
+#workspace{display:block;padding:0}
+.panel{break-inside:avoid;margin-bottom:15px}
+#inventory-panel,#cuts-panel{display:block!important}
+.table-scroll{max-height:none;overflow:visible}
+.inventory-table{min-width:0!important}
+#assembly-panel,#selected-details{display:none!important}
+#sheet-scroll{height:500px}
+}
+
+html[data-layout=phone] .inventory-table tbody th{position:sticky;left:0;z-index:1;background:var(--white);box-shadow:2px 0 0 var(--line)}
+html[data-layout=phone] .inventory-table tbody tr.selected th{background:#edf5ff}
+html[data-layout=phone] .inventory-table thead th:first-child{position:sticky;left:0;z-index:2;background:#f5f5f7}
+html[data-layout=phone] .part-name{font-size:13px}
+html[data-layout=phone] .inventory-table tbody th{width:145px;min-width:145px;max-width:145px}
+html[data-layout=phone] .part-code{font-size:13px}
+html[data-layout=phone] .table-scroll{scroll-padding-left:148px}
+html[data-layout=phone] #sheet-scroll{height:300px}
+
+.sheet-part.related path{stroke:#0071e3;stroke-width:2;stroke-dasharray:4 3;fill-opacity:.85}
+
+/* Helvetica typography and quiet, native-style chrome for both offline editions. */
+#app { max-width: 1720px; margin: 0 auto; }
+h1 { font-weight: 600; letter-spacing: -.9px; }
+h2 { font-weight: 600; letter-spacing: -.8px; }
+h3 { font-weight: 600; }
+.eyebrow { letter-spacing: .5px; font-weight: 500; font-size: 11px; }
+button { font-weight: 500; transition: background .15s, border-color .15s, box-shadow .15s; }
+button:active { background: #e8e8ed; }
+button.primary:active { background: #0063c7; }
+.job-header { padding-top: 30px; padding-bottom: 26px; gap: 16px; border-bottom: 0; }
+.brand-mark { display: grid; place-items: center; flex-shrink: 0; width: 50px; height: 50px; padding: 0; color: var(--blue); border: 1px solid #dce9fa; border-radius: 14px; background: linear-gradient(#fff,#eef5ff); box-shadow: 0 2px 5px #00000006; }
+.brand-mark svg { width: 29px; height: 29px; }
+.job-meta { font-size: 12px; }
+.job-meta strong { font-weight: 500; }
+.workflow { gap: 8px; border-top: 1px solid var(--line); padding-top: 12px; padding-bottom: 12px; }
+.stage { border-radius: 13px; gap: 11px; padding: 11px 18px; }
+.stage.active { background: var(--white); color: var(--ink); border-color: #dedee4; box-shadow: 0 2px 5px #00000009; }
+.stage-number { display: grid; place-items: center; min-width: 29px; height: 29px; border-radius: 50%; font-size: 12px; font-weight: 600; background: #dcdce2; color: #55555b; opacity: 1; }
+.stage.active .stage-number { color: white; background: var(--blue); }
+.stage strong { font-size: 14px; font-weight: 600; }
+.stage small { color: var(--muted); opacity: 1; margin-top: 4px; }
+.stage-arrow { display: none; }
+.job-progress { font-size: 12px; font-variant-numeric: tabular-nums; }
+progress::-moz-progress-bar { background: var(--blue); }
+.stage-intro { padding-top: 30px; padding-bottom: 24px; }
+.stage-intro > p { font-size: 13px; line-height: 1.65; }
+.panel { padding: 22px; border-color: #e8e8ed; box-shadow: 0 3px 14px #00000003; }
+.panel-heading { margin-bottom: 17px; }
+.panel-heading .eyebrow { font-size: 10px; letter-spacing: .35px; }
+#workspace { gap: 20px; }
+.table-scroll { max-height: 400px; }
+.inventory-table { font-size: 13px; }
+.inventory-table thead th { font-size: 11px; text-transform: none; letter-spacing: 0; font-weight: 500; padding: 12px 8px; }
+.inventory-table tbody th, .inventory-table td { padding: 10px 8px; }
+.inventory-table td.numeric { font-variant-numeric: tabular-nums; }
+.dimensions { font-size: 12px; line-height: 1.55; }
+.part-name { font-size: 13px; }
+.part-name small { font-size: 11px; font-weight: 400; margin-top: 4px; }
+.part-select[aria-pressed=true] { background: none !important; }
+.inventory-tools { margin-bottom: 16px; }
+.inventory-tools input { background: #f5f5f7; border-color: transparent; font-size: 13px; padding: 10px 13px; }
+.inventory-tools input::placeholder { color: var(--muted); opacity: 1; }
+.inventory-tools select { font-size: 12px; }
+.count-badge { border: 0; border-radius: 20px; background: #f0f0f3; color: var(--muted); font-size: 13px; font-weight: 500; padding: 7px 10px; }
+.part-facts dt { font-size: 11px; text-transform: none; letter-spacing: 0; }
+.part-facts dd { font-size: 13px; font-weight: 500; }
+.detail-actions button { font-size: 12px; }
+.segment-note { border-radius: 9px; background: #fff8e6; color: #765715; padding: 11px; }
+.drawing-tools { font-size: 12px; margin: 15px 0; }
+.drawing-tools > span:last-child { font-size: 11px; max-width: 140px; }
+#sheet-scroll { border-radius: 13px; }
+.cut-number { display: grid; place-items: center; font-size: 18px; min-width: 39px; height: 40px; background: #edf5ff; border-radius: 11px; }
+.cut-step { padding: 20px 0; min-height: 112px; }
+.cut-step p:not(.eyebrow) { font-size: 12px; }
+.cut-controls button { font-size: 12px; }
+#next-cut:not(:disabled) { color: var(--blue); border-color: #d2e6fb; background: #edf5ff; }
+#model { border-radius: 14px; }
+.model-hint { font-size: 11px; bottom: 14px; }
+.model-controls label { font-size: 13px; font-weight: 500; }
+.model-error { border-radius: 14px; }
+.package-footer { font-size: 11px; }
+html[data-layout=phone] .job-header { padding: 25px 20px 22px; }
+html[data-layout=phone] h1 { font-size: 26px; letter-spacing: -.7px; }
+html[data-layout=phone] .job-heading .eyebrow { font-size: 9px; letter-spacing: .3px; }
+html[data-layout=phone] .job-meta { font-size: 10px; max-width: 96px; }
+html[data-layout=phone] .job-meta strong { font-size: 11px; }
+html[data-layout=phone] .workflow { background: #ececeff2; -webkit-backdrop-filter: blur(16px); backdrop-filter: blur(16px); padding-top: max(10px,env(safe-area-inset-top)); }
+html[data-layout=phone] .stage { gap: 8px; padding: 11px 10px; min-width: 125px; border-radius: 12px; }
+html[data-layout=phone] .stage-number { font-size: 11px; min-width: 25px; height: 25px; }
+html[data-layout=phone] .stage small { font-size: 10px; line-height: 1.4; }
+html[data-layout=phone] .job-progress { font-size: 11px; padding-top: 3px; }
+html[data-layout=phone] .job-progress progress { width: 85px; }
+html[data-layout=phone] .stage-intro { padding: 24px 20px 20px; }
+html[data-layout=phone] .stage-intro > p { font-size: 13px; line-height: 1.55; margin-top: 10px; }
+html[data-layout=phone] .mobile-switch { gap: 5px; padding: 4px; margin: 0 14px 15px; background: #e8e8ed; border-radius: 13px; }
+html[data-layout=phone] .mobile-switch button { font-size: 13px; border: 0; background: transparent; }
+html[data-layout=phone] .mobile-switch button.active { color: var(--ink); background: white; box-shadow: 0 1px 4px #00000014; }
+html[data-layout=phone] #workspace { padding: 0 14px; gap: 15px; }
+html[data-layout=phone] .panel { padding: 17px; border-radius: 18px; }
+html[data-layout=phone] .panel-heading h3 { font-size: 19px; }
+html[data-layout=phone] .panel-heading .eyebrow { font-size: 9px; }
+html[data-layout=phone] .inventory-table { min-width: 505px; }
+html[data-layout=phone] .model-controls label { font-size: 12px; }
+html[data-layout=phone] .selected-details, html[data-layout=phone] .drawing-panel { scroll-margin-top: 135px; }
+@media print { .panel { box-shadow: none; } }
+
+/* Readable before JavaScript, including phone attachment previews. */
+#package-preview{max-width:1120px;margin:0 auto}
+.preview-content{display:grid;gap:20px;padding:0 24px 30px}
+.preview-notice h2{font-size:20px;margin-bottom:10px}
+.preview-notice p{font-size:13px;line-height:1.65;color:var(--muted)}
+.preview-links{display:flex;flex-wrap:wrap;gap:8px 18px}
+.preview-links a{color:var(--blue);padding:10px 0;font-size:14px}
+#package-preview .table-scroll{max-height:none}
+.preview-part{display:flex;align-items:center;gap:9px}
+.preview-sheet-drawing{display:block;width:100%;max-height:540px;margin:20px 0}
+.preview-sheet-drawing text{font-family:inherit;font-weight:600;fill:var(--ink);paint-order:stroke;stroke:#fff;stroke-width:2;stroke-linejoin:round}
+.preview-sheet>h3{margin-top:22px}
+.preview-cut-steps{padding-left:24px;margin-bottom:0}
+.preview-cut-steps>li{padding:12px 0;border-bottom:1px solid var(--line);font-size:13px;line-height:1.6;break-inside:avoid}
+.preview-cut-steps>li:last-child{border-bottom:0}
+.preview-cut-steps .fine-print{margin-top:4px}
+@media(max-width:600px){.preview-content{padding:0 14px 24px;gap:15px}
+#package-preview .job-meta{max-width:100px}
+.preview-sheet-drawing{max-height:380px}
+}
+@media print{.preview-notice,.preview-links{display:none}
+.preview-content{display:block;padding:0}
+.preview-sheet{break-inside:auto}
+}

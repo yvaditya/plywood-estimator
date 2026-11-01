@@ -5,7 +5,7 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "test": "node --test ../tests/optimizer.test.mjs ../tests/thickness.test.mjs ../tests/stepExport.test.mjs",
+    "test": "node --test ../tests/optimizer.test.mjs ../tests/thickness.test.mjs ../tests/stepExport.test.mjs ../tests/rip_improvements.test.mjs ../tests/cae_meshing.test.mjs ../tests/cae_mesh_view.test.mjs ../tests/cae_boundary_mesh.test.mjs ../tests/cae_elements.test.mjs ../tests/cae_curved.test.mjs ../tests/cae_field_raster.test.mjs ../tests/cae_import_frame.test.mjs ../tests/package.test.mjs",
     "build": "tsc -b && vite build",
     "preview": "vite preview"
   },
@@ -13,10 +13,14 @@
     "jspdf": "^4.2.1",
     "occt-import-js": "^0.0.23",
     "polygon-clipping": "^0.15.7",
+    "qrcode-generator": "^1.4.4",
     "three": "^0.169.0"
   },
   "devDependencies": {
+    "@types/multicast-dns": "^7.2.4",
     "@types/three": "^0.169.0",
+    "esbuild": "0.21.5",
+    "multicast-dns": "^7.2.5",
     "typescript": "^5.6.3",
     "vite": "^5.4.10"
   }

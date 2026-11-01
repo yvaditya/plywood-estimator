@@ -1,3 +1,4 @@
+import { elementEdges } from './caeMeshEdges';
 /**
  * Three.js viewer tuned for CAD-style legibility (Onshape / Fusion vibe).
  *
@@ -74,6 +75,8 @@ export interface CaeMeshData {
 export interface CaeMeshStyle {
   /** Fill the element faces (default true). */
   faces?: boolean;
+  /** Include interior H8 edges from actual element connectivity. */
+  volumeEdges?: boolean;
   /** Draw element edges (default true). */
   edges?: boolean;
   /** Draw a dot per node (default false). */
@@ -170,6 +173,7 @@ export class Viewer {
   private grainGroup = new THREE.Group();
   private nonSheetGroup = new THREE.Group();
   private correctionPreview: THREE.Group | null = null;
+  private correctionInspection = new THREE.Group();
   private correctionVisibility = new Map<number, boolean>();
   /** Overlays for the structural-analysis feature: deflection heatmap meshes,
    *  force arrows, joint contact lines, floor glyphs, and the "weak panel"
@@ -779,7 +783,7 @@ export class Viewer {
     if (!data || data.elemCount === 0) return;
 
     const {
-      faces = true, edges = true, points = false,
+      faces = true, edges = true, points = false, volumeEdges = false,
       field = null, fieldMin = 0, fieldMax = 0, legend = null,
       disp = null, dispScale = 0, opacity = 1,
     } = style;
@@ -855,15 +859,17 @@ export class Viewer {
     }
 
     if (edges) {
-      const segs = uniqueQuadEdges(quads);
+      const segs = volumeEdges ? elementEdges(data.elems, data.nodesPerElem) : uniqueQuadEdges(quads);
       const eGeom = new THREE.BufferGeometry();
       eGeom.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+      if (!faces && colors) eGeom.setAttribute('color', new THREE.BufferAttribute(colors, 3));
       eGeom.setIndex(new THREE.BufferAttribute(segs, 1));
       // Solid hull edges carry the element facets, so they sit darker/stronger
       // than the shell's in-plane grid.
       const solid = data.nodesPerElem === 8;
       const eMat = new THREE.LineBasicMaterial({
-        color: faces ? (solid ? 0x0f1720 : 0x1b2733) : 0x37414f,
+        vertexColors: !faces && !!colors,
+        color: !faces && colors ? 0xffffff : faces ? (solid ? 0x0f1720 : 0x1b2733) : 0x37414f,
         transparent: true,
         opacity: faces ? (solid ? 0.8 : 0.6) : 0.9,
       });
@@ -1210,6 +1216,7 @@ export class Viewer {
 
   clear() {
     this.showThicknessPreview(null);
+    this.inspectThicknessMeshes([]);
     for (const b of this.bodies) {
       this.root.remove(b.mesh);
       b.mesh.geometry.dispose();
@@ -1796,6 +1803,40 @@ export class Viewer {
     mesh.userData.tangentialEdges = tangential;
 
     return mesh;
+  }
+
+  /** Review overlay and camera framing, independent of cutting selection. */
+  inspectThicknessMeshes(meshes: OcctMesh[]) {
+    for (const child of [...this.correctionInspection.children]) {
+      this.correctionInspection.remove(child); disposeObject3D(child);
+    }
+    if (!meshes.length) { this.invalidate(); return; }
+    this.scene.add(this.correctionInspection);
+    const all = new THREE.Box3();
+    for (const mesh of meshes) {
+      const box = new THREE.Box3();
+      const p = mesh.attributes.position.array;
+      for (let i = 0; i < p.length; i += 3) box.expandByPoint(new THREE.Vector3(p[i], p[i + 1], p[i + 2]));
+      if (box.isEmpty()) continue;
+      all.union(box);
+      const helper = new THREE.Box3Helper(box, 0x087f8c);
+      const material = helper.material as THREE.LineBasicMaterial;
+      material.depthTest = false; helper.renderOrder = 100;
+      this.correctionInspection.add(helper);
+    }
+    if (!all.isEmpty()) {
+      const center = all.getCenter(new THREE.Vector3()), size = all.getSize(new THREE.Vector3());
+      const direction = this.camera.position.clone().sub(this.controls.target).normalize();
+      const span = Math.max(size.x, size.y, size.z, 1);
+      const fov = this.camera.fov * Math.PI / 180;
+      const distance = span / (2 * Math.tan(fov / 2) * Math.min(1, this.camera.aspect)) * 1.7;
+      this.controls.target.copy(center);
+      this.camera.position.copy(center).addScaledVector(direction, distance);
+      this.camera.near = Math.max(.1, span / 1000);
+      this.camera.far = Math.max(this.camera.far, distance * 100);
+      this.camera.updateProjectionMatrix(); this.controls.update();
+    }
+    this.invalidate();
   }
 
   frameAll() {

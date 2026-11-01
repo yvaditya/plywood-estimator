@@ -1,7 +1,7 @@
 import { analyzeBody, type Vec3 } from './geometry';
 import {
   correctThickness, correctionStepParts,
-  type CorrectionInput, type CorrectionOptions, type CorrectionProposal,
+  type CorrectionInput, type CorrectionOptions, type CorrectionProposal, type CorrectionIssue,
 } from './thicknessCorrection';
 import { buildAssemblyStep } from './stepExport';
 
@@ -19,6 +19,7 @@ interface ThicknessHost {
   onPreview: (proposal: CorrectionProposal | null) => void;
   onApply: (cabinet: ThicknessCabinet, proposal: CorrectionProposal) => void;
   onReset: (cabinet: ThicknessCabinet) => void;
+  onInspect: (cabinet: ThicknessCabinet | undefined, ids: number[]) => void;
 }
 
 const mm = (n: number) => Number.isFinite(n) ? (Math.abs(n) < 0.0005 ? '0' : Number(n.toFixed(3)).toString()) : '—';
@@ -32,7 +33,7 @@ function element<K extends keyof HTMLElementTagNameMap>(tag: K, text?: string, c
 }
 
 /** Owns proposal UI only. The host owns immutable imports and applied geometry. */
-export function mountThicknessCorrection(host: ThicknessHost): { refresh: () => void; clearPreview: () => void } {
+export function mountThicknessCorrection(host: ThicknessHost): { refresh: () => void; clearPreview: () => void; clearInspection: () => void } {
   const get = <T extends HTMLElement>(id: string) => {
     const found = document.getElementById(id);
     if (!found) throw new Error(`Missing thickness correction control: ${id}`);
@@ -57,6 +58,11 @@ export function mountThicknessCorrection(host: ThicknessHost): { refresh: () => 
   const previewLegend = get<HTMLDivElement>('thicknessPreviewLegend');
   const stockSummary = get<HTMLParagraphElement>('thicknessStockSummary');
   const workspaceTab = get<HTMLButtonElement>('modeThicknessBtn');
+  const reviewHelp = get<HTMLParagraphElement>('thicknessReviewHelp');
+  const inspection = get<HTMLDivElement>('thicknessInspection');
+  const inspectionLabel = get<HTMLSpanElement>('thicknessInspectionLabel');
+  const showAll = get<HTMLButtonElement>('thicknessShowAllBtn');
+  let inspectedId: number | null = null;
   const thicknessCache = new WeakMap<CorrectionInput['mesh'], number | null>();
   let activeKey = '';
   let activeInputs: CorrectionInput[] = [];
@@ -91,9 +97,47 @@ export function mountThicknessCorrection(host: ThicknessHost): { refresh: () => 
 
   function invalidate(): void {
     stopPreview();
+    clearInspection();
     pending = null;
     failure = '';
     notice = '';
+  }
+
+  function clearInspection(): void {
+    inspectedId = null;
+    inspection.hidden = true;
+    host.onInspect(undefined, []);
+    for (const button of document.querySelectorAll<HTMLButtonElement>('[data-review-body]')) button.setAttribute('aria-pressed', 'false');
+  }
+
+  function inspectButton(id: number, name: string): HTMLButtonElement {
+    const button = element('button', `Inspect ${name}`, 'thickness-issue-board');
+    button.type = 'button';
+    button.dataset.reviewBody = String(id);
+    button.setAttribute('aria-pressed', String(inspectedId === id));
+    button.title = 'Highlight this board and zoom to it in 3D';
+    button.addEventListener('click', () => {
+      if (host.isBusy()) return;
+      stopPreview();
+      host.onInspect(selected(), [id]);
+      inspectedId = id;
+      inspectionLabel.textContent = `Highlighted in 3D: ${name}`;
+      inspection.hidden = false;
+      previewLegend.hidden = true;
+      for (const control of document.querySelectorAll<HTMLButtonElement>('[data-review-body]')) {
+        control.setAttribute('aria-pressed', String(control.dataset.reviewBody === String(id)));
+      }
+    });
+    return button;
+  }
+
+  function nextStep(issue: CorrectionIssue): string {
+    const message = issue.message.toLowerCase();
+    if (message.includes('source thickness') || message.includes('positive finite')) return 'Check the source stock group and target thickness on the left, then analyse again.';
+    if (message.includes('existing solids overlap')) return 'Inspect the named boards in 3D. Remove the overlapping solid geometry in the source CAD, then import the repaired assembly and analyse again.';
+    if (message.includes('anchor') || message.includes('exterior face') || message.includes('outside outline')) return 'Inspect the board’s outside faces. The app cannot choose which face may move while preserving the exterior. Resolve that placement in the source CAD, then import and analyse again.';
+    if (message.includes('joint') || message.includes('non-positive') || message.includes('creates an overlap')) return 'Check the target thickness and inspect the affected joint. If this stock is correct, adjust the joint or board placement in the source CAD, then import and analyse again.';
+    return 'Inspect the affected geometry. Automatic correction supports closed rectangular boards; repair or edit this geometry in the source CAD, then import and analyse again.';
   }
 
   function setOptions(select: HTMLSelectElement, entries: [string, string][], preferred: string): void {
@@ -178,6 +222,7 @@ export function mountThicknessCorrection(host: ThicknessHost): { refresh: () => 
       details.id = `thickness-board-${change.id}`; details.hidden = true;
       const reason = element('td'); reason.colSpan = 4;
       reason.append(element('strong', 'Why this board changes'), element('p', change.reasons.join(' · ')));
+      reason.append(inspectButton(change.id, change.name));
       details.append(reason);
       detailToggle.addEventListener('click', () => {
         details.hidden = !details.hidden;
@@ -188,21 +233,43 @@ export function mountThicknessCorrection(host: ThicknessHost): { refresh: () => 
   }
 
   function renderReport(report: CorrectionProposal): void {
+    const errors = report.issues.filter(issue => issue.severity === 'error');
+    if (errors.length) {
+      const blockers = element('section', undefined, 'thickness-blockers');
+      blockers.append(element('h3', 'Why Apply is blocked'), element('p', `${errors.length} ${errors.length === 1 ? 'problem needs' : 'problems need'} a fix before this correction can be applied. Click an affected board to inspect it in 3D.`));
+      const names = new Map(selected()?.inputs.map(input => [input.id, input.name]));
+      for (const [index, issue] of errors.entries()) {
+        const card = element('article', undefined, 'thickness-issue');
+        card.append(element('h4', `Problem ${index + 1}`), element('p', issue.message));
+        if (issue.bodyIds.length) {
+          const boards = element('div', undefined, 'thickness-issue-boards');
+          for (const id of [...new Set(issue.bodyIds)]) boards.append(inspectButton(id, names.get(id) ?? `Board ${id}`));
+          card.append(boards);
+        }
+        card.append(element('strong', 'Next step'), element('p', nextStep(issue)));
+        blockers.append(card);
+      }
+      status.append(blockers);
+    }
     const metrics = element('dl', undefined, 'thickness-metrics');
     const metric = (label: string, value: string) => {
       const tile = element('div');
       tile.append(element('dt', label), element('dd', value));
       metrics.append(tile);
     };
-    metric('Original contacts', `${report.contacts.length}${report.ok ? ' retained' : ' detected'}`);
+    metric('Original contacts', report.ok ? `${report.contacts.length} retained` : report.contacts.length ? `${report.contacts.length} detected · not validated` : 'Not validated');
     metric('Outside outline', report.ok ? 'Unchanged' : 'Not validated');
     metric('Solid collisions', report.ok || report.validation.collisionCount > 0 ? String(report.validation.collisionCount) : 'Not validated');
     if (report.ok) metric('Maximum joint gap change', `${mm(report.validation.maxJointGapError)} mm`);
     status.append(metrics);
-    if (report.issues.length) {
+    const warnings = report.issues.filter(issue => issue.severity === 'warning');
+    if (warnings.length) {
+      const notes = element('details', undefined, 'thickness-reference-details');
+      notes.append(element('summary', `Notes · ${warnings.length} · do not block Apply`));
       const issues = element('ul');
-      for (const issue of report.issues) issues.append(element('li', issue.message, issue.severity === 'warning' ? 'thickness-review-warning' : undefined));
-      status.append(issues);
+      for (const issue of warnings) issues.append(element('li', issue.message, 'thickness-review-warning'));
+      notes.append(issues);
+      status.append(notes);
     }
     if (report.excluded.length) {
       const references = element('details', undefined, 'thickness-reference-details');
@@ -245,12 +312,14 @@ export function mountThicknessCorrection(host: ThicknessHost): { refresh: () => 
     else if (busy) status.append(element('strong', analysing ? 'Analysing imported geometry…' : 'Controls paused while another operation finishes.'));
     else if (proposal) status.append(element('strong', proposal.ok
       ? (proposal.changes.length ? `Ready to apply · ${proposal.changes.length} changed boards` : 'No geometry changes needed.')
-      : 'Correction needs review · apply is blocked'));
+      : 'Cannot apply this correction yet'));
     else if (!sourceSelect.value) status.append(element('p', 'No measurable solid panels were found in this cabinet.'));
     else if (!options()) status.append(element('p', 'Enter a positive target thickness and a tolerance greater than 0 and no more than 0.5 mm.'));
     else status.append(element('p', 'Analyse these settings from the imported model, then review and apply the changes.'));
     if (notice) status.append(element('p', notice));
     const report = proposal ?? cabinet?.applied ?? null;
+    reviewHelp.hidden = !proposal || proposal.ok;
+    apply.title = proposal && !proposal.ok ? 'Fix the problems listed under Why Apply is blocked, then analyse again.' : '';
     if (report) renderReport(report);
     appliedStatus.replaceChildren();
     appliedStatus.hidden = !cabinet?.applied;
@@ -276,7 +345,7 @@ export function mountThicknessCorrection(host: ThicknessHost): { refresh: () => 
       search.value = '';
     }
     if (pending && !currentProposal(cabinet)) invalidate();
-    if (host.isBusy()) stopPreview();
+    if (host.isBusy()) { stopPreview(); clearInspection(); }
     render();
   }
 
@@ -299,20 +368,29 @@ export function mountThicknessCorrection(host: ThicknessHost): { refresh: () => 
       const proposal = correctThickness(cabinet.inputs, parameters);
       pending = { proposal, key: cabinet.key, inputs: snapshot(cabinet.inputs), settings: settings() };
     } catch (error) { failure = `Analysis failed: ${error instanceof Error ? error.message : String(error)}`; }
-    finally { analysing = false; render(); }
+    finally {
+      analysing = false; render();
+      get<HTMLDivElement>('thicknessReviewScroll').scrollTop = 0;
+      if (pending && !pending.proposal.ok) {
+        const heading = status.querySelector<HTMLHeadingElement>('.thickness-blockers h3');
+        if (heading) { heading.tabIndex = -1; heading.focus({ preventScroll: true }); }
+      }
+    }
   });
   preview.addEventListener('change', () => {
     const proposal = currentProposal(selected());
     if (host.isBusy() || !proposal?.ok) { stopPreview(); render(); return; }
-    try { host.onPreview(preview.checked ? proposal : null); }
+    try { clearInspection(); host.onPreview(preview.checked ? proposal : null); }
     catch (error) { preview.checked = false; failure = `Preview failed: ${error instanceof Error ? error.message : String(error)}`; }
     render();
   });
+  showAll.addEventListener('click', () => { clearInspection(); get<HTMLButtonElement>('recenterBtn').click(); });
   apply.addEventListener('click', () => {
     const cabinet = selected(), proposal = currentProposal(cabinet);
     if (host.isBusy() || !cabinet || !proposal?.ok || !proposal.changes.length) return;
     try {
       stopPreview();
+      clearInspection();
       host.onApply(cabinet, proposal);
       pending = null;
       failure = '';
@@ -349,5 +427,5 @@ export function mountThicknessCorrection(host: ThicknessHost): { refresh: () => 
     render();
   });
   refresh();
-  return { refresh, clearPreview: stopPreview };
+  return { refresh, clearPreview: stopPreview, clearInspection };
 }

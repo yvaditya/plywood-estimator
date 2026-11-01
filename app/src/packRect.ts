@@ -1804,6 +1804,56 @@ function consolidateSheets(result: MultiSheetResult, job: PackJob): MultiSheetRe
  */
 export type BinKind = 'maxrects' | 'maxrects-g' | 'shelf' | 'shelf-v' | 'rip-shelf' | 'sas' | `beam${number}`;
 
+/** Plan length combinations before the shelf packer allocates full-length rips.
+ * Random part orders rarely discover complementary lengths across many widths.
+ * This bounded subset search supplies one deterministic candidate; ordinary
+ * starters and shuffles remain available when its greedy strip choices lose. */
+function ripSubsetOrder(job: PackJob): PackInput[] {
+  const landscape = job.sheetW >= job.sheetH;
+  const length = Math.max(job.sheetW, job.sheetH);
+  const groups = new Map<number, { item: PackInput; length: number; width: number }[]>();
+  for (const item of job.items) {
+    const along = item.allowRotate ? Math.max(item.w, item.h) : landscape ? item.w : item.h;
+    const across = item.allowRotate ? Math.min(item.w, item.h) : landscape ? item.h : item.w;
+    const key = Math.round(across / SETTING_TOL);
+    const group = groups.get(key) ?? [];
+    group.push({ item, length: along + job.kerf, width: across });
+    groups.set(key, group);
+  }
+  const order: PackInput[] = [];
+  // A shared work budget keeps this synchronous schedule-building step small
+  // even for thousands of parts. Search effort is independent of job size.
+  let stateBudget = 40000;
+  for (const group of [...groups.values()].sort((a, b) => b[0].width - a[0].width)) {
+    let pool = group.slice().sort((a, b) => b.length - a.length);
+    while (pool.length) {
+      if (stateBudget <= 0) { order.push(...pool.map((p) => p.item)); break; }
+      let states: { used: number; indices: number[] }[] = [{ used: 0, indices: [] }];
+      // Bound both branching and large-job work. Remaining parts still enter
+      // the normal packer, including oversized parts and alternative rotations.
+      const window = Math.min(pool.length, 96);
+      for (let i = 0; i < window; i++) {
+        stateBudget -= states.length;
+        if (stateBudget < 0) break;
+        const next = states.concat(states.filter((s) => s.used + pool[i].length <= length)
+          .map((s) => ({ used: s.used + pool[i].length, indices: [...s.indices, i] })));
+        const seen = new Set<number>();
+        states = next.sort((a, b) => b.used - a.used).filter((s) => {
+          const key = Math.round(s.used * 1e6);
+          if (seen.has(key)) return false;
+          seen.add(key); return true;
+        }).slice(0, 512);
+        // Keep the empty state so later short parts can start new combinations.
+        if (!states.some((s) => s.used === 0)) states.push({ used: 0, indices: [] });
+      }
+      const chosen = new Set(states[0].indices.length ? states[0].indices : [0]);
+      order.push(...pool.filter((_, i) => chosen.has(i)).map((p) => p.item));
+      pool = pool.filter((_, i) => !chosen.has(i));
+    }
+  }
+  return order;
+}
+
 export interface PackTrial { order: PackInput[]; heur: Heuristic; binKind?: BinKind }
 
 export function buildTrialSchedule(job: PackJob, restarts: number, seedOffset = 0): PackTrial[] {
@@ -1851,7 +1901,9 @@ export function buildTrialSchedule(job: PackJob, restarts: number, seedOffset = 
     const banded = [...groups.values()].sort((a, b) => b.length - a.length || width(b[0]) - width(a[0]))
       .flatMap((g) => g.sort((a, b) => b.w * b.h - a.w * a.h));
     const byRipWidth = job.items.slice().sort((a, b) => width(b) - width(a) || b.w * b.h - a.w * a.h);
-    for (const order of [banded, byRipWidth, baseline, bySide]) {
+    const orders = [banded, byRipWidth, baseline, bySide];
+    if (restarts > orders.length) orders.push(ripSubsetOrder(job));
+    for (const order of orders) {
       trials.push({ order, heur: 'BSSF', binKind: 'rip-shelf' });
     }
     while (trials.length < restarts) trials.push({ order: shuffle(), heur: 'BSSF', binKind: 'rip-shelf' });

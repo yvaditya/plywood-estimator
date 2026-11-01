@@ -1,4 +1,6 @@
 import { defineConfig, type Plugin, type Connect } from 'vite';
+import { packageRuntimePlugin } from './packageRuntimePlugin';
+import { remoteBridge, REMOTE_HOSTNAME } from './remoteBridge';
 import { execSync, spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import type { ServerResponse } from 'node:http';
@@ -132,9 +134,12 @@ function sidecarStarter(): Plugin {
 }
 
 export default defineConfig({
-  plugins: [gitVersionLine(), sidecarStarter()],
+  plugins: [gitVersionLine(), sidecarStarter(), packageRuntimePlugin(), remoteBridge()],
   server: {
     port: 5173,
+    // Listen on the LAN so the shop remote (remote.html) opens on a phone.
+    host: true,
+    allowedHosts: [REMOTE_HOSTNAME],
     open: false,
     fs: {
       // occt-import-js ships .wasm next to its js entry; allow serving it
@@ -147,4 +152,13 @@ export default defineConfig({
   worker: {
     format: 'es'
   },
+  build: {
+    rollupOptions: {
+      input: {
+        main: fileURLToPath(new URL('index.html', import.meta.url)),
+        remote: fileURLToPath(new URL('remote.html', import.meta.url)),
+      },
+    },
+  },
+  preview: { host: true, allowedHosts: [REMOTE_HOSTNAME] },
 });

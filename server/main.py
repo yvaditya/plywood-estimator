@@ -21,9 +21,8 @@ mapped as short stiff link MEMBERS between the app's paired seam nodes:
   hinged      -> 0.1% rotational section (a regularised near-hinge, mirroring
                  the app's own token-rotational-stiffness regularisation so the
                  seam is not a free numerical mechanism)
-Floor grounding maps to fully-fixed node supports. A tiny soft grounding spring
-on every DOF removes residual rigid-body / drilling mechanisms (the same trick
-the app's PCG path uses).
+Floor grounding maps to fully-fixed node supports. No implicit grounding
+springs are added; unstable models fail the stability check.
 
 Run:
   python -m pip install -r server/requirements.txt
@@ -70,13 +69,6 @@ LINK_STIFF_FRAC = {
 }
 LINK_MIN_LEN = 0.5           # mm — below this a seam pair is "coincident"
 LINK_OFFSET = 1.0            # mm — synthetic length given to a coincident link
-# Per-DOF soft grounding spring — small enough to be negligible for a properly
-# constrained DOF, present only to kill a residual drilling/rigid-body mode.
-# (Correct joint coupling — not a strong soft spring — is what prevents a real
-# sub-assembly from drifting; see the LINK_* section stiffnesses.)
-SOFT_SPRING_ABS = 1.0e-4
-
-
 # ---------------------------------------------------------------------------
 # Request / response schema (mirrors app/src/cae.ts serialiseAssembly()).
 # ---------------------------------------------------------------------------
@@ -117,10 +109,8 @@ class Model(BaseModel):
     links: List[Link]
     supports: List[int]   # node indices fully fixed (all 6 DOF)
     loads: List[Load]
-    # Per-DOF soft grounding-spring stiffness the app's own solver uses — pins
-    # residual rigid-body / weakly-coupled modes identically to cae.ts. Optional
-    # (falls back to a tiny absolute value) for older/hand-built payloads.
-    kSoft: float = 1.0e-4
+    # Explicit legacy grounding springs only; zero/default means no foundation.
+    kSoft: float = 0.0
 
 
 class SolveStats(BaseModel):
@@ -181,6 +171,29 @@ def solve(model: Model) -> SolveResponse:
     if n_nodes == 0:
         _progress.update(stage="idle", pct=0)
         return SolveResponse(ok=False, message="No nodes in model.", disp=[])
+
+    # Independently reject unsupported connected components: matrix solvers
+    # may numerically factor a singular free-body stiffness without detecting it.
+    graph = [set() for _ in model.nodes]
+    for quad in model.quads:
+        if len(quad.n) != 4 or any(n < 0 or n >= n_nodes for n in quad.n):
+            return SolveResponse(ok=False, message="Invalid quad connectivity.", disp=[])
+        for n in quad.n:
+            graph[n].update(quad.n)
+    for link in model.links:
+        if 0 <= link.a < n_nodes and 0 <= link.b < n_nodes:
+            graph[link.a].add(link.b)
+            graph[link.b].add(link.a)
+    supported = {n for n in model.supports if 0 <= n < n_nodes}
+    queue = list(supported)
+    for n in queue:
+        for neighbor in graph[n]:
+            if neighbor not in supported:
+                supported.add(neighbor)
+                queue.append(neighbor)
+    if len(supported) != n_nodes and model.kSoft == 0:
+        _progress.update(stage="idle", pct=0)
+        return SolveResponse(ok=False, message="Unsupported model component: no physical support path.", disp=[])
 
     m = FEModel3D()
 
@@ -243,17 +256,14 @@ def solve(model: Model) -> SolveResponse:
         if 0 <= s < n_nodes:
             m.def_support(f"N{s}", True, True, True, True, True, True)
 
-    # --- Soft grounding spring on every DOF. Use the stiffness the app's OWN
-    #     solver uses (model.kSoft = repStiff·1e-4) so the sidecar regularizes a
-    #     residual rigid-body / weakly-coupled-sub-assembly mode IDENTICALLY to
-    #     cae.ts — strong enough to pin an orphan panel to a physical
-    #     displacement, negligible for a properly-constrained DOF. Falls back to
-    #     a tiny absolute value if the payload omits it. ---
-    soft = model.kSoft if model.kSoft and model.kSoft > 0 else SOFT_SPRING_ABS
-    for i in range(n_nodes):
-        nm = f"N{i}"
-        for dof in ("DX", "DY", "DZ", "RX", "RY", "RZ"):
-            m.def_support_spring(nm, dof, soft)
+    # A foundation is never inferred from zero or an omitted field.
+    # Retain positive explicitly requested springs for legacy callers only.
+    if not math.isfinite(model.kSoft) or model.kSoft < 0:
+        return SolveResponse(ok=False, message="Invalid foundation stiffness.", disp=[])
+    if model.kSoft > 0:
+        for i in range(n_nodes):
+            for dof in ("DX", "DY", "DZ", "RX", "RY", "RZ"):
+                m.def_support_spring(f"N{i}", dof, model.kSoft)
 
     # --- Loads: world nodal forces (N). ---
     for load in model.loads:
@@ -274,21 +284,14 @@ def solve(model: Model) -> SolveResponse:
         n_nodes, len(model.quads), len(model.links), len(model.supports), len(model.loads),
     )
 
-    # --- Linear static solve, single load combo. Try the stability check first;
-    #     if PyNite flags instability (a weakly-connected panel etc.), retry
-    #     WITHOUT the check — the soft grounding springs already regularise the
-    #     system, and the frontend's non-physical backstop catches any garbage. ---
+    # A stability failure is a failed model, never an unchecked safety result.
     ts = time.perf_counter()
     try:
         m.analyze_linear(check_statics=False, check_stability=True, sparse=True)
     except Exception as exc:
-        log.warning("stability-checked solve failed (%s) — retrying without stability check", exc)
-        try:
-            m.analyze_linear(check_statics=False, check_stability=False, sparse=True)
-        except Exception as exc2:  # genuinely singular — let the frontend fall back.
-            log.warning("solve failed: %s", exc2)
-            _progress.update(stage="idle", pct=0)
-            return SolveResponse(ok=False, message=f"PyNite solve failed: {exc2}", disp=[])
+        log.warning("stability-checked solve failed: %s", exc)
+        _progress.update(stage="idle", pct=0)
+        return SolveResponse(ok=False, message=f"PyNite solve failed: {exc}", disp=[])
     solve_ms = (time.perf_counter() - ts) * 1000.0
 
     combo = next(iter(m.load_combos), None)
@@ -310,8 +313,11 @@ def solve(model: Model) -> SolveResponse:
             disp[base + 4] = float(node.RY[combo])
             disp[base + 5] = float(node.RZ[combo])
         except (KeyError, TypeError):
-            # Unsolved DOF (shouldn't happen) — leave zeros.
-            pass
+            _progress.update(stage="idle", pct=0)
+            return SolveResponse(ok=False, message="PyNite did not return a complete displacement field.", disp=[])
+    if not all(math.isfinite(v) for v in disp):
+        _progress.update(stage="idle", pct=0)
+        return SolveResponse(ok=False, message="PyNite returned non-finite displacements.", disp=[])
 
     _progress.update(stage="done", pct=100)
 

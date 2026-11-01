@@ -50,13 +50,18 @@ couplings, floor grounding, nodal loads — then serialises that SAME model here
 A joint's paired seam nodes are often (near-)coincident; a zero-length member is
 degenerate in PyNite, so a coincident link's B-endpoint is nudged ~1 mm (sub-mm
 on a shell — negligible, and displacements are read back by node id, not
-position) to give the member a real length. A tiny **soft grounding spring** on
-every DOF removes residual rigid-body / drilling mechanisms (the same trick the
-app's PCG path uses).
+position) to give the member a real length. Assembly models use **zero
+foundation stiffness**: every connected component must reach a physical
+support. Stability failures are returned without an unchecked retry.
+The legacy `kSoft` payload field adds springs only when explicitly positive.
 
 After the solve the app maps the returned displacement vector straight back into
 its DOF vector and runs its **existing** stress recovery + verdicts — the
 sidecar only replaces the linear solve.
+
+The frontend uses PyNite for shell previews up to 18,000 DOF at exactly the
+displayed mesh. Larger meshes and H8 solids use Eigen/PCG at their selected
+resolution; switching backend never silently substitutes a coarser shell.
 
 ## Fidelity note — "PyNite (isotropic E_eff)"
 

@@ -2378,6 +2378,19 @@ input[type="checkbox"]:focus-visible { box-shadow: 0 0 0 2px var(--accent-ring);
 .thickness-status ul { margin: 9px 0; padding-left: 16px; }
 .thickness-status li + li { margin-top: 5px; }
 .thickness-review-warning { color: var(--warn); }
+.thickness-blockers { margin-bottom: 18px; }
+.thickness-blockers h3 { color: var(--bad); font-size: 16px; margin: 0 0 6px; }
+.thickness-issue { border: 1px solid #e8c7bd; border-left: 3px solid var(--bad); background: #fffaf7; border-radius: 5px; padding: 14px; margin-top: 12px; color: var(--text-2); }
+.thickness-issue h4 { margin: 0 0 5px; font-size: 12px; color: var(--bad); }
+.thickness-issue > strong { display: block; margin-top: 12px; font-size: 11px; color: var(--text); }
+.thickness-issue-boards { display: flex; flex-wrap: wrap; gap: 7px; margin-top: 12px; }
+.thickness-issue-board { font-size: 11px; padding: 6px 9px; border: 1px solid #b8cfd0; background: #fff; border-radius: 4px; color: #087f8c; cursor: pointer; }
+.thickness-issue-board:hover, .thickness-issue-board[aria-pressed="true"] { background: #e7f4f4; border-color: #087f8c; }
+.thickness-issue-board:focus-visible, .thickness-blockers h3:focus-visible { outline: 2px solid #087f8c; outline-offset: 3px; }
+.thickness-inspection { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px; padding: 10px 12px; margin-bottom: 14px; background: #e7f4f4; border: 1px solid #b8cfd0; border-radius: 5px; font-size: 11px; color: #087f8c; }
+.thickness-inspection button { font-size: 11px; }
+.thickness-review-help { margin: 0 0 12px; color: var(--bad); font-size: 11px; line-height: 1.6; grid-column: 1 / -1; }
+.thickness-inspection[hidden], .thickness-review-help[hidden] { display: none; }
 .thickness-metrics { display: grid; grid-template-columns: 1fr 1fr; gap: 1px; background: var(--line); border: 1px solid var(--line); border-radius: 6px; overflow: hidden; margin: 0 0 12px; }
 .thickness-metrics > div { padding: 11px 12px; background: #f8faf8; }
 .thickness-metrics dt { color: var(--muted); font-size: 10px; }
@@ -2483,3 +2496,41 @@ button:focus-visible, input:focus-visible, select:focus-visible { outline: 2px s
 @media (prefers-reduced-motion: reduce) { *, *::before, *::after { scroll-behavior: auto !important; transition-duration: 0s !important; animation-duration: 0s !important; } }
 
 .mode-tab:disabled { opacity: .45; cursor: wait; }
+.asm-mesh-view { display: grid; gap: 5px; margin: 10px 0 6px; }
+.asm-mesh-view select { width: 100%; }
+
+/* Shop remote — QR button in the header corner and its popover. */
+.app-header { position: relative; }
+.remote-btn {
+  position: absolute; top: 2px; right: 2px;
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 28px; height: 28px; padding: 0;
+  border: none; border-radius: 6px; background: transparent; color: var(--muted); cursor: pointer;
+}
+.remote-btn:hover, .remote-btn[aria-expanded="true"] { background: var(--bg-subtle); color: var(--text); }
+.remote-btn.live::after {
+  content: ''; position: absolute; top: 4px; right: 4px;
+  width: 6px; height: 6px; border-radius: 50%; background: var(--good);
+}
+.remote-pop {
+  position: fixed; z-index: 1000; width: 260px; padding: 14px;
+  background: var(--bg); border: 1px solid var(--line); border-radius: 8px;
+  box-shadow: 0 8px 28px rgba(15, 15, 14, .12);
+  font-size: 12.5px; color: var(--text);
+}
+.remote-pop-title { margin: 0 0 10px; font-weight: 600; font-size: 13px; }
+.remote-qr svg { display: block; width: 100%; height: auto; }
+.remote-url {
+  display: block; margin-top: 8px; color: var(--text-2);
+  font-family: var(--font-mono); font-size: 11.5px; word-break: break-all; text-decoration: none;
+}
+.remote-url:hover { color: var(--accent); }
+.remote-addr { display: flex; align-items: center; gap: 8px; margin-top: 8px; color: var(--muted); }
+.remote-addr select { flex: 1; }
+.remote-pop-note { margin: 8px 0 0; color: var(--muted); line-height: 1.4; }
+.remote-dot { display: inline-block; width: 6px; height: 6px; margin-right: 6px; border-radius: 50%; background: var(--good); vertical-align: middle; }
+.app-header .brand { padding-right: 30px; }
+.remote-btn[hidden] { display: none; }
+.remote-pick { display: flex; flex-direction: column; gap: 6px; margin-bottom: 10px; }
+.remote-pick label { display: grid; grid-template-columns: 52px 1fr; align-items: center; gap: 8px; color: var(--muted); }
+.remote-pick select { min-width: 0; }

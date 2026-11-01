@@ -34,7 +34,7 @@ Open <http://localhost:5173/>.
 
 Requires Node 18 or newer.
 
-Run optimizer, thickness-correction, and STEP round-trip tests with `npm test` from `app/`. To benchmark a
+Run optimizer, thickness-correction, STEP round-trip, and CAE mesh tests with `npm test` from `app/`. To benchmark a
 local model using the same STEP analysis and nesting pipeline, run
 `node tests/step_bench.mjs "path/to/model.stp" 256` from the repository root.
 Results are saved under `tests/_output/`; saw-setting counts exclude reference trims.
@@ -61,6 +61,45 @@ job leaves the machine.
 ---
 
 ## Features
+
+### Offline interactive build packages
+
+After estimating, open **Export → PC / tablet HTML** or **Phone HTML**.
+Each download is one self-contained HTML file with the job data, cut layouts,
+inventory table, and interactive 3D model embedded. Open it in a browser;
+no server or internet connection is needed. The two editions contain the same
+job with layouts designed for their respective screens.
+
+1. **Cut & check:** choose a sheet, walk through the cut sequence, and label
+   each piece with its panel code. The inventory table lists every physical
+   piece, its dimensions, quantity, source cabinet, sheet, and progress.
+2. **Assemble:** drag to rotate the CAD model, pinch/scroll to zoom, move the
+   exploded-view slider, and select or isolate a part to see where it fits.
+   Selecting a piece links its inventory row, sheet location, and source model.
+
+Cut and assembled checkboxes remember progress in the current browser when
+storage is available. Copies on different devices do not synchronize, and
+progress does not rewrite the downloaded file. If storage is blocked, the
+checklist works for the current session. Split pieces identify their segment
+and highlight the original source panel in 3D; unplaced pieces remain visible
+in the inventory. The exploded view is a spatial reference, not an inferred
+assembly order.
+
+The HTML includes a readable cut list, every sheet layout, and cutting steps
+before any scripts run. If a phone file-manager or email preview blocks
+JavaScript, this read-only view stays available instead of a loading screen.
+Interactive 3D and checklists require a browser or HTML viewer that runs
+JavaScript; 3D also requires WebGL. On iPhone, a hosted copy can be opened in
+Safari, or the downloaded file can be opened in an HTML viewer that supports
+JavaScript. Inventory and cutting views remain available if WebGL is disabled.
+
+Export checks: `node tests/package_fixture.mjs` creates representative sample
+HTML files and a STEP fixture under `tests/_output/package/`.
+`python tests/package_ui.py` checks offline layouts and interactions.
+`python tests/package_preview_ui.py` checks readable exports with scripts
+disabled, blocked, or failing during startup.
+With the app running, `python tests/package_export_ui.py http://127.0.0.1:5173`
+checks real STEP import, estimation, downloads, and offline model selection.
 
 ### Choose a workspace
 
@@ -139,6 +178,41 @@ outside constraints, and ambiguous anchors block application for CAD review.
 Zero-thickness reference surfaces are listed and excluded from panel-solid export.
 Internal clear openings may change as the stock changes.
 
+If Apply is blocked, **Why Apply is blocked** lists each problem, affected
+boards, and a next step. **Inspect** highlights and frames a board in 3D without
+changing the cutting selection. **Show whole cabinet** restores the assembly
+view. Resolve the reported settings or CAD geometry, then analyse again;
+review is not a checkbox that bypasses failed geometry checks.
+
+### Assembly finite-element mesh
+The Analysis workspace uses the same Q4 shell or H8 solid elements for preview
+and solution. Rectilinear boards retain their efficient boundary grid. Curved
+and oblique planar outlines use a constrained, refined mesh subdivided into
+convex Q4 elements, then extruded into H8 layers for solid analysis. Outer
+boundaries, holes, and notches follow the imported polylines (STEP curves are
+tessellated at 0.1 mm chord tolerance). Each element's actual coordinates drive
+isoparametric stiffness and stress recovery. The mesh report shows boundary
+area mismatch, worst aspect ratio, minimum scaled Jacobian, actual size and
+solver DOF, and coarsening or quality warnings. Check result convergence under
+refinement, especially with distorted solid elements near detailed curves.
+Assembly patch loads integrate uniform pressure over covered element area,
+preserving total force and its centre of pressure as mesh density changes.
+Round footprints use a 128-sided approximation (under 0.041% area error).
+Footprints wholly outside material or inside holes are refused; explicit
+zero-size point loads use the nearest active node.
+Mesh view defaults to filled solver element faces with visible edges. Choose
+All element edges to inspect internal H8 edges directly from solver connectivity,
+and enable Nodes to inspect the full node set. Face triangulation diagonals are
+never presented as element edges. Results default to undeformed coordinates;
+the Deform control explicitly enables true-scale or exaggerated displacement.
+Bent, doubly curved, beveled, or variable-thickness bodies cannot be represented
+by this planar-board solver and are explicitly refused, as are invalid boundaries
+and disconnected panel regions. Joint connections remain approximate nearest-node
+links. The legacy individual-panel checker uses its original raster mesh.
+Assembly floor supports follow the geometric floor boundary. The solver adds
+no hidden spring foundation to make an unsupported cabinet appear stable;
+detached components and failed iterative solves return an actionable failure.
+
 ### Cut sheet nesting
 - **Four cut strategies**:
   - **Min cuts** — guillotine packing (shelf + SAS trials plus a beam
@@ -151,6 +225,8 @@ Internal clear openings may change as the stock changes.
     Parts sharing a rip width occupy the same strips. Selecting it also
     selects the parallel-guide sequence. Sheet count comes first among
     these strip layouts; this workflow can use more stock than other modes.
+    A bounded subset search plans complementary part lengths within each rip
+    width before allocating strips, alongside the existing packing trials.
   - **CNC nest** — true-shape any-angle nesting for router / waterjet.
 - **Save a usable remnant.** Every strategy moves the least-full sheet
   of each thickness group to the end. Corner packing is kept only when

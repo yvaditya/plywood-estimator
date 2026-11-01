@@ -1,0 +1,28 @@
+import { build } from '../app/node_modules/esbuild/lib/main.js';
+import { writeFileSync, readFileSync, mkdirSync } from 'node:fs';
+import * as THREE from '../app/node_modules/three/build/three.module.js';
+import {fileURLToPath} from 'node:url';
+process.chdir(fileURLToPath(new URL('../', import.meta.url)));
+const out='tests/_output/package'; mkdirSync(out,{recursive:true});
+for (const entry of ['packageData','packageHtml','packageRuntime']) await build({entryPoints:[`app/src/${entry}.ts`],outfile:`${out}/${entry}.js`,bundle:true,format:entry==='packageRuntime'?'iife':'esm',platform:entry==='packageRuntime'?'browser':'node',logLevel:'silent',minify:true});
+const {buildPackageData}=await import(`./_output/package/packageData.js`);
+const {buildPackageHtml}=await import(`./_output/package/packageHtml.js`);
+const {runNest}=await (async()=>{await build({entryPoints:['app/src/nest.ts'],outfile:`${out}/nest.js`,bundle:true,format:'esm',platform:'node',logLevel:'silent'});return import(`./_output/package/nest.js`);})();
+const panels=[['Left side',[18,400,600],[-291,0,300]],['Right side',[18,400,600],[291,0,300]],['Bottom',[564,400,18],[0,0,9]],['Top',[564,400,18],[0,0,591]],['Shelf',[564,380,18],[0,0,290]],['Back',[564,18,564],[0,191,300]]];
+const colors=['#b96b44','#bf854e','#719f9a','#709876','#b8a753','#8795a9'];
+const bodies=panels.map(([name,size,pos],i)=>{const g=new THREE.BoxGeometry(...size);g.translate(...pos);const dims=[...size].sort((a,b)=>a-b);return{id:String(i),name,fileTag:'Workshop cabinet',color:colors[i],length:dims[2],width:dims[1],thickness:dims[0],positions:Array.from(g.attributes.position.array),normals:Array.from(g.attributes.normal.array),indices:Array.from(g.index.array)};});
+const parts=bodies.map(b=>({id:b.id,name:b.name,thickness:b.thickness,qty:b.id==='4'?2:1,grain:'free',rotation:'flip90',outer:[[0,0],[b.width,0],[b.width,b.length],[0,b.length]],holes:[],color:b.color}));
+const nest=runNest(parts,{sheetW:1220,sheetL:2440,margin:10,kerf:3,resolution:1,cutStrategy:'guillotine',restarts:1});
+const data=buildPackageData({jobName:'Workshop cabinet',units:'mm',nest,bodies,margin:10,kerf:3,kerfRef:'keeper',sequenceStyle:'row',strategy:'guillotine'});
+for(const mode of ['pc','phone'])writeFileSync(`${out}/cabinet_${mode}.html`,buildPackageHtml(data,mode,readFileSync(`${out}/packageRuntime.js`,'utf8'),readFileSync('app/src/packageStyle.css','utf8')));
+console.log(`Built sample packages: ${data.parts.length} parts, ${data.sheets.length} sheets`);
+await build({entryPoints:['app/src/stepExport.ts'],outfile:`${out}/stepExport.js`,bundle:true,format:'esm',platform:'node',logLevel:'silent'});
+const {buildAssemblyStep}=await import('./_output/package/stepExport.js');
+const stepPanels=panels.map(([name,size,pos])=>{
+  const axis=size.indexOf(Math.min(...size));
+  const u=(axis+1)%3,v=(axis+2)%3;
+  const direction=i=>[0,1,2].map(a=>a===i?1:0);
+  const origin=pos.map((x,i)=>x-size[i]/2);
+  return{name,outer:[[0,0],[size[u],0],[size[u],size[v]],[0,size[v]]],holes:[],thickness:size[axis],origin,uAxis:direction(u),vAxis:direction(v),normal:direction(axis)};
+});
+writeFileSync(`${out}/cabinet.step`,buildAssemblyStep(stepPanels,new Date().toISOString(),'Workshop cabinet'));

@@ -8,6 +8,7 @@
  */
 
 import './style.css';
+import { rasterizeQuadField } from './caeFieldRaster';
 
 import * as THREE from 'three';
 import { parseStep, preloadOcct, type OcctResult, type OcctMesh } from './stepLoader';
@@ -41,6 +42,9 @@ import {
 } from './rearrange';
 import { checkForUpdate, dismissUpdate } from './updateCheck';
 import { sheetToDxf, downloadDxf } from './dxf';
+import { buildPackageData, encodeModels, type PackageBody } from './packageData';
+import { mountRemoteHost } from './remoteHost';
+import type { RemoteCommand, RemoteJob } from './remoteTypes';
 import { buildStep, type StepPart } from './stepExport';
 import {
   buildPdf,
@@ -291,7 +295,7 @@ const state: {
     detected: false, field: 'deflection', lastSolve: null,
     meshKind: 'shell', elementSizeMm: 30, solidLayers: 2, preview: null,
     show: { mesh: true, nodes: false, supports: true, couplings: true, loads: true },
-    deformScale: 'auto',
+    deformScale: 0,
     legend: { ...DEFAULT_LEGEND },
     jointsOpen: false,
   },
@@ -489,6 +493,9 @@ const downloadCutDxfBtn = $<HTMLButtonElement>('downloadCutDxfBtn');
 const downloadPdfBtn = $<HTMLButtonElement>('downloadPdfBtn');
 const downloadPhonePdfBtn = $<HTMLButtonElement>('downloadPhonePdfBtn');
 const downloadCutlistPdfBtn = $<HTMLButtonElement>('downloadCutlistPdfBtn');
+const downloadPcHtmlBtn = $<HTMLButtonElement>('downloadPcHtmlBtn');
+const downloadPhoneHtmlBtn = $<HTMLButtonElement>('downloadPhoneHtmlBtn');
+let packageExportBusy = false;
 
 const shopList = $('shoppingList');
 const shopCount = $('shopCount');
@@ -547,14 +554,18 @@ viewer.setGrainCycleListener((bodyId: number) => {
 
 /** Send a body's current grain (and orientation info) to the viewer. */
 function pushGrainToViewer(b: BodyState) {
+  const a = b.analysis;
+  const frame = a.outlineFrame;
+  // Grain choices refer to the same outline U/V axes used by the material
+  // model. Imported outlines may have rotated away from the original OBB.
   viewer.setBodyGrain(b.id, b.grain, {
-    faceCenter: b.analysis.faceCenter,
-    faceNormal: b.analysis.faceNormal,
-    lengthDir: b.analysis.lengthDir,
-    widthDir: b.analysis.widthDir,
-    length: b.analysis.length,
-    width: b.analysis.width,
-    thickness: b.analysis.thickness,
+    faceCenter: a.faceCenter,
+    faceNormal: frame?.normal ?? a.faceNormal,
+    lengthDir: frame?.uAxis ?? a.lengthDir,
+    widthDir: frame?.vAxis ?? a.widthDir,
+    length: frame ? a.outline.bbox.w : a.length,
+    width: frame ? a.outline.bbox.h : a.width,
+    thickness: a.thickness,
   });
 }
 function pushAllGrainToViewer() {
@@ -673,6 +684,10 @@ let nextReferenceId = -1;
 const thicknessCabinets: ThicknessCabinet[] = [];
 let thicknessUI: ReturnType<typeof mountThicknessCorrection> | null = null;
 let geometryBusy = false;
+/** Shop remote (phone on the LAN); null until mounted at the end of startup. */
+let remoteHost: ReturnType<typeof mountRemoteHost> | null = null;
+/** Cut-list signature the current plan was estimated from (see cutListSig). */
+let planInputsSig = '';
 const modelBusy = () => geometryBusy || !!document.querySelector('button.busy');
 /** Gap (mm) between auto-laid-out files in the 3D view. */
 const FILE_GAP = 100;
@@ -987,6 +1002,7 @@ window.addEventListener('drop', (e) => {
 // Body list rendering
 // --------------------------------------------------------------------------
 function renderBodyList() {
+  remoteHost?.schedule();
   // "15 sheet / 19 total" when some imports were skipped as non-sheet.
   bodyCount.textContent = state.nonSheetCount > 0
     ? `${state.bodies.length} sheet / ${state.bodies.length + state.nonSheetCount} total`
@@ -1198,11 +1214,11 @@ const v3add = (a: Vec3, b: Vec3): Vec3 => [a[0] + b[0], a[1] + b[1], a[2] + b[2]
 const v3scale = (a: Vec3, s: number): Vec3 => [a[0] * s, a[1] * s, a[2] * s];
 
 /** The world corner where the part outline's (0,0) sits, plus the world axes
- *  that outline X (length) and outline Y (width) run along. Rectangular parts
- *  map exactly; skew parts are approximated by centring the bbox on the face
- *  centroid. */
+ *  that outline X and outline Y run along. Imported outlines retain their
+ *  exact projection frame; synthesized rectangular boards use the fallback. */
 function outlineFrame(b: BodyState): { origin: Vec3; uAxis: Vec3; vAxis: Vec3; normal: Vec3 } {
   const a = b.analysis;
+  if (a.outlineFrame) return a.outlineFrame;
   const uAxis = a.lengthDir as Vec3;
   const vAxis = a.widthDir as Vec3;
   const normal = a.faceNormal as Vec3;
@@ -1245,8 +1261,7 @@ function forceToN(val: number, unit: 'N' | 'kg' | 'lbf'): number {
 function buildAsmHeatTexture(
   pr: AsmPanelResult, denom: number, field: 'deflection' | 'stress',
 ): THREE.CanvasTexture {
-  const { nx, ny, active } = pr;
-  const data = field === 'stress' ? pr.vm : pr.disp;
+  const {nx,ny,field:data}=rasterizeQuadField(pr.uv,pr.quads,field === 'stress' ? pr.vm : pr.disp);
   const canvas = document.createElement('canvas');
   canvas.width = nx;
   canvas.height = ny;
@@ -1258,7 +1273,7 @@ function buildAsmHeatTexture(
       const n = iy * nx + ix;
       // Flip Y so texture V matches outline +Y (canvas is top-down).
       const dst = ((ny - 1 - iy) * nx + ix) * 4;
-      if (!active[n] || Number.isNaN(data[n])) {
+      if (!Number.isFinite(data[n])) {
         img.data[dst + 3] = 0; // transparent outside the part
         continue;
       }
@@ -1344,6 +1359,8 @@ const asmMeshDensity = $<HTMLSelectElement>('asmMeshDensity');
 const asmSolidLayers = $<HTMLSelectElement>('asmSolidLayers');
 const asmSolidLayersRow = $('asmSolidLayersRow');
 const asmMeshStats = $('asmMeshStats');
+const asmMeshView = $<HTMLSelectElement>('asmMeshView');
+asmMeshView.addEventListener('change', () => paintCaeVisuals());
 const asmDeformRow = $('asmDeformRow');
 const asmDeformScale = $<HTMLSelectElement>('asmDeformScale');
 
@@ -1400,8 +1417,8 @@ function currentAsmOptions(): { opts: AsmSolveOptions; panels: BodyState[] } | n
 }
 
 /**
- * Safety ceiling handed to the mesher, expressed in the mesher's own currency
- * (shell nodes × 6). The element size sets the density; this only stops a
+ * Safety ceiling in actual solver DOF for the selected element family.
+ * The element size sets the density; this only stops a
  * 5 mm mesh on a whole kitchen from producing a system the direct
  * factorization can't carry.
  *
@@ -1419,10 +1436,7 @@ function currentAsmOptions(): { opts: AsmSolveOptions; panels: BodyState[] } | n
 const CAE_DOF_CEILING = { shell: 200_000, solid: 90_000 } as const;
 
 function asmMaxDof(): number {
-  const solid = state.asm.meshKind === 'solid';
-  const dofPerShellNode = solid ? 3 * (state.asm.solidLayers + 1) : 6;
-  const shellNodes = CAE_DOF_CEILING[solid ? 'solid' : 'shell'] / dofPerShellNode;
-  return Math.ceil(shellNodes * 6);
+  return CAE_DOF_CEILING[state.asm.meshKind];
 }
 
 /** A mesh setting changed: the cached solve belongs to a mesh that no longer
@@ -1461,6 +1475,7 @@ asmDeformScale.addEventListener('change', () => {
 const bindShow = (el: HTMLInputElement, key: keyof typeof state.asm.show) => {
   el.addEventListener('change', () => {
     state.asm.show[key] = el.checked;
+    if (key === 'loads') repaintAsmLoadMarkers();
     paintCaeVisuals();
   });
 };
@@ -1512,6 +1527,7 @@ function panelLabel(b: BodyState): string {
 function asmPanelForBody(b: BodyState): AsmPanel {
   const f = panelMidFrame(b);
   return {
+    unsupportedReason: b.analysis.caeUnsupportedReason,
     id: b.id,
     label: panelLabel(b),
     outline: b.analysis.outline,
@@ -1548,10 +1564,10 @@ function detectAssemblyJoints() {
   void launchSidecar();
   ensureAsmCabinet();
   const panels = cabinetPanels();
-  if (panels.length < 2) {
+  if (panels.length < 1) {
     state.asm.joints = [];
     state.asm.detected = true;
-    state.asm.solveMsg = 'Select at least two panels of the cabinet to detect joints.';
+    state.asm.solveMsg = 'Select a board to build its mesh.';
     renderAnalysisSection();
     return;
   }
@@ -1567,7 +1583,8 @@ function detectAssemblyJoints() {
   state.asm.detected = true;
   state.asm.solveMsg = state.asm.joints.length
     ? `${state.asm.joints.length} joint${state.asm.joints.length === 1 ? '' : 's'} detected — set stiffness, add loads, then Solve.`
-    : 'No touching panel edges found. Raise the join tolerance if panels should be joined.';
+    : panels.length === 1 ? 'Board mesh ready. Add a load, then Solve.'
+      : 'No touching panel edges found. Raise the join tolerance if panels should be joined.';
   // Clear a stale solved overlay/result — joints changed.
   state.asm.analysis = null;
   state.asm.lastSolve = null;
@@ -1621,6 +1638,7 @@ function onAsmLoadsChanged() {
 function repaintAsmLoadMarkers() {
   // Clear markers for every cabinet body, then repaint placed loads.
   for (const b of cabinetPanels()) viewer.clearLoadMarkers(b.id);
+  if (!state.asm.show.loads) return;
   const grouped = new Map<number, CaeLoad[]>();
   for (const ld of state.asm.loads) {
     if (ld.panelId == null) continue;
@@ -1759,15 +1777,12 @@ async function solveAssemblyForCabinet(
   // --- PRIMARY: PyNite local sidecar. Serialize → POST → map displacements
   //     back → run the existing recovery/verdicts. Any failure falls through
   //     to the WASM/PCG path so a result is always produced. ---
-  if (pynite) {
+  if (pynite && solveOpts.meshKind !== 'solid' && (state.asm.preview?.mesh.dofCount ?? Infinity) <= 18_000) {
     await stage('Solving (PyNite local)…', 55);
     await yieldFrame();
-    // PyNite's pure-Python sparse assembly is O(nodes) and slow for dense
-    // cabinet meshes, so serialize it at a COARSER density (it's the isotropic-
-    // E_eff approximation backend — a coarser grid is consistent with its
-    // looser fidelity and keeps the local solve interactive). The recovery runs
-    // on this SAME coarse mesh, so displacement→stress stays self-consistent.
-    const ser = serializeAssembly({ ...solveOpts, targetNodesPerPanel: 140, maxDof: 18000 });
+    // PyNite supplies Q4 plates. Keep its input identical to the shell preview;
+    // larger jobs and H8 solids use the in-process solver at the chosen mesh.
+    const ser = serializeAssembly(solveOpts);
     if (ser.ok) {
       const sol = await pynite.solve(ser.model);
       if (sol && sol.disp.length === ser.pre.nDof) {
@@ -1970,11 +1985,19 @@ function paintCaeMesh() {
     return;
   }
   const fld = currentCaeField();
+  $('asmMeshViewHint').textContent = asmMeshView.value === 'wire'
+    ? mesh.nodesPerElem === 8
+      ? 'Actual H8 solver edges, including internal thickness layers. Enable Nodes to see every solver node.'
+      : 'Actual Q4 shell elements on board midsurfaces. No display triangle diagonals.'
+    : mesh.nodesPerElem === 8
+      ? 'Exterior H8 element faces. Switch to all element edges to inspect the interior.'
+      : 'Filled Q4 shell elements on board midsurfaces.';
   // The contour spans exactly what the legend says it spans.
   const range = fld ? caeContourRange(fld) : null;
   viewer.setCaeMeshFocus(true);
   viewer.showCaeMesh(mesh, {
-    faces: true,
+    faces: asmMeshView.value === 'surface',
+    volumeEdges: asmMeshView.value === 'wire',
     edges: true,
     points: st.show.nodes,
     field: fld?.field ?? null,
@@ -2082,6 +2105,7 @@ function paintCaeVisuals() {
   paintCaeCallouts();
   renderMeshStats();
   renderCaeLegend();
+  viewer.invalidate();
 }
 
 /** Mesh resolution + constraint counts under the Mesh controls. */
@@ -2106,18 +2130,24 @@ function renderMeshStats() {
     `<b>${mesh.elemCount.toLocaleString()}</b> ${elemWord} · <b>${mesh.nodeCount.toLocaleString()}</b> nodes · <b>${mesh.dofCount.toLocaleString()}</b> DOF`,
     `element ${size}`
     + `${mesh.kind === 'solid' ? ` · ${mesh.throughLayers} layer${mesh.throughLayers === 1 ? '' : 's'} through t` : ''}`,
+    `CAD boundaries: <b>${mesh.boundaryConforming ? 'conforming' : 'approximate'}</b> · area mismatch ${mesh.areaErrorMm2.toPrecision(3)} mm²`,
+    `Worst element aspect ratio: <b>${mesh.maxAspectRatio.toFixed(2)}</b>`,
+    `Minimum scaled Jacobian: <b>${mesh.minScaledJacobian.toFixed(3)}</b>`,
   ];
+  if (mesh.unstructuredPanels) rows.push(`Boundary-fitted mesh · ${mesh.unstructuredPanels} curved/oblique panel${mesh.unstructuredPanels === 1 ? '' : 's'} · imported curve chord tolerance 0.1 mm`);
   if (mesh.coarsened) {
     rows.push(
       `<span class="asm-mesh-warn">coarsened from ${asked} mm — that needed `
-      + `${mesh.uncappedDof.toLocaleString()} DOF, over the ${CAE_DOF_CEILING[mesh.kind].toLocaleString()} cap</span>`,
+      + `${mesh.uncappedDofEstimated ? 'about ' : ''}${mesh.uncappedDof.toLocaleString()} DOF, over the ${CAE_DOF_CEILING[mesh.kind].toLocaleString()} cap</span>`,
     );
   }
   if (cv) {
     rows.push(
       `<b>${cv.groundedCount.toLocaleString()}</b> fixed nodes · <b>${cv.jointLinks.length.toLocaleString()}</b> couplings · <b>${cv.loads.length.toLocaleString()}</b> loaded nodes (${cv.totalLoadN.toFixed(0)} N)`,
     );
+    if (cv.jointLinks.length) rows.push(`Joints: approximate node links · longest link ${cv.maxJointGapMm.toFixed(2)} mm`);
   }
+  for (const warning of mesh.qualityWarnings) rows.push(`<span class="asm-mesh-warn">${escapeHtml(warning)}</span>`);
   asmMeshStats.innerHTML = rows.map((r) => `<div class="asm-mesh-stat">${r}</div>`).join('');
 }
 
@@ -2262,6 +2292,7 @@ function renderAnalysisSection() {
   asmCabinetSelect.parentElement!.style.display = cabs.length > 1 ? '' : 'none';
 
   asmDetectBtn.disabled = !hasBodies;
+  asmDetectBtn.textContent = cabinetPanels().length === 1 ? 'Build mesh' : 'Detect joints';
   asmTolInput.value = state.units === 'in'
     ? String(Number(fromMm(state.asm.tolMm, 'in').toFixed(3)))
     : String(Number(fromMm(state.asm.tolMm, 'mm').toFixed(1)));
@@ -2279,7 +2310,9 @@ function renderAnalysisSection() {
   if (!state.asm.detected) {
     asmJointsSummary.innerHTML = '<span class="asm-hint">Detect joints to find touching panel edges.</span>';
   } else if (joints.length === 0) {
-    asmJointsSummary.innerHTML = '<span class="asm-hint">No joints found. Raise the tolerance if panels should touch.</span>';
+    asmJointsSummary.innerHTML = cabinetPanels().length === 1
+      ? '<span class="asm-hint">Single board · no assembly joints needed.</span>'
+      : '<span class="asm-hint">No joints found. Raise the tolerance if panels should touch.</span>';
   } else {
     const byStiff = { rigid: 0, 'semi-rigid': 0, hinged: 0 } as Record<JointStiffness, number>;
     for (const j of joints) byStiff[j.stiffness]++;
@@ -2594,7 +2627,7 @@ function applySidebarMode(mode: SidebarMode) {
     button.setAttribute('aria-selected', String(mode === key));
     button.tabIndex = mode === key ? 0 : -1;
   }
-  if (mode !== 'thickness') thicknessUI?.clearPreview();
+  if (mode !== 'thickness') { thicknessUI?.clearPreview(); thicknessUI?.clearInspection(); }
   $('app').classList.toggle('workspace-thickness', mode === 'thickness');
   $('thicknessWorkspaceHeader').hidden = mode !== 'thickness';
   $('thicknessReview').hidden = mode !== 'thickness';
@@ -2976,6 +3009,7 @@ async function runEstimate(opts: { seed?: number; deepSearch?: boolean } = {}) {
 
   nestBtn.disabled = true;
   nestBtn.textContent = 'Estimating…';
+  remoteHost?.schedule(0);
   resultsEmpty.hidden = false;
   resultsEmpty.textContent = 'Optimising layout…';
   resultsDetail.hidden = true;
@@ -2984,6 +3018,8 @@ async function runEstimate(opts: { seed?: number; deepSearch?: boolean } = {}) {
   downloadPdfBtn.disabled = true;
   downloadPhonePdfBtn.disabled = true;
   downloadCutlistPdfBtn.disabled = true;
+  downloadPcHtmlBtn.disabled = true;
+  downloadPhoneHtmlBtn.disabled = true;
   rearrangeBtn.disabled = true;
   replayBtn.disabled = true;
 
@@ -3064,6 +3100,7 @@ async function runEstimate(opts: { seed?: number; deepSearch?: boolean } = {}) {
     state.lastNest = result;
     state.partLabels = assignPartLabels(result);
     state.lastSheet = { w: sheetW, l: sheetL, margin, kerf };
+    planInputsSig = cutListSig();
     state.currentSheetKey = firstSheetKey(result);
     renderResults();
     renderConvergenceChart();
@@ -3079,6 +3116,7 @@ async function runEstimate(opts: { seed?: number; deepSearch?: boolean } = {}) {
     nestBtn.textContent = 'Estimate cut sheets';
     optimizeMoreBtn.disabled = !state.lastNest;
     thicknessUI?.refresh();
+    remoteHost?.schedule();
   }
 }
 
@@ -3296,6 +3334,7 @@ function renderResults() {
   const result = state.lastNest;
   const sz = state.lastSheet;
   if (!result || !sz) return;
+  remoteHost?.schedule();
 
   // Arm (or disarm) manual rearrange for the sheets about to be built. The
   // registry is rebuilt every render because the old SVG nodes are discarded.
@@ -3324,9 +3363,11 @@ function renderResults() {
   const parked = staging.length > 0;
   downloadDxfBtn.disabled = parked;
   downloadCutDxfBtn.disabled = parked;
-  downloadPdfBtn.disabled = parked;
-  downloadPhonePdfBtn.disabled = parked;
-  downloadCutlistPdfBtn.disabled = parked;
+  downloadPdfBtn.disabled = parked || packageExportBusy;
+  downloadPhonePdfBtn.disabled = parked || packageExportBusy;
+  downloadCutlistPdfBtn.disabled = parked || packageExportBusy;
+  downloadPcHtmlBtn.disabled = parked || packageExportBusy;
+  downloadPhoneHtmlBtn.disabled = parked || packageExportBusy;
   rearrangeBtn.disabled = false;
   pushPartLabelsToViewer();
   const totalSheets = result.groups.reduce((a, g) => a + g.sheets.length, 0);
@@ -3940,6 +3981,8 @@ async function exportPdf(btn: HTMLButtonElement, paper: string) {
   downloadPdfBtn.disabled = true;
   downloadPhonePdfBtn.disabled = true;
   downloadCutlistPdfBtn.disabled = true;
+  downloadPcHtmlBtn.disabled = true;
+  downloadPhoneHtmlBtn.disabled = true;
   btn.classList.add('busy');
   thicknessUI?.refresh();
   const setProgress = (label: string, pct: number) => {
@@ -4174,10 +4217,70 @@ async function exportPdf(btn: HTMLButtonElement, paper: string) {
   downloadPdfBtn.disabled = false;
   downloadPhonePdfBtn.disabled = false;
   downloadCutlistPdfBtn.disabled = false;
+  downloadPcHtmlBtn.disabled = staging.length > 0 || packageExportBusy;
+  downloadPhoneHtmlBtn.disabled = staging.length > 0 || packageExportBusy;
 }
 
 downloadPdfBtn.addEventListener('click', () => exportPdf(downloadPdfBtn, pdfPaperSelect.value));
 downloadPhonePdfBtn.addEventListener('click', () => exportPdf(downloadPhonePdfBtn, 'mobile'));
+
+/** Source meshes include applied thickness corrections and per-file transforms.
+ *  Clone geometry so encoding never depends on later viewer changes. */
+function capturePackageBodies(): PackageBody[] {
+  return state.bodies.map(b => {
+    const handle = viewer.bodies.find(h => h.id === b.id);
+    if (!handle) throw new Error(`Missing 3D body for ${b.name}.`);
+    handle.mesh.updateWorldMatrix(true, false);
+    const geometry = handle.mesh.geometry.clone().applyMatrix4(handle.mesh.matrixWorld);
+    try {
+      const position = geometry.getAttribute('position');
+      const normal = geometry.getAttribute('normal');
+      return { id: String(b.id), name: b.name, fileTag: b.fileTag, color: b.color,
+        length: b.analysis.length, width: b.analysis.width, thickness: applyThicknessOverride(b.analysis.thickness),
+        positions: Array.from(position.array), normals: normal ? Array.from(normal.array) : undefined,
+        indices: geometry.index ? Array.from(geometry.index.array) : Array.from({ length: position.count }, (_, i) => i) };
+    } finally { geometry.dispose(); }
+  });
+}
+
+/** Capture one immutable job revision before loading the export runtime. */
+async function exportInteractivePackage(layout: 'pc' | 'phone', button: HTMLButtonElement) {
+  if (packageExportBusy || modelBusy() || !state.lastNest || !state.lastSheet || staging.length) return;
+  thicknessUI?.clearPreview();
+  packageExportBusy = true;
+  button.classList.add('busy');
+  const buttons = [downloadPcHtmlBtn, downloadPhoneHtmlBtn, downloadPdfBtn, downloadPhonePdfBtn, downloadCutlistPdfBtn];
+  const originalLabel = button.innerHTML;
+  const previousDisabled = buttons.map(b => b.disabled);
+  buttons.forEach(b => { b.disabled = true; });
+  button.textContent = 'Preparing build package…';
+  const nestAtStart = state.lastNest;
+  try {
+    // Source meshes include applied thickness corrections and per-file transforms.
+    // Clone geometry so encoding never depends on later viewer changes.
+    const bodies = capturePackageBodies();
+    const data = buildPackageData({ jobName: state.jobName || 'Plywood cut estimate', units: state.units,
+      margin: state.lastSheet.margin, kerf: state.lastSheet.kerf, kerfRef: state.kerfRef,
+      sequenceStyle: state.sequenceStyle, strategy: state.lastStrategy, nest: nestAtStart,
+      bodies, segments: state.splitSegmentGeo, overrides: loadAllOverrides() });
+    await yieldFrame();
+    button.textContent = 'Packaging offline viewer…';
+    const { downloadPackage } = await import('./packageExport');
+    downloadPackage(data, layout);
+    setStatus(`${layout === 'pc' ? 'PC / tablet' : 'Phone'} build package downloaded. Open the HTML file in your browser.`);
+  } catch (err) {
+    console.error('HTML package export failed', err);
+    setStatus(`Could not export the build package: ${err instanceof Error ? err.message : String(err)}`, 'error');
+  } finally {
+    packageExportBusy = false;
+    button.classList.remove('busy');
+    button.innerHTML = originalLabel;
+    const unavailable = !state.lastNest || !state.lastSheet || staging.length > 0 || nestBtn.textContent?.includes('Estimating');
+    buttons.forEach((b, i) => { b.disabled = !!unavailable || previousDisabled[i]; });
+  }
+}
+downloadPcHtmlBtn.addEventListener('click', () => void exportInteractivePackage('pc', downloadPcHtmlBtn));
+downloadPhoneHtmlBtn.addEventListener('click', () => void exportInteractivePackage('phone', downloadPhoneHtmlBtn));
 
 /**
  * Push each body's sheet panel id ("1a", or "1a,2c" when a part is split
@@ -4391,7 +4494,7 @@ function invalidateCorrectedResults() {
   detailSvg.innerHTML = '';
   convergenceChart.innerHTML = '';
   for (const button of [downloadDxfBtn, downloadCutDxfBtn, downloadPdfBtn, downloadPhonePdfBtn,
-    downloadCutlistPdfBtn, optimizeMoreBtn, replayBtn, rearrangeBtn]) button.disabled = true;
+    downloadCutlistPdfBtn, downloadPcHtmlBtn, downloadPhoneHtmlBtn, optimizeMoreBtn, replayBtn, rearrangeBtn]) button.disabled = true;
   renderShoppingList();
   state.asm.preview = null;
   clearAssembly();
@@ -4436,4 +4539,96 @@ thicknessUI = mountThicknessCorrection({
   },
   onApply: (cabinet, proposal) => installCorrectedGeometry(cabinet, proposal),
   onReset: cabinet => installCorrectedGeometry(cabinet, null),
+  onInspect: (cabinet, ids) => {
+    const live = new Map(cabinet?.applied?.panels.map(panel => [panel.id, panel.mesh]));
+    viewer.inspectThicknessMeshes(cabinet?.inputs.filter(input => ids.includes(input.id)).map(input => live.get(input.id) ?? input.mesh) ?? []);
+  },
+});
+
+// --------------------------------------------------------------------------
+// Shop remote: phone on the LAN mirrors the job and edits the cut list.
+// --------------------------------------------------------------------------
+/** What the plan depends on from the cut list; a mismatch marks it stale. */
+function cutListSig(): string {
+  return JSON.stringify(state.bodies.filter(b => b.selected).map(b =>
+    [b.id, b.qty, b.grain, b.rotation, b.material, applyThicknessOverride(b.analysis.thickness)]));
+}
+
+function remoteSnapshot(): RemoteJob {
+  let plan: RemoteJob['plan'] = null;
+  if (state.lastNest && state.lastSheet) {
+    try {
+      // Meshes travel separately (remoteModels); bodies here only carry identity.
+      const { models: _models, ...rest } = buildPackageData({ jobName: state.jobName || 'Plywood cut estimate', units: state.units,
+        margin: state.lastSheet.margin, kerf: state.lastSheet.kerf, kerfRef: state.kerfRef,
+        sequenceStyle: state.sequenceStyle, strategy: state.lastStrategy, nest: state.lastNest,
+        bodies: state.bodies.map(b => ({ id: String(b.id), name: b.name, fileTag: b.fileTag, color: b.color,
+          length: b.analysis.length, width: b.analysis.width, thickness: applyThicknessOverride(b.analysis.thickness),
+          positions: [], indices: [] })),
+        segments: state.splitSegmentGeo, overrides: loadAllOverrides(), withModels: false });
+      plan = rest;
+    } catch (err) { console.warn('Shop remote: plan not shareable', err); }
+  }
+  return {
+    jobName: state.jobName || 'Plywood cut estimate', units: state.units, publishedAt: new Date().toISOString(),
+    busy: geometryBusy, status: loadStatus.textContent ?? '',
+    stale: plan !== null && planInputsSig !== cutListSig(),
+    bodies: state.bodies.map(b => ({ id: String(b.id), name: b.name, fileTag: b.fileTag, color: b.color,
+      length: b.analysis.length, width: b.analysis.width, thickness: applyThicknessOverride(b.analysis.thickness),
+      qty: b.qty, selected: b.selected, grain: b.grain, rotation: b.rotation,
+      material: b.material ? MATERIALS.find(m => m.id === b.material)?.name ?? b.material : 'Job default' })),
+    stock: state.shopping.map(r => ({ thickness: r.thickness, sheetW: r.sheetW, sheetL: r.sheetL, need: r.need, have: r.have, buy: r.buy })),
+    plan,
+  };
+}
+
+/** Mesh revision: body identity, triangle count and placement. Cheap to compute. */
+function remoteModels() {
+  const rev = viewer.bodies.map(h => {
+    h.mesh.updateWorldMatrix(true, false);
+    return `${h.id}:${h.mesh.geometry.getAttribute('position').count}:${h.mesh.matrixWorld.elements.map(v => v.toFixed(2)).join(',')}`;
+  }).join('|');
+  return { rev: String(rev.length) + ':' + hashString(rev), build: () => encodeModels(capturePackageBodies()) };
+}
+function hashString(s: string): string {
+  let h = 2166136261;
+  for (let i = 0; i < s.length; i++) h = Math.imul(h ^ s.charCodeAt(i), 16777619);
+  return (h >>> 0).toString(16);
+}
+
+let remotePlanTimer: ReturnType<typeof setTimeout> | undefined;
+/** Re-plan after phone edits settle; wait out any estimate already running. */
+function remotePlanSoon(delay: number) {
+  clearTimeout(remotePlanTimer);
+  remotePlanTimer = setTimeout(() => {
+    if (modelBusy()) { remotePlanSoon(600); return; }
+    if (state.bodies.some(b => b.selected)) void runEstimate();
+  }, delay);
+}
+
+function handleRemoteCommand(cmd: RemoteCommand) {
+  if (cmd.type === 'estimate') { remotePlanSoon(0); return; }
+  if (cmd.type !== 'body') return;
+  const b = state.bodies.find(x => String(x.id) === cmd.id);
+  if (!b) return;
+  const p = cmd.patch;
+  if (typeof p.qty === 'number' && Number.isFinite(p.qty)) b.qty = Math.max(1, Math.min(999, Math.round(p.qty)));
+  if (typeof p.selected === 'boolean') b.selected = p.selected;
+  if (p.grain === 'free' || p.grain === 'length' || p.grain === 'width') {
+    b.grain = p.grain;
+    pushGrainToViewer(b);
+    refreshWeakBodies();
+  }
+  if (p.rotation === 'lock' || p.rotation === 'flip90' || p.rotation === 'any') b.rotation = p.rotation;
+  syncViewerSelectionFromState();
+  renderBodyList();
+  updateNestBtn();
+  setStatus(`Phone edit: ${b.name}. Re-planning…`);
+  if (state.lastNest) remotePlanSoon(900);
+}
+
+remoteHost = mountRemoteHost(document.getElementById('remoteBtn') as HTMLButtonElement, {
+  snapshot: remoteSnapshot, models: remoteModels, onCommand: handleRemoteCommand,
+  sections: () => analysisCabinets().map(name => ({ name,
+    parts: [...new Set(state.bodies.filter(b => b.selected && b.fileTag === name).map(b => b.name))] })),
 });

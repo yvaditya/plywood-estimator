@@ -1,0 +1,82 @@
+"""Standalone packages: real WebGL, offline file URLs, touch layouts, storage fallbacks."""
+from pathlib import Path
+from playwright.sync_api import sync_playwright, expect
+
+out = Path(__file__).resolve().parent / '_output' / 'package'
+with sync_playwright() as p:
+    browser = p.chromium.launch(headless=True)
+    for mode, width, height in [('pc',1440,1000),('pc',820,1180),('phone',390,844),('phone',844,390)]:
+        context=browser.new_context(viewport={'width':width,'height':height},has_touch=width<1000,offline=True)
+        page=context.new_page()
+        errors=[]; requests=[]
+        page.on('pageerror',lambda e:errors.append(str(e)))
+        page.on('request',lambda r:requests.append(r.url) if r.url.startswith(('http:','https:')) else None)
+        page.goto((out/f'cabinet_{mode}.html').as_uri(),wait_until='load')
+        expect(page.locator('#job-title')).to_have_text('Workshop cabinet')
+        expect(page.locator('#cuts-panel')).to_be_visible()
+        expect(page.locator('#assembly-panel')).to_be_hidden()
+        page.locator('#next-cut').click()
+        expect(page.locator('.cut-overlay line')).to_have_count(1)
+        expect(page.locator('#cut-select')).to_have_value('0')
+        page.locator('#previous-cut').click()
+        page.locator('#sheet-zoom-in').click()
+        expect(page.locator('#sheet-zoom-label')).to_have_text('150%')
+        page.locator('#sheet-fit').click()
+        page.screenshot(path=str(out/f'{mode}-{width}-cutting.png'),full_page=True)
+        page.locator('button[data-stage="assembly"]').click()
+        expect(page.locator('#model canvas')).to_be_visible()
+        assert page.evaluate('document.documentElement.scrollWidth <= innerWidth'), 'No page overflow'
+        initial=page.locator('#model').screenshot()
+        page.locator('#explode').fill('65')
+        page.wait_for_timeout(200)
+        assert page.locator('#model').screenshot()!=initial, 'Explosion changes geometry'
+        page.locator('#reset-view').click()
+        before_orbit=page.locator('#model').screenshot()
+        canvas=page.locator('#model canvas').bounding_box()
+        cx=canvas['x']+canvas['width']/2;cy=canvas['y']+canvas['height']/2
+        page.mouse.move(cx,cy);page.mouse.down();page.mouse.move(cx+60,cy+25,steps=6);page.mouse.up()
+        page.wait_for_timeout(100)
+        assert page.locator('#model').screenshot()!=before_orbit, 'Dragging rotates the actual CAD model'
+        page.locator('#reset-view').click()
+        page.locator('button[data-stage="cutting"]').click()
+        if mode=='phone': page.locator('[data-view="parts"]').click()
+        page.locator('.part-select').first.click()
+        expect(page.locator('#selected-details')).to_contain_text('Show in model')
+        page.locator('.cut-check').first.check()
+        expect(page.locator('#progress-text')).to_contain_text('1 cut')
+        page.locator('.assembled-check').first.check()
+        expect(page.locator('#progress-text')).to_contain_text('1 assembled')
+        page.locator('#part-search').fill('Shelf')
+        expect(page.locator('#inventory-body tr')).to_have_count(2)
+        page.locator('#part-search').fill('')
+        page.locator('#show-sheet').click()
+        expect(page.locator('.sheet-part.selected').first).to_be_visible()
+        page.locator('.sheet-part').last.click()
+        expect(page.locator('#selected-details')).not_to_be_empty()
+        page.locator('#show-model').click()
+        expect(page.locator('#model canvas')).to_be_visible()
+        page.locator('#isolate').click()
+        expect(page.locator('#isolate')).to_have_attribute('aria-pressed','true')
+        page.locator('#restore-all').click()
+        expect(page.locator('#isolate')).to_have_attribute('aria-pressed','false')
+        page.evaluate('window.scrollTo(0,0)')
+        page.screenshot(path=str(out/f'{mode}-{width}.png'),full_page=True)
+        page.reload(wait_until='load')
+        expect(page.locator('#progress-text')).to_contain_text('1 cut')
+        assert not errors, errors
+        assert not requests, requests
+        context.close()
+    context=browser.new_context(offline=True)
+    page=context.new_page()
+    page.add_init_script("""Object.defineProperty(window,'localStorage',{get(){throw new Error('blocked')}});
+    HTMLCanvasElement.prototype.getContext=function(){return null};""")
+    page.goto((out/'cabinet_phone.html').as_uri(),wait_until='load')
+    page.locator('button[data-stage="assembly"]').click()
+    expect(page.locator('#model')).to_contain_text('3D view unavailable')
+    page.locator('button[data-stage="cutting"]').click()
+    page.locator('[data-view="parts"]').click()
+    page.locator('.cut-check').first.check()
+    expect(page.locator('#progress-text')).to_contain_text('1 cut')
+    expect(page.locator('#storage-note')).to_contain_text('this session')
+    context.close(); browser.close()
+print('Standalone offline checks passed: desktop, tablet, portrait/landscape phone, WebGL/storage fallbacks')

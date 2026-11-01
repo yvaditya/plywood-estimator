@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+    <meta name="theme-color" content="#ffffff" />
+    <title>Shop Remote</title>
+  </head>
+  <body>
+    <header class="r-top">
+      <div class="r-title">
+        <h1 id="jobName">Shop remote</h1>
+        <p id="jobSub">Connecting to the computer…</p>
+      </div>
+      <select id="section" class="r-section" aria-label="Section" hidden></select>
+      <span id="conn" class="r-conn" title="Connection"></span>
+    </header>
+    <div id="banner" class="r-banner" hidden></div>
+    <main>
+      <section id="tab-inventory" class="r-tab" aria-label="Inventory"></section>
+      <section id="tab-cuts" class="r-tab" aria-label="Cut list" hidden></section>
+      <section id="tab-3d" class="r-tab r-tab-3d" aria-label="3D view" hidden>
+        <div class="r-model-tools">
+          <label class="r-explode">Explode <input id="explode" type="range" min="0" max="100" value="0" /></label>
+          <button id="isolate" type="button" aria-pressed="false" disabled>Isolate</button>
+          <button id="resetView" type="button">Reset</button>
+        </div>
+        <div id="chips" class="r-chips" aria-label="Panels"></div>
+        <div id="model" class="r-model"></div>
+      </section>
+    </main>
+    <aside id="card" class="r-card" hidden aria-live="polite"></aside>
+    <nav class="r-tabs" aria-label="Sections">
+      <button data-tab="inventory" class="active" aria-pressed="true"><span>1</span>Inventory</button>
+      <button data-tab="cuts" aria-pressed="false"><span>2</span>Cut list</button>
+      <button data-tab="3d" aria-pressed="false"><span>3</span>3D</button>
+    </nav>
+    <div id="toast" class="r-toast" hidden></div>
+    <script type="module" src="/src/remote.ts"></script>
+  </body>
+</html>

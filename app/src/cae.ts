@@ -17,6 +17,9 @@
  */
 
 import type { PolygonOutline, Vec2 } from './geometry';
+import { meshBoundaryQuads } from './caeBoundaryMesh';
+import { quadGeometry, quadMembraneK, quadPlateK, extrudedHexK, extrudedHexStrain } from './caeElements';
+import { patchNodalWeights } from './caeLoads';
 
 // ---------------------------------------------------------------------------
 // Material cards
@@ -839,6 +842,8 @@ export function rectOutline(length: number, width: number): PolygonOutline {
  *  unit axes local X (length), local Y (width) and the plate normal run along.
  */
 export interface AsmPanel {
+  /** Source geometry cannot be represented as a constant-thickness planar board. */
+  unsupportedReason?: string;
   /** Stable id (the body id). Used to key results + joints. */
   id: number;
   /** Short label for the UI/PDF, e.g. "1a". */
@@ -942,6 +947,11 @@ export type SolveBackend = 'PyNite (isotropic E_eff)' | 'Eigen LDLT (wasm)' | 'P
 
 /** Per-panel deflection field, in that panel's local grid (like SolveResult). */
 export interface AsmPanelResult {
+  /** Explicit local solver nodes and Q4 connectivity, including curved outlines. */
+  uv: Vec2[];
+  quads: [number, number, number, number][];
+  /** Actual nonuniform outline coordinates of grid nodes. */
+  xs: number[]; ys: number[];
   id: number;
   nx: number; ny: number; dx: number; dy: number;
   /** Per-node transverse deflection magnitude |u·? | — the total translational
@@ -1026,6 +1036,17 @@ export interface AsmResult {
 export type MeshKind = 'shell' | 'solid';
 
 export interface CaeMeshView {
+  /** Panels using an unstructured, outline-conforming Q4 mesh. */
+  unstructuredPanels: number;
+  /** Minimum corner scaled Jacobian; 1 is orthogonal, <= 0 is invalid. */
+  minScaledJacobian: number;
+  boundaryConforming: boolean;
+  maxAspectRatio: number;
+  qualityWarnings: string[];
+  /** Uncapped DOF uses an analytic estimate when pre-coarsening was needed. */
+  uncappedDofEstimated: boolean;
+  /** Absolute discrepancy between meshed and CAD planar area, mm². */
+  areaErrorMm2: number;
   kind: MeshKind;
   /** World node positions, 3 floats per node, in solver node order. */
   nodes: Float32Array;
@@ -1064,6 +1085,9 @@ export interface CaeConstraintView {
   groundedCount: number;
   /** The node-pair couplings — one per penalty spring set. */
   jointLinks: CaeJointLink[];
+  /** Connections are approximate nearest-node penalty springs, not conforming seams. */
+  jointModel: 'nearest-node penalty';
+  maxJointGapMm: number;
   /** Nodal force vectors from the patch loads. */
   loads: CaeNodalLoad[];
   /** Σ|F| over the loaded nodes (N). */
@@ -1267,10 +1291,8 @@ export interface SidecarModel {
   links: SidecarLink[];
   supports: number[];
   loads: SidecarLoad[];
-  /** The per-DOF soft grounding-spring stiffness the app's OWN solver uses
-   *  (repStiff·1e-4). Passing it lets the sidecar regularize residual
-   *  rigid-body / weakly-coupled-sub-assembly modes identically to cae.ts —
-   *  strong enough to pin an orphan panel, negligible for a constrained DOF. */
+  /** Legacy explicit foundation stiffness. Assembly models serialize zero:
+   * unsupported mechanisms must fail rather than acquire artificial supports. */
   kSoft: number;
 }
 
@@ -1404,17 +1426,13 @@ function addBtDBWith(K: number[][], B: number[][], D: number[][], wgt: number) {
 // ---------------------------------------------------------------------------
 // JOINT DETECTION
 // ---------------------------------------------------------------------------
-/** The four world edges of a panel's outline bbox, each as [p0,p1,length]. */
-function panelBboxEdges(p: AsmPanel): { p0: Vec3World; p1: Vec3World; len: number }[] {
-  const w = p.outline.bbox.w, h = p.outline.bbox.h;
+/** Actual material boundary segments, including hole rims. Bounding-box
+ * corners can lie in air on curved boards and must never create contacts. */
+function panelBoundaryEdges(p: AsmPanel): { p0: Vec3World; p1: Vec3World; len: number }[] {
   const c = (ox: number, oy: number) => panelLocalToWorld(p, ox, oy);
   const seg = (a: Vec3World, b: Vec3World) => ({ p0: a, p1: b, len: w3len(w3sub(b, a)) });
-  return [
-    seg(c(0, 0), c(w, 0)),   // bottom
-    seg(c(w, 0), c(w, h)),   // right
-    seg(c(w, h), c(0, h)),   // top
-    seg(c(0, h), c(0, 0)),   // left
-  ];
+  return [p.outline.outer,...p.outline.holes].flatMap(ring =>
+    ring.map((a,i) => seg(c(...a),c(...ring[(i+1)%ring.length]))));
 }
 
 /**
@@ -1480,7 +1498,7 @@ function pointOnPanel(
 function bestContact(a: AsmPanel, b: AsmPanel, tol: number): { p0: Vec3World; p1: Vec3World; len: number } | null {
   const tryDir = (src: AsmPanel, dst: AsmPanel): { p0: Vec3World; p1: Vec3World; len: number } | null => {
     let best: { p0: Vec3World; p1: Vec3World; len: number } | null = null;
-    for (const e of panelBboxEdges(src)) {
+    for (const e of panelBoundaryEdges(src)) {
       if (e.len < 1e-3) continue;
       const steps = Math.max(8, Math.min(200, Math.ceil(e.len / 10)));
       let runStart = -1;
@@ -1517,6 +1535,10 @@ function bestContact(a: AsmPanel, b: AsmPanel, tol: number): { p0: Vec3World; p1
 // ASSEMBLY MESH + SOLVE
 // ---------------------------------------------------------------------------
 interface PanelMesh {
+  uv: Vec2[];
+  quads: [number, number, number, number][];
+  unstructured: boolean;
+  xs: number[]; ys: number[];
   panel: AsmPanel;
   nx: number; ny: number; dx: number; dy: number;
   active: Uint8Array;
@@ -1527,7 +1549,8 @@ interface PanelMesh {
 }
 
 /**
- * Rasterise one panel into a grid.
+ * Build a boundary-conforming rectilinear grid; every CAD vertex coordinate
+ * is a mandatory grid line, so cell-centre classification cannot cross an edge.
  *
  * `elementSizeMm`, when given, is the ABSOLUTE target element edge — the way a
  * mesh size is normally specified, and the only way an element size means the
@@ -1535,49 +1558,70 @@ interface PanelMesh {
  * active nodes per panel gives every panel the same node COUNT regardless of
  * size, which silently under-resolves the big ones.
  */
-function meshPanel(p: AsmPanel, target: number, elementSizeMm?: number): {
-  nx: number; ny: number; dx: number; dy: number;
-  active: Uint8Array; activeCells: [number, number][]; activeCount: number;
-} {
-  const bboxW = p.outline.bbox.w;
-  const bboxH = p.outline.bbox.h;
-  let nx: number, ny: number;
-  if (elementSizeMm && elementSizeMm > 0) {
-    // CEIL, not round: the requested size is a MAXIMUM edge length. Rounding
-    // lets a panel whose length doesn't divide evenly come out coarser than
-    // asked for (a 101 mm rail at "20 mm" rounds to 5 divisions → 20.3 mm
-    // elements). Ceiling guarantees every element is ≤ the requested size on
-    // both axes, which is what selecting a mesh size is supposed to promise.
-    nx = Math.ceil(bboxW / elementSizeMm) + 1;
-    ny = Math.ceil(bboxH / elementSizeMm) + 1;
-  } else {
-    const areaFrac = Math.max(0.15, outlineArea(p.outline) / (bboxW * bboxH || 1));
-    const aspect = bboxW / (bboxH || 1);
-    ny = Math.round(Math.sqrt((target / areaFrac) / aspect)) + 1;
-    nx = Math.round(ny * aspect) + 1;
-  }
-  nx = Math.max(nx, 4); ny = Math.max(ny, 4);
-  const dx = bboxW / (nx - 1);
-  const dy = bboxH / (ny - 1);
-  const nNodes = nx * ny;
-  const active = new Uint8Array(nNodes);
-  const activeCells: [number, number][] = [];
-  const nodeIdx = (ix: number, iy: number) => iy * nx + ix;
-  for (let iy = 0; iy < ny - 1; iy++) {
-    for (let ix = 0; ix < nx - 1; ix++) {
-      const cx = (ix + 0.5) * dx, cy = (iy + 0.5) * dy;
-      if (pointInOutline(cx, cy, p.outline)) {
-        activeCells.push([ix, iy]);
-        active[nodeIdx(ix, iy)] = 1;
-        active[nodeIdx(ix + 1, iy)] = 1;
-        active[nodeIdx(ix, iy + 1)] = 1;
-        active[nodeIdx(ix + 1, iy + 1)] = 1;
-      }
+function meshPanel(p: AsmPanel, target: number, elementSizeMm?: number) {
+  const { w, h } = p.outline.bbox;
+  if (!(w > 0 && h > 0)) throw new Error('Panel has invalid dimensions.');
+  const rings = [p.outline.outer, ...p.outline.holes];
+  const eps = Math.max(w, h) * 1e-8;
+  let rectilinear = true;
+  for (const ring of rings) {
+    if (ring.length < 3) throw new Error('Panel boundary has fewer than three vertices.');
+    for (let i = 0; i < ring.length; i++) {
+      const a = ring[i], b = ring[(i + 1) % ring.length];
+      if (!a.every(Number.isFinite) || a[0] < -eps || a[1] < -eps || a[0] > w + eps || a[1] > h + eps)
+        throw new Error('Panel boundary is invalid or outside its bounding box.');
+      if (Math.abs(a[0] - b[0]) > eps && Math.abs(a[1] - b[1]) > eps)
+        rectilinear = false;
     }
   }
-  let activeCount = 0;
-  for (let i = 0; i < nNodes; i++) if (active[i]) activeCount++;
-  return { nx, ny, dx, dy, active, activeCells, activeCount };
+  const size = elementSizeMm && elementSizeMm > 0 ? elementSizeMm : Math.sqrt(outlineArea(p.outline) / Math.max(4, target));
+  if (!rectilinear) {
+    const { uv, quads } = meshBoundaryQuads(p.outline, size);
+    // Grid metadata is retained for legacy callers; explicit coordinates and
+    // connectivity, never a fictitious grid, drive all assembly operations.
+    return { uv, quads, unstructured: true, nx: uv.length, ny: 1,
+      xs: [] as number[], ys: [] as number[], dx: size, dy: size,
+      active: new Uint8Array(uv.length).fill(1), activeCells: [] as [number, number][], activeCount: uv.length };
+  }
+  const axis = (k: number, extent: number) => {
+    const values = [0, extent, ...rings.flatMap(r => r.map(v => v[k]))].sort((a,b)=>a-b);
+    const cuts = values.filter((v,i)=>i===0 || v-values[i-1]>eps);
+    const out = [cuts[0]];
+    for (let i=1;i<cuts.length;i++) {
+      const span = cuts[i]-cuts[i-1], n = Math.max(1, Math.ceil(span/size));
+      if (out.length+n > 100000) throw new Error('Requested mesh exceeds safe allocation size. Increase element size.');
+      for(let j=1;j<=n;j++) out.push(cuts[i-1]+span*j/n);
+    }
+    return out;
+  };
+  const xs = axis(0,w), ys = axis(1,h), nx = xs.length, ny = ys.length;
+  if(nx*ny>2000000) throw new Error('Requested boundary grid exceeds safe allocation size. Increase element size.');
+  const active = new Uint8Array(nx*ny), activeCells: [number,number][] = [];
+  let area = 0;
+  for(let iy=0;iy<ny-1;iy++) for(let ix=0;ix<nx-1;ix++) {
+    if(pointInOutline((xs[ix]+xs[ix+1])/2,(ys[iy]+ys[iy+1])/2,p.outline)) {
+      activeCells.push([ix,iy]); area+=(xs[ix+1]-xs[ix])*(ys[iy+1]-ys[iy]);
+      for(const n of [iy*nx+ix,iy*nx+ix+1,(iy+1)*nx+ix,(iy+1)*nx+ix+1]) active[n]=1;
+    }
+  }
+  if(activeCells.length===0) throw new Error('Panel has no active elements.');
+  // A panel must be edge-connected: a vertex-only contact is not a valid plate.
+  const cells = new Set(activeCells.map(([ix,iy])=>iy*(nx-1)+ix));
+  const queue=[activeCells[0]], seen = new Set<number>();
+  for(let at=0;at<queue.length;at++) {
+    const [ix,iy]=queue[at], id=iy*(nx-1)+ix;
+    if(seen.has(id)) continue; seen.add(id);
+    for(const [jx,jy] of [[ix-1,iy],[ix+1,iy],[ix,iy-1],[ix,iy+1]]) {
+      const next=jy*(nx-1)+jx;
+      if(jx>=0 && jy>=0 && jx<nx-1 && jy<ny-1 && cells.has(next) && !seen.has(next)) queue.push([jx,jy]);
+    }
+  }
+  if(seen.size!==activeCells.length) throw new Error('Panel mesh contains disconnected regions. Split the CAD into separate panels.');
+  const areaError = Math.abs(area-outlineArea(p.outline));
+  if(areaError>Math.max(1e-6,area*1e-8)) throw new Error('Panel boundary is invalid: mesh area does not match CAD area. Check overlapping holes or self-intersections.');
+  const uv: Vec2[] = ys.flatMap(y => xs.map(x => [x, y] as Vec2));
+  const quads: [number,number,number,number][] = activeCells.map(([ix,iy]) => [iy*nx+ix,iy*nx+ix+1,(iy+1)*nx+ix+1,(iy+1)*nx+ix]);
+  return {uv,quads,unstructured:false,nx,ny,xs,ys,dx:w/(nx-1),dy:h/(ny-1),active,activeCells,activeCount:active.reduce((a,b)=>a+b,0)};
 }
 
 // ---------------------------------------------------------------------------
@@ -1682,6 +1726,7 @@ interface AsmPreprocess {
   achievedSizeMm?: number;
   /** DOF the requested size would have produced — what the cap refused. */
   uncappedDof: number;
+  uncappedDofEstimated: boolean;
   /** True when the DOF cap forced a coarser mesh than requested. */
   coarsened: boolean;
 }
@@ -1691,7 +1736,13 @@ interface AsmPreFail { fail: true; message: string; resolutionLog: string; total
 
 function preprocessAssembly(opts: AsmSolveOptions, report: (p: SolveProgress) => void): AsmPreprocess | AsmPreFail {
   const { panels, joints, loads, tolMm } = opts;
+  if (!Number.isFinite(opts.tolMm) || opts.tolMm < 0
+    || (opts.solidLayers !== undefined && !(Number.isFinite(opts.solidLayers) && opts.solidLayers >= 1))
+    || (opts.targetNodesPerPanel !== undefined && !(Number.isFinite(opts.targetNodesPerPanel) && opts.targetNodesPerPanel > 0)))
+    return {fail:true,message:'Mesh controls must be finite; layers and target nodes must be positive, and contact tolerance nonnegative.',resolutionLog:'Invalid mesh options',totalNodes:0,nDof:0};
   const maxDof = opts.maxDof ?? 60000;
+  const meshDofPerNode = opts.meshKind === 'solid' ? 3 * (Math.max(1, Math.round(opts.solidLayers ?? 2)) + 1) : 6;
+  if(!(Number.isFinite(maxDof) && maxDof>0) || (opts.elementSizeMm !== undefined && !(Number.isFinite(opts.elementSizeMm) && opts.elementSizeMm>0))) return {fail:true,message:'Mesh size and DOF cap must be positive finite values.',resolutionLog:'Invalid mesh options',totalNodes:0,nDof:0};
   let target = opts.targetNodesPerPanel ?? 600;
   let elementSize = opts.elementSizeMm;
 
@@ -1707,6 +1758,7 @@ function preprocessAssembly(opts: AsmSolveOptions, report: (p: SolveProgress) =>
   let coarsened = false;
   const requestedSizeMm = elementSize;
   let uncappedDof = 0;
+  let uncappedDofEstimated = false;
 
   // PRE-ESTIMATE the node count analytically and coarsen the size BEFORE
   // building anything. A 5 mm request on a 2.4 m cabinet is several hundred
@@ -1723,10 +1775,11 @@ function preprocessAssembly(opts: AsmSolveOptions, report: (p: SolveProgress) =>
       }
       return n;
     };
-    uncappedDof = Math.round(estNodes(elementSize) * 6);
+    uncappedDof = Math.round(estNodes(elementSize) * meshDofPerNode);
+    uncappedDofEstimated = true;
     let guard = 0;
-    while (estNodes(elementSize) * 6 > maxDof && guard++ < 60) {
-      const need = Math.sqrt((estNodes(elementSize) * 6) / maxDof);
+    while (estNodes(elementSize) * meshDofPerNode > maxDof && guard++ < 60) {
+      const need = Math.sqrt((estNodes(elementSize) * meshDofPerNode) / maxDof);
       elementSize *= Math.max(1.08, need);
       coarsened = true;
     }
@@ -1737,40 +1790,42 @@ function preprocessAssembly(opts: AsmSolveOptions, report: (p: SolveProgress) =>
     totalNodes = 0;
     const nodeTable: Vec3World[] = [];
     for (const p of panels) {
-      const m = meshPanel(p, target, elementSize);
-      const gnode = new Int32Array(m.nx * m.ny).fill(-1);
-      for (let iy = 0; iy < m.ny; iy++) {
-        for (let ix = 0; ix < m.nx; ix++) {
-          const n = iy * m.nx + ix;
-          if (m.active[n]) {
-            gnode[n] = nodeTable.length;
-            nodeTable.push(panelLocalToWorld(p, ix * m.dx, iy * m.dy));
-          }
+      let m: ReturnType<typeof meshPanel>;
+      if (p.unsupportedReason) return {fail:true,message:`Panel ${p.label}: ${p.unsupportedReason}`,resolutionLog:'Unsupported CAD geometry',totalNodes:0,nDof:0};
+      try { m = meshPanel(p, target, elementSize); }
+      catch(error) { return {fail:true,message:`Panel ${p.label}: ${error instanceof Error ? error.message : String(error)}`,resolutionLog:'Mesh refused',totalNodes:0,nDof:0}; }
+      const gnode = new Int32Array(m.uv.length).fill(-1);
+      for (let n = 0; n < m.uv.length; n++) {
+        if (m.active[n]) {
+          gnode[n] = nodeTable.length;
+          nodeTable.push(panelLocalToWorld(p, m.uv[n][0], m.uv[n][1]));
         }
       }
-      meshes.push({ panel: p, nx: m.nx, ny: m.ny, dx: m.dx, dy: m.dy, active: m.active, activeCells: m.activeCells, gnode });
+      meshes.push({ ...m, panel: p, gnode });
       totalNodes += m.activeCount;
     }
-    if (attempt === 0 && !uncappedDof) uncappedDof = totalNodes * 6;
-    if (totalNodes * 6 <= maxDof) break;
+    if (attempt === 0 && !coarsened) { uncappedDof = totalNodes * meshDofPerNode; uncappedDofEstimated = false; }
+    if (totalNodes * (opts.meshKind === 'solid' ? 3 * (Math.max(1, Math.round(opts.solidLayers ?? 2)) + 1) : 6) <= maxDof) break;
     coarsened = true;
     if (elementSize && elementSize > 0) {
       // Node count scales ~1/size², so this is the step that just clears the
       // cap, floored at +15% so it always makes progress.
-      const need = Math.sqrt((totalNodes * 6) / maxDof);
+      const need = Math.sqrt((totalNodes * meshDofPerNode) / maxDof);
       elementSize *= Math.max(1.15, need);
     } else {
-      target = Math.max(120, Math.floor(target * (maxDof / (totalNodes * 6)) * 0.9));
+      target = Math.max(120, Math.floor(target * (maxDof / (totalNodes * meshDofPerNode)) * 0.9));
     }
   }
 
+  const actualDof = totalNodes * (opts.meshKind === 'solid' ? 3 * (Math.max(1, Math.round(opts.solidLayers ?? 2)) + 1) : 6);
+  if(actualDof>maxDof) return {fail:true,message:`Boundary-conforming mesh needs ${actualDof} DOF, exceeding the ${maxDof} DOF cap. Increase the cap or simplify CAD boundary features.`,resolutionLog:'DOF cap exceeded',totalNodes,nDof:actualDof};
   const nDof = totalNodes * 6;
   const sizeNote = elementSize && elementSize > 0
     ? `${elementSize.toFixed(1)} mm elements`
-      + (coarsened ? ` (asked ${requestedSizeMm?.toFixed(0)} mm → ${uncappedDof.toLocaleString()} DOF, over the cap)` : '')
+      + (coarsened ? ` (asked ${requestedSizeMm?.toFixed(0)} mm → ${uncappedDofEstimated ? "estimated " : ""}${uncappedDof.toLocaleString()} DOF, over the cap)` : '')
     : `target ${target}/panel`;
   const resolutionLog =
-    `${panels.length} panel${panels.length === 1 ? '' : 's'} · ${totalNodes} nodes · ${nDof} DOF · ${sizeNote}`;
+    `${panels.length} panel${panels.length === 1 ? '' : 's'} · ${opts.meshKind === "solid" ? totalNodes * (Math.max(1, Math.round(opts.solidLayers ?? 2)) + 1) : totalNodes} nodes · ${actualDof} DOF · ${sizeNote}`;
 
   // --- STAGE: assembling the global stiffness — OUR TypeScript. ---
   report({ stage: 'assembling', pct: 25, detail: `${nDof.toLocaleString()} DOF` });
@@ -1778,11 +1833,9 @@ function preprocessAssembly(opts: AsmSolveOptions, report: (p: SolveProgress) =>
   // Rebuild the global node table (positions) so we can ground + couple.
   const nodePos: Vec3World[] = new Array(totalNodes);
   for (const m of meshes) {
-    for (let iy = 0; iy < m.ny; iy++) {
-      for (let ix = 0; ix < m.nx; ix++) {
-        const g = m.gnode[iy * m.nx + ix];
-        if (g >= 0) nodePos[g] = panelLocalToWorld(m.panel, ix * m.dx, iy * m.dy);
-      }
+    for (let n = 0; n < m.uv.length; n++) {
+      const g = m.gnode[n];
+      if (g >= 0) nodePos[g] = panelLocalToWorld(m.panel, ...m.uv[n]);
     }
   }
 
@@ -1813,12 +1866,9 @@ function preprocessAssembly(opts: AsmSolveOptions, report: (p: SolveProgress) =>
 
   const nodesAlong = (m: PanelMesh, s0: Vec3World, s1: Vec3World, tol: number): number[] => {
     const out: number[] = [];
-    for (let iy = 0; iy < m.ny; iy++) {
-      for (let ix = 0; ix < m.nx; ix++) {
-        const g = m.gnode[iy * m.nx + ix];
-        if (g < 0) continue;
-        if (pointSegDist(nodePos[g], s0, s1) <= tol) out.push(g);
-      }
+    for (const g of m.gnode) {
+      if (g < 0) continue;
+      if (pointSegDist(nodePos[g], s0, s1) <= tol) out.push(g);
     }
     return out;
   };
@@ -1855,8 +1905,11 @@ function preprocessAssembly(opts: AsmSolveOptions, report: (p: SolveProgress) =>
     if (z > zMax) zMax = z;
   }
   const floorZ = zMin;
-  const finestDx = Math.min(...meshes.map((m) => Math.min(m.dx, m.dy)));
-  const groundBand = Math.max(tolMm, finestDx * 1.01, (zMax - zMin) * 0.01);
+  // Grounding is a geometric floor contact, independent of mesh resolution.
+  // A spacing-sized band silently fixes interior rows and can fix a coarse
+  // vertical panel completely. Only the caller's physical contact tolerance
+  // plus floating-point geometry tolerance is permitted here.
+  const groundBand = Math.max(tolMm, Math.max(1, zMax - zMin) * 1e-9);
   const grounded: number[] = [];
   const groundPoints: Vec3World[] = [];
   for (let g = 0; g < totalNodes; g++) {
@@ -1871,43 +1924,33 @@ function preprocessAssembly(opts: AsmSolveOptions, report: (p: SolveProgress) =>
       resolutionLog, totalNodes, nDof };
   }
 
-  // --- World load vector (pre-BC): spread each footprint load over the active
-  //     nodes inside it, acting along −normal. ---
+  const owner = new Int32Array(totalNodes);
+  for (let i=0;i<meshes.length;i++) for (const g of meshes[i].gnode) if(g>=0) owner[g]=i;
+  const graph = meshes.map(()=>new Set<number>());
+  for(const jp of jointPairs) { const a=owner[jp.gi],b=owner[jp.gj];graph[a].add(b);graph[b].add(a); }
+  const supported = new Set<number>(grounded.map(g=>owner[g])), queue=[...supported];
+  for(let i=0;i<queue.length;i++) for(const j of graph[queue[i]]) if(!supported.has(j)) {supported.add(j);queue.push(j);}
+  const unsupported = meshes.filter((_,i)=>!supported.has(i));
+  if(unsupported.length) return {fail:true,message:`Unsupported panels (${unsupported.map(m=>m.panel.label).join(', ')}): no resolved joint path connects them to the floor. Add physical supports or fix the contacts.`,resolutionLog,totalNodes,nDof};
+
+  // --- World load vector (pre-BC): integrate each footprint's uniform
+  //     pressure over covered element area, acting along −normal. ---
   const F = new Float64Array(nDof);
   for (const load of loads) {
-    if (!load.N) continue;
+    if (load.N === 0) continue;
     const m = panelById.get(load.panelId);
     if (!m) continue;
-    const p = m.panel;
-    const inFoot: number[] = [];
-    const half = load.size / 2;
-    for (let iy = 0; iy < m.ny; iy++) {
-      for (let ix = 0; ix < m.nx; ix++) {
-        const g = m.gnode[iy * m.nx + ix];
-        if (g < 0) continue;
-        const px = ix * m.dx, py = iy * m.dy;
-        const within = load.size <= 0 ? false : (load.shape === 'round'
-          ? Math.hypot(px - load.x, py - load.y) <= half + 1e-6
-          : Math.abs(px - load.x) <= half + 1e-6 && Math.abs(py - load.y) <= half + 1e-6);
-        if (within) inFoot.push(g);
-      }
+    let weights: Float64Array;
+    try {
+      if(!Number.isFinite(load.N)) throw new Error('Load force must be finite.');
+      weights=patchNodalWeights(m.uv,m.quads,load);
+    } catch(error) {
+      return {fail:true,message:`Panel ${m.panel.label}: ${error instanceof Error ? error.message : String(error)}`,resolutionLog,totalNodes,nDof};
     }
-    if (inFoot.length === 0) {
-      let best = -1, bestD = Infinity;
-      for (let iy = 0; iy < m.ny; iy++) {
-        for (let ix = 0; ix < m.nx; ix++) {
-          const g = m.gnode[iy * m.nx + ix];
-          if (g < 0) continue;
-          const d = Math.hypot(ix * m.dx - load.x, iy * m.dy - load.y);
-          if (d < bestD) { bestD = d; best = g; }
-        }
-      }
-      if (best >= 0) inFoot.push(best);
-    }
-    if (inFoot.length === 0) continue;
-    const share = load.N / inFoot.length;
-    const fWorld: Vec3World = w3scale(p.normal, -share);
-    for (const g of inFoot) {
+    for (let n=0;n<weights.length;n++) {
+      const g=m.gnode[n];
+      if(g<0 || weights[n]===0) continue;
+      const fWorld=w3scale(m.panel.normal,-load.N*weights[n]);
       F[g * 6] += fWorld[0];
       F[g * 6 + 1] += fWorld[1];
       F[g * 6 + 2] += fWorld[2];
@@ -1917,7 +1960,7 @@ function preprocessAssembly(opts: AsmSolveOptions, report: (p: SolveProgress) =>
   return {
     meshes, panelById, nodePos, totalNodes, nDof, resolutionLog,
     panelD, panelStiff, repStiff, jointPairs, grounded, groundPoints, F,
-    requestedSizeMm, achievedSizeMm: elementSize, uncappedDof, coarsened,
+    requestedSizeMm, achievedSizeMm: elementSize, uncappedDof, uncappedDofEstimated, coarsened,
   };
 }
 
@@ -1927,11 +1970,35 @@ function preprocessAssembly(opts: AsmSolveOptions, report: (p: SolveProgress) =>
  * inactive corner are skipped — exactly as the assembler skips them — so the
  * drawn mesh and the solved mesh are the same set of elements.
  */
+function meshQuality(pre: AsmPreprocess, layers?: number) {
+  let maxAspectRatio=1, minScaledJacobian=1;
+  for(const m of pre.meshes) for(const q of m.quads) {
+    const uv = q.map(n => m.uv[n]);
+    const sides = uv.map((p,i) => Math.hypot(p[0]-uv[(i+1)%4][0],p[1]-uv[(i+1)%4][1]));
+    for (let i=0;i<4;i++) {
+      const p=uv[i], next=uv[(i+1)%4], prev=uv[(i+3)%4];
+      const cross=(next[0]-p[0])*(prev[1]-p[1])-(next[1]-p[1])*(prev[0]-p[0]);
+      minScaledJacobian=Math.min(minScaledJacobian,cross/(sides[i]*sides[(i+3)%4]));
+    }
+    if(layers) sides.push(m.panel.thicknessMm/layers);
+    maxAspectRatio=Math.max(maxAspectRatio,Math.max(...sides)/Math.min(...sides));
+  }
+  const qualityWarnings: string[] = [];
+  if(maxAspectRatio>10) qualityWarnings.push(`High element aspect ratio (${maxAspectRatio.toFixed(1)}). Refine or simplify closely spaced boundary features and check convergence.`);
+  if(minScaledJacobian<0.2) qualityWarnings.push(`Distorted elements (minimum scaled Jacobian ${minScaledJacobian.toFixed(3)}). Refine and check convergence.`);
+  return {maxAspectRatio,minScaledJacobian,unstructuredPanels:pre.meshes.filter(m=>m.unstructured).length,qualityWarnings,uncappedDofEstimated:pre.uncappedDofEstimated};
+}
+function quadArea(uv: Vec2[]): number {
+  return uv.reduce((sum,p,i)=>sum+p[0]*uv[(i+1)%4][1]-p[1]*uv[(i+1)%4][0],0)/2;
+}
+function meshAreaError(pre: AsmPreprocess): number {
+  return pre.meshes.reduce((sum,m)=>sum+Math.abs(m.quads.reduce((a,q)=>a+quadArea(q.map(n=>m.uv[n])),0)-outlineArea(m.panel.outline)),0);
+}
 function shellMeshView(pre: AsmPreprocess): CaeMeshView {
   const { meshes, nodePos, totalNodes, nDof } = pre;
 
   let elemCount = 0;
-  for (const m of meshes) elemCount += m.activeCells.length;
+  for (const m of meshes) elemCount += m.quads.length;
 
   const nodes = new Float32Array(totalNodes * 3);
   for (let g = 0; g < totalNodes; g++) {
@@ -1944,22 +2011,19 @@ function shellMeshView(pre: AsmPreprocess): CaeMeshView {
   let minEdge = Infinity, maxEdge = 0;
   let e = 0;
   for (const m of meshes) {
-    minEdge = Math.min(minEdge, m.dx, m.dy);
-    maxEdge = Math.max(maxEdge, m.dx, m.dy);
-    const nodeIdx = (ix: number, iy: number) => iy * m.nx + ix;
-    for (const [ix, iy] of m.activeCells) {
-      const g0 = m.gnode[nodeIdx(ix, iy)];
-      const g1 = m.gnode[nodeIdx(ix + 1, iy)];
-      const g2 = m.gnode[nodeIdx(ix + 1, iy + 1)];
-      const g3 = m.gnode[nodeIdx(ix, iy + 1)];
-      if (g0 < 0 || g1 < 0 || g2 < 0 || g3 < 0) continue;
-      elems[e * 4] = g0; elems[e * 4 + 1] = g1; elems[e * 4 + 2] = g2; elems[e * 4 + 3] = g3;
+    for (const q of m.quads) {
+      for (let i=0;i<4;i++) {
+        const a=m.uv[q[i]], b=m.uv[q[(i+1)%4]], len=Math.hypot(a[0]-b[0],a[1]-b[1]);
+        minEdge=Math.min(minEdge,len); maxEdge=Math.max(maxEdge,len);
+        elems[e*4+i]=m.gnode[q[i]];
+      }
       panelOf[e] = m.panel.id;
       e++;
     }
   }
 
   return {
+    ...meshQuality(pre), boundaryConforming: true, areaErrorMm2: meshAreaError(pre),
     kind: 'shell',
     nodes,
     elems: elems.subarray(0, e * 4),
@@ -2023,23 +2087,18 @@ function solidMeshView(pre: AsmPreprocess, layersIn = 2): CaeMeshView {
   }
 
   let cellCount = 0;
-  for (const m of meshes) cellCount += m.activeCells.length;
+  for (const m of meshes) cellCount += m.quads.length;
   const elems = new Int32Array(cellCount * layers * 8);
   const panelOf = new Int32Array(cellCount * layers);
   let minEdge = Infinity, maxEdge = 0;
   let e = 0;
   for (const m of meshes) {
-    minEdge = Math.min(minEdge, m.dx, m.dy);
-    maxEdge = Math.max(maxEdge, m.dx, m.dy);
-    const nodeIdx = (ix: number, iy: number) => iy * m.nx + ix;
-    for (const [ix, iy] of m.activeCells) {
-      const q = [
-        m.gnode[nodeIdx(ix, iy)],
-        m.gnode[nodeIdx(ix + 1, iy)],
-        m.gnode[nodeIdx(ix + 1, iy + 1)],
-        m.gnode[nodeIdx(ix, iy + 1)],
-      ];
-      if (q.some((g) => g < 0)) continue;
+    for (const local of m.quads) {
+      for (let i=0;i<4;i++) {
+        const a=m.uv[local[i]], b=m.uv[local[(i+1)%4]], len=Math.hypot(a[0]-b[0],a[1]-b[1]);
+        minEdge=Math.min(minEdge,len); maxEdge=Math.max(maxEdge,len);
+      }
+      const q=local.map(n=>m.gnode[n]);
       for (let l = 0; l < layers; l++) {
         const base = e * 8;
         // Standard hex ordering: bottom face 0-3 (level l), top face 4-7.
@@ -2052,6 +2111,7 @@ function solidMeshView(pre: AsmPreprocess, layersIn = 2): CaeMeshView {
   }
 
   return {
+    ...meshQuality(pre,layers), boundaryConforming: true, areaErrorMm2: meshAreaError(pre),
     kind: 'solid',
     nodes,
     elems: elems.subarray(0, e * 8),
@@ -2061,8 +2121,8 @@ function solidMeshView(pre: AsmPreprocess, layersIn = 2): CaeMeshView {
     elemCount: e,
     dofPerNode: 3,
     dofCount: nodeCount * 3,
-    minEdgeMm: Number.isFinite(minEdge) ? minEdge : 0,
-    maxEdgeMm: maxEdge,
+    minEdgeMm: Math.min(Number.isFinite(minEdge) ? minEdge : 0,...meshes.map(m=>m.panel.thicknessMm/layers)),
+    maxEdgeMm: Math.max(maxEdge,...meshes.map(m=>m.panel.thicknessMm/layers)),
     throughLayers: layers,
     requestedSizeMm: pre.requestedSizeMm,
     coarsened: pre.coarsened,
@@ -2097,7 +2157,7 @@ function constraintView(pre: AsmPreprocess): CaeConstraintView {
     totalLoadN += Math.hypot(fx, fy, fz);
   }
 
-  return { grounded, groundedCount: groundPoints.length, jointLinks, loads, totalLoadN };
+  return { grounded, groundedCount: groundPoints.length, jointLinks, loads, totalLoadN, jointModel:'nearest-node penalty',maxJointGapMm:jointLinks.reduce((a,j)=>Math.max(a,w3len(w3sub(j.p0,j.p1))),0) };
 }
 
 /**
@@ -2113,7 +2173,7 @@ export function previewAssembly(opts: AsmSolveOptions): AsmPreview {
   if ('fail' in pre) return { ok: false, message: pre.message };
   return {
     ok: true,
-    mesh: opts.meshKind === 'solid' ? solidMeshView(pre) : shellMeshView(pre),
+    mesh: opts.meshKind === 'solid' ? solidMeshView(pre,opts.solidLayers ?? 2) : shellMeshView(pre),
     constraints: constraintView(pre),
     resolutionLog: pre.resolutionLog,
   };
@@ -2151,9 +2211,7 @@ export function serializeAssembly(opts: AsmSolveOptions):
   // Quads: every active cell of every panel, as global node indices (CCW).
   const quads: SidecarQuad[] = [];
   for (const m of pre.meshes) {
-    const nodeIdx = (ix: number, iy: number) => iy * m.nx + ix;
-    for (const [ix, iy] of m.activeCells) {
-      const en = [nodeIdx(ix, iy), nodeIdx(ix + 1, iy), nodeIdx(ix + 1, iy + 1), nodeIdx(ix, iy + 1)];
+    for (const en of m.quads) {
       const g = en.map((n) => m.gnode[n]);
       if (g.some((x) => x < 0)) continue;
       quads.push({ n: [g[0], g[1], g[2], g[3]], t: m.panel.thicknessMm, mat: matName.get(m.panel.id)! });
@@ -2169,9 +2227,8 @@ export function serializeAssembly(opts: AsmSolveOptions):
     if (fx || fy || fz) loads.push({ node: g, fx, fy, fz });
   }
 
-  // The app's own soft grounding-spring stiffness — passed so the sidecar
-  // regularizes identically (see cae.ts kSoft in solveAssembly).
-  const kSoft = pre.repStiff * 1e-4;
+  // Explicit zero prevents legacy sidecars from inferring a foundation.
+  const kSoft = 0; // No artificial translational foundation in sidecar models.
 
   return { ok: true, model: { nodes, materials, quads, links, supports: pre.grounded, loads, kSoft }, pre };
 }
@@ -2225,7 +2282,7 @@ export function solveAssembly(opts: AsmSolveOptions): AsmResult {
   // through the thickness into hexes.
   if (opts.meshKind === 'solid') return solveAssemblySolid(pre, opts, panels, report, empty);
 
-  const { meshes, nDof, repStiff, jointPairs, grounded, F } = pre;
+  const { meshes, nDof, jointPairs, grounded, F } = pre;
 
   // Assemble the global stiffness in a row-map (6 DOF/node).
   const rows: Map<number, number>[] = Array.from({ length: nDof }, () => new Map());
@@ -2244,15 +2301,24 @@ export function solveAssembly(opts: AsmSolveOptions): AsmResult {
     const Db = bendingD(e1, e2, p.material.gShear, NU, t);
     const Ds = shearD(p.material.gShear, p.material.gShear, t);
     const Dm = membraneD(e1, e2, p.material.gShear, NU, t);
-    const Kb = elementK(m.dx, m.dy, Db, Ds);   // 12×12 [w,θx,θy] per node
-    const Km = membraneK(m.dx, m.dy, Dm);       // 8×8  [u,v]     per node
+
 
     const ux = p.uAxis, vy = p.vAxis, nz = p.normal;
     const drill = (Dm[2][2]) * 1e-3;
 
-    const nodeIdx = (ix: number, iy: number) => iy * m.nx + ix;
-    for (const [ix, iy] of m.activeCells) {
-      const en = [nodeIdx(ix, iy), nodeIdx(ix + 1, iy), nodeIdx(ix + 1, iy + 1), nodeIdx(ix, iy + 1)];
+    const cache = new Map<string, {Kb:number[][];Km:number[][]}>();
+    for (const en of m.quads) {
+      const uv=en.map(n=>m.uv[n]);
+      const dx=uv[1][0]-uv[0][0], dy=uv[3][1]-uv[0][1];
+      const key=m.unstructured ? en.join(',') : `${dx},${dy}`;
+      let matrices=cache.get(key);
+      if(!matrices) {
+        matrices=m.unstructured
+          ? {Kb:quadPlateK(uv,Db,Ds),Km:quadMembraneK(uv,Dm)}
+          : {Kb:elementK(dx,dy,Db,Ds),Km:membraneK(dx,dy,Dm)};
+        cache.set(key,matrices);
+      }
+      const {Kb,Km}=matrices;
       const g = en.map((n) => m.gnode[n]);
       if (g.some((x) => x < 0)) continue;
 
@@ -2268,7 +2334,7 @@ export function solveAssembly(opts: AsmSolveOptions): AsmResult {
               blk[2 + r][2 + c] += Kb[ni * 3 + r][nj * 3 + c];
             }
           }
-          if (ni === nj) blk[5][5] += drill * m.dx * m.dy;
+          if (ni === nj) blk[5][5] += drill * (m.unstructured ? quadArea(uv) : dx * dy);
           rotateAndScatter(rows, blk, g[ni], g[nj], ux, vy, nz);
         }
       }
@@ -2299,13 +2365,8 @@ export function solveAssembly(opts: AsmSolveOptions): AsmResult {
     for (let dof = 0; dof < 6; dof++) fixed[g * 6 + dof] = 1;
   }
 
-  // Soft regularization on every free DOF (kills residual mechanisms).
-  const kSoft = repStiff * 1e-4;
-  for (let g = 0; g < nDof; g++) {
-    if (fixed[g]) continue;
-    const r = rows[g];
-    r.set(g, (r.get(g) ?? 0) + kSoft);
-  }
+  // No diagonal foundation: ungrounded translations must remain unsupported,
+  // rather than acquire artificial springs that dominate refined bending.
 
   // Copy the (pre-BC) load vector; BCs applied below.
   const Fsolve = new Float64Array(F);
@@ -2394,6 +2455,8 @@ export function solveAssembly(opts: AsmSolveOptions): AsmResult {
     backend = 'PCG';
   }
 
+  if(!converged) return {...empty('Structural solve did not converge. Check physical supports, joint mechanisms and mesh quality; no safety verdict is available.'),iterations,resolutionLog:pre.resolutionLog,totalNodes:pre.totalNodes,totalDof:nDof};
+
   // --- STAGE: stress recovery / verdicts / result packaging — shared with the
   //     sidecar path via finishAssembly (same recovery over the same x). ---
   return finishAssembly(pre, x, panels, { backend, factorMs, solveMs, iterations, converged }, report);
@@ -2447,7 +2510,7 @@ function finishAssembly(
 
   for (const m of meshes) {
     const p = m.panel;
-    const nNodes = m.nx * m.ny;
+    const nNodes = m.uv.length;
     const disp = new Float32Array(nNodes).fill(NaN);
     let pMax = 0;
     // Local displacement extraction: local = Rᵀ·world for both the translation
@@ -2458,20 +2521,18 @@ function finishAssembly(
       vy[0] * wx + vy[1] * wy + vy[2] * wz,
       nz[0] * wx + nz[1] * wy + nz[2] * wz,
     ];
-    for (let iy = 0; iy < m.ny; iy++) {
-      for (let ix = 0; ix < m.nx; ix++) {
-        const g = m.gnode[iy * m.nx + ix];
+    for (let n = 0; n < m.uv.length; n++) {
+        const g = m.gnode[n];
         if (g < 0) continue;
         const dxv = x[g * 6], dyv = x[g * 6 + 1], dzv = x[g * 6 + 2];
         const mag = Math.hypot(dxv, dyv, dzv);
-        disp[iy * m.nx + ix] = mag;
+        disp[n] = mag;
         nodeDisp[g * 3] = dxv; nodeDisp[g * 3 + 1] = dyv; nodeDisp[g * 3 + 2] = dzv;
         nodeDispMag[g] = mag;
         if (mag > pMax) pMax = mag;
         if (mag > maxDisp) {
-          maxDisp = mag; maxPanelId = p.id; maxAt = [ix * m.dx, iy * m.dy];
+          maxDisp = mag; maxPanelId = p.id; maxAt = [...m.uv[n]];
         }
-      }
     }
 
     // --- Stress recovery: per element, worst-face von Mises at the centre,
@@ -2480,9 +2541,7 @@ function finishAssembly(
     const D = panelD.get(p.id)!;
     const vmSum = new Float64Array(nNodes);
     const vmCnt = new Int32Array(nNodes);
-    const nodeIdx = (jx: number, jy: number) => jy * m.nx + jx;
-    for (const [ix, iy] of m.activeCells) {
-      const en = [nodeIdx(ix, iy), nodeIdx(ix + 1, iy), nodeIdx(ix + 1, iy + 1), nodeIdx(ix, iy + 1)];
+    for (const en of m.quads) {
       const g = en.map((n) => m.gnode[n]);
       if (g.some((gg) => gg < 0)) continue;
       // Build local per-node DOF arrays: membrane [u,v]×4, bending [w,θx,θy]×4.
@@ -2497,8 +2556,15 @@ function finishAssembly(
         wl[i * 3] = lw; wl[i * 3 + 1] = ru; wl[i * 3 + 2] = rv;
       }
       // N = Dm·ε (N/mm) ; M = Db·κ (N·mm/mm).
-      const eps = membraneStrainCentre(m.dx, m.dy, ul);
-      const kap = bendingCurvatureCentre(m.dx, m.dy, wl);
+      const uv=en.map(n=>m.uv[n]);
+      const eps: [number,number,number] = [0,0,0], kap: [number,number,number] = [0,0,0];
+      const {dx,dy}=quadGeometry(uv);
+      for(let i=0;i<4;i++) {
+        eps[0]+=dx[i]*ul[i*2]; eps[1]+=dy[i]*ul[i*2+1];
+        eps[2]+=dy[i]*ul[i*2]+dx[i]*ul[i*2+1];
+        kap[0]+=dx[i]*wl[i*3+2]; kap[1]-=dy[i]*wl[i*3+1];
+        kap[2]+=dy[i]*wl[i*3+2]-dx[i]*wl[i*3+1];
+      }
       const N = m3v(D.Dm, eps);
       const M = m3v(D.Db, kap);
       // Surface stresses on the two faces: σ = N/t ± 6M/t².
@@ -2522,18 +2588,15 @@ function finishAssembly(
     // Nodal average → a smooth field.
     const vmField = new Float32Array(nNodes).fill(NaN);
     let pVm = 0;
-    for (let iy = 0; iy < m.ny; iy++) {
-      for (let ix = 0; ix < m.nx; ix++) {
-        const n = nodeIdx(ix, iy);
+    for (let n=0;n<m.uv.length;n++) {
         if (!m.active[n] || vmCnt[n] === 0) continue;
         const v = vmSum[n] / vmCnt[n];
         vmField[n] = v;
         if (v > pVm) pVm = v;
-        if (v > maxVm) { maxVm = v; maxVmPanelId = p.id; maxVmAt = [ix * m.dx, iy * m.dy]; }
-      }
+        if (v > maxVm) { maxVm = v; maxVmPanelId = p.id; maxVmAt = [...m.uv[n]]; }
     }
 
-    panelResults.push({ id: p.id, nx: m.nx, ny: m.ny, dx: m.dx, dy: m.dy, disp, vm: vmField, active: m.active, maxAbs: pMax, maxVm: pVm });
+    panelResults.push({ uv:m.uv,quads:m.quads,xs:m.xs,ys:m.ys,id: p.id, nx: m.nx, ny: m.ny, dx: m.dx, dy: m.dy, disp, vm: vmField, active: m.active, maxAbs: pMax, maxVm: pVm });
   }
 
   // Non-physical / NaN backstop.
@@ -2593,7 +2656,7 @@ function solveAssemblySolid(
   report: (p: SolveProgress) => void,
   empty: (msg: string) => AsmResult,
 ): AsmResult {
-  const { meshes, nodePos, totalNodes, jointPairs, grounded, F, repStiff } = pre;
+  const { meshes, nodePos, totalNodes, jointPairs, grounded, F } = pre;
   const layers = Math.max(1, Math.round(opts.solidLayers ?? 2));
   const levels = layers + 1;
   const nNodes = totalNodes * levels;
@@ -2601,7 +2664,7 @@ function solveAssemblySolid(
 
   const view = solidMeshView(pre, layers);
   const resolutionLog =
-    `${panels.length} panel${panels.length === 1 ? '' : 's'} · ${view.elemCount} hex · ${nNodes} nodes · ${nDof} DOF · ${layers} layer${layers === 1 ? '' : 's'}`;
+    `${panels.length} panel${panels.length === 1 ? '' : 's'} · ${view.elemCount} hex · ${nNodes} nodes · ${nDof} DOF · ${layers} layer${layers === 1 ? '' : 's'} · ${view.minEdgeMm.toFixed(1)}–${view.maxEdgeMm.toFixed(1)} mm edges` + (view.coarsened ? ` (coarsened from requested ${view.requestedSizeMm ?? 'automatic'} mm)` : '');
 
   report({ stage: 'assembling', pct: 25, detail: `${nDof.toLocaleString()} DOF · hex` });
 
@@ -2612,16 +2675,19 @@ function solveAssemblySolid(
     r.set(j, (r.get(j) ?? 0) + v);
   };
 
-  // --- Element assembly. Every hex in a panel is the same rectangular box, so
-  //     the local 24×24 is formed once and rotated per element. ---
-  let repSolid = 0;
+  // --- Element assembly using the actual quadrilateral footprint. ---
   for (const m of meshes) {
     const p = m.panel;
     const c = p.thicknessMm / layers;
     const D = panelSolidD(p);
-    const Kl = hexKIncompatible(m.dx, m.dy, c, D);
-    repSolid = Math.max(repSolid, D[0][0] * Math.min(m.dx, m.dy, c));
-
+    const cache = new Map<string, number[][]>();
+    for (const local of m.quads) {
+      const uv=local.map(n=>m.uv[n]);
+      const dx=uv[1][0]-uv[0][0],dy=uv[3][1]-uv[0][1];
+      const key=m.unstructured ? local.join(',') : `${dx},${dy}`;
+      let Kg=cache.get(key);
+      if(!Kg) {
+      const Kl = m.unstructured ? extrudedHexK(uv,c,D) : hexKIncompatible(dx,dy,c,D);
     // Local→global rotation: columns are the panel's world axes.
     const R = [
       [p.uAxis[0], p.vAxis[0], p.normal[0]],
@@ -2629,7 +2695,7 @@ function solveAssemblySolid(
       [p.uAxis[2], p.vAxis[2], p.normal[2]],
     ];
     // Pre-rotate every 3×3 nodal block: Kg = R·Kl·Rᵀ.
-    const Kg: number[][] = Array.from({ length: 24 }, () => new Array(24).fill(0));
+    const rotated: number[][] = Array.from({ length: 24 }, () => new Array(24).fill(0));
     for (let ni = 0; ni < 8; ni++) {
       for (let nj = 0; nj < 8; nj++) {
         const blk = [
@@ -2638,16 +2704,13 @@ function solveAssemblySolid(
           [Kl[ni * 3 + 2][nj * 3], Kl[ni * 3 + 2][nj * 3 + 1], Kl[ni * 3 + 2][nj * 3 + 2]],
         ];
         const rot = mat3mul(mat3mul(R, blk), transpose3(R));
-        for (let r = 0; r < 3; r++) for (let cc = 0; cc < 3; cc++) Kg[ni * 3 + r][nj * 3 + cc] = rot[r][cc];
+        for (let r = 0; r < 3; r++) for (let cc = 0; cc < 3; cc++) rotated[ni * 3 + r][nj * 3 + cc] = rot[r][cc];
       }
     }
 
-    const nodeIdx = (ix: number, iy: number) => iy * m.nx + ix;
-    for (const [ix, iy] of m.activeCells) {
-      const q = [
-        m.gnode[nodeIdx(ix, iy)], m.gnode[nodeIdx(ix + 1, iy)],
-        m.gnode[nodeIdx(ix + 1, iy + 1)], m.gnode[nodeIdx(ix, iy + 1)],
-      ];
+        Kg=rotated;cache.set(key,Kg);
+      }
+      const q = local.map(n=>m.gnode[n]);
       if (q.some((g) => g < 0)) continue;
       for (let l = 0; l < layers; l++) {
         const en = [
@@ -2665,7 +2728,6 @@ function solveAssemblySolid(
       }
     }
   }
-  if (repSolid <= 0 || !Number.isFinite(repSolid)) repSolid = repStiff;
 
   // --- Joint coupling. A shell node pair becomes one translational penalty
   //     spring per through-thickness level, so the joined stacks move together
@@ -2713,12 +2775,7 @@ function solveAssemblySolid(
     }
   }
 
-  // Soft regularization on free DOF, then homogeneous Dirichlet BCs.
-  const kSoft = repSolid * 1e-6;
-  for (let i = 0; i < nDof; i++) {
-    if (fixed[i]) continue;
-    rows[i].set(i, (rows[i].get(i) ?? 0) + kSoft);
-  }
+  // Homogeneous Dirichlet conditions; no artificial foundation.
   for (let i = 0; i < nDof; i++) {
     if (fixed[i]) { Fs[i] = 0; rows[i] = new Map([[i, 1]]); }
   }
@@ -2784,6 +2841,8 @@ function solveAssemblySolid(
     iterations = r.iterations; converged = r.converged;
   }
 
+  if(!converged) return {...empty('Solid solve did not converge. Check physical supports, joint mechanisms and mesh quality; no safety verdict is available.'),iterations,resolutionLog,totalNodes:nNodes,totalDof:nDof};
+
   return finishSolid(pre, view, x, panels, layers, {
     backend, factorMs, solveMs, iterations, converged, resolutionLog,
   }, report, empty);
@@ -2840,18 +2899,6 @@ function finishSolid(
     const p = m.panel;
     const c = p.thicknessMm / layers;
     const D = panelSolidD(p);
-    // Centre-point B (ξ=η=ζ=0) for a rectangular box.
-    const jx = 2 / m.dx, jy = 2 / m.dy, jz = 2 / c;
-    const Bc: number[][] = Array.from({ length: 6 }, () => new Array(24).fill(0));
-    for (let i = 0; i < 8; i++) {
-      const [xi, eta, zeta] = HEX_NAT[i];
-      const dNdx = 0.125 * xi * jx, dNdy = 0.125 * eta * jy, dNdz = 0.125 * zeta * jz;
-      const cu = i * 3, cv = cu + 1, cw = cu + 2;
-      Bc[0][cu] = dNdx; Bc[1][cv] = dNdy; Bc[2][cw] = dNdz;
-      Bc[3][cv] = dNdz; Bc[3][cw] = dNdy;
-      Bc[4][cu] = dNdz; Bc[4][cw] = dNdx;
-      Bc[5][cu] = dNdy; Bc[5][cv] = dNdx;
-    }
     // World→local rotation (rows are the panel axes).
     const toLocal = (gx: number, gy: number, gz: number): [number, number, number] => [
       p.uAxis[0] * gx + p.uAxis[1] * gy + p.uAxis[2] * gz,
@@ -2859,17 +2906,14 @@ function finishSolid(
       p.normal[0] * gx + p.normal[1] * gy + p.normal[2] * gz,
     ];
 
-    const gridNodes = m.nx * m.ny;
+    const gridNodes = m.uv.length;
     const disp = new Float32Array(gridNodes).fill(NaN);
     const vmGrid = new Float32Array(gridNodes).fill(NaN);
     let pMax = 0, pVm = 0;
 
-    const nodeIdx = (ix: number, iy: number) => iy * m.nx + ix;
-    for (const [ix, iy] of m.activeCells) {
-      const q = [
-        m.gnode[nodeIdx(ix, iy)], m.gnode[nodeIdx(ix + 1, iy)],
-        m.gnode[nodeIdx(ix + 1, iy + 1)], m.gnode[nodeIdx(ix, iy + 1)],
-      ];
+    for (const local of m.quads) {
+      const uv=local.map(n=>m.uv[n]);
+      const q = local.map(n=>m.gnode[n]);
       if (q.some((g) => g < 0)) continue;
       for (let l = 0; l < layers; l++) {
         const en = [
@@ -2883,12 +2927,7 @@ function finishSolid(
           const [lu, lv, lw] = toLocal(x[n * 3], x[n * 3 + 1], x[n * 3 + 2]);
           ue[i * 3] = lu; ue[i * 3 + 1] = lv; ue[i * 3 + 2] = lw;
         }
-        const eps = new Array(6).fill(0);
-        for (let r = 0; r < 6; r++) {
-          let s = 0;
-          for (let k = 0; k < 24; k++) s += Bc[r][k] * ue[k];
-          eps[r] = s;
-        }
+        const eps = extrudedHexStrain(uv,c,ue);
         const sig = new Array(6).fill(0);
         for (let r = 0; r < 6; r++) {
           let s = 0;
@@ -2910,9 +2949,7 @@ function finishSolid(
     // Collapse the through-thickness stack back onto the in-plane grid so the
     // per-panel texture overlay + PDF pages keep working unchanged: each
     // mid-surface node takes the worst value over its stack.
-    for (let iy = 0; iy < m.ny; iy++) {
-      for (let ix = 0; ix < m.nx; ix++) {
-        const gi = nodeIdx(ix, iy);
+    for (let gi = 0; gi < m.uv.length; gi++) {
         const g = m.gnode[gi];
         if (g < 0) continue;
         let dMax = 0, vMax = 0, sawVm = false;
@@ -2929,13 +2966,13 @@ function finishSolid(
         if (sawVm) vmGrid[gi] = vMax;
         if (dMax > pMax) pMax = dMax;
         if (vMax > pVm) pVm = vMax;
-        if (dMax > maxDisp) { maxDisp = dMax; maxPanelId = p.id; maxAt = [ix * m.dx, iy * m.dy]; }
-        if (sawVm && vMax > maxVm) { maxVm = vMax; maxVmPanelId = p.id; maxVmAt = [ix * m.dx, iy * m.dy]; }
-      }
+        if (dMax > maxDisp) { maxDisp = dMax; maxPanelId = p.id; maxAt = [...m.uv[gi]]; }
+        if (sawVm && vMax > maxVm) { maxVm = vMax; maxVmPanelId = p.id; maxVmAt = [...m.uv[gi]]; }
     }
 
     panelResults.push({
-      id: p.id, nx: m.nx, ny: m.ny, dx: m.dx, dy: m.dy,
+      uv:m.uv, quads:m.quads,
+      xs:m.xs,ys:m.ys,id: p.id, nx: m.nx, ny: m.ny, dx: m.dx, dy: m.dy,
       disp, vm: vmGrid, active: m.active, maxAbs: pMax, maxVm: pVm,
     });
   }

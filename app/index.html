@@ -29,6 +29,12 @@
               <p class="version" id="versionLine">build · author</p>
             </div>
           </div>
+          <button id="remoteBtn" class="remote-btn" type="button" hidden aria-expanded="false" title="Open on your phone (QR code)">
+            <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <rect x="3" y="3" width="7" height="7" rx="1" /><rect x="14" y="3" width="7" height="7" rx="1" /><rect x="3" y="14" width="7" height="7" rx="1" />
+              <path d="M14 14h3v3h-3zM20 14v.01M14 20h.01M17 17h3v3" />
+            </svg>
+          </button>
           <!-- Shown only when GitHub says this build is behind the branch
                head. Hidden and inert otherwise — see updateCheck.ts. -->
           <div id="updateBanner" class="update-banner" hidden>
@@ -328,7 +334,8 @@
             <div class="asm-hint">Detect joints to list touching panel edges.</div>
           </div>
 
-          <div class="asm-subtitle">Mesh</div>
+          <div class="asm-subtitle">Finite-element mesh</div>
+          <p class="asm-hint">Actual solver elements follow straight and curved board outlines, holes, and notches. Curves follow the imported CAD boundary.</p>
           <div class="asm-mesh-row">
             <label>Elements
               <select id="asmMeshKind">
@@ -336,7 +343,7 @@
                 <option value="solid">Solid (hex)</option>
               </select>
             </label>
-            <label>Element size
+            <label>In-plane size
               <select id="asmMeshDensity">
                 <option value="5">5 mm</option>
                 <option value="10">10 mm</option>
@@ -355,6 +362,13 @@
               </select>
             </label>
           </div>
+          <label class="asm-mesh-view">Mesh view
+            <select id="asmMeshView">
+              <option value="surface" selected>Filled mesh + edges</option>
+              <option value="wire">All element edges (see through)</option>
+            </select>
+          </label>
+          <div id="asmMeshViewHint" class="asm-hint">Filled solver element faces with visible mesh edges. Switch to all element edges to inspect the interior.</div>
           <div class="asm-mesh-toggles">
             <label class="check-row"><input type="checkbox" id="asmShowMesh" checked /><span>Mesh</span></label>
             <label class="check-row"><input type="checkbox" id="asmShowNodes" /><span>Nodes</span></label>
@@ -387,8 +401,8 @@
           <div id="asmDeformRow" class="asm-deform-row" hidden>
             <label>Deform ×
               <select id="asmDeformScale">
-                <option value="0">off</option>
-                <option value="auto" selected>auto</option>
+                <option value="0" selected>Undeformed mesh</option>
+                <option value="auto">Auto exaggerated</option>
                 <option value="1">1</option>
                 <option value="5">5</option>
                 <option value="10">10</option>
@@ -448,6 +462,7 @@
             <header class="thickness-review-header"><div class="thickness-eyebrow">02 / Review &amp; apply</div><h2 id="thicknessReviewTitle">Correction review</h2><p>Check the fit before changing your model.</p></header>
             <div id="thicknessReviewScroll" class="thickness-review-scroll">
               <div id="thicknessStatus" class="thickness-status" role="status" aria-live="polite">Load a STEP cabinet to begin.</div>
+              <div id="thicknessInspection" class="thickness-inspection" hidden><span id="thicknessInspectionLabel"></span><button id="thicknessShowAllBtn" type="button" class="ghost">Show whole cabinet</button></div>
               <div id="thicknessApplied" class="thickness-applied" hidden></div>
               <div id="thicknessReviewEmpty" class="thickness-review-empty">
                 <svg viewBox="0 0 160 90" width="160" height="90" fill="none" aria-hidden="true"><path d="M23 16h114v58H23z" stroke="currentColor" stroke-width="1" stroke-dasharray="3 4"/><path d="M29 16v58M131 16v58M29 22h102M29 68h102" stroke="currentColor" stroke-width="5"/><path d="M52 45h56m-50-5-6 5 6 5m44-10 6 5-6 5" stroke="currentColor" stroke-width="1.5"/></svg>
@@ -457,6 +472,7 @@
               <div id="thicknessChanges" class="thickness-changes" hidden></div>
             </div>
             <footer class="thickness-review-footer">
+              <p id="thicknessReviewHelp" class="thickness-review-help" hidden>Review the problems above. This is not an approval checkbox: fix the listed geometry or settings, then analyse again to enable Apply.</p>
               <label class="thickness-preview"><input id="thicknessPreview" type="checkbox" disabled /><span>Preview changes in 3D</span><span class="thickness-preview-key" aria-hidden="true"></span></label>
               <button id="thicknessApplyBtn" type="button" class="primary" disabled>Apply correction</button>
               <div class="thickness-export-actions"><button id="thicknessResetBtn" type="button" class="ghost" disabled>Reset to imported</button><button id="thicknessExportBtn" type="button" class="ghost" disabled>Download STEP <span aria-hidden="true">↓</span></button></div>
@@ -509,6 +525,14 @@
                     </svg>
                   </summary>
                   <div class="export-opts-menu" role="group" aria-label="Export">
+                    <button id="downloadPcHtmlBtn" class="export-item" disabled>
+                      <span class="export-item-name">PC / tablet HTML</span>
+                      <span class="export-item-sub">Offline build package — cuts, inventory table, 3D assembly</span>
+                    </button>
+                    <button id="downloadPhoneHtmlBtn" class="export-item" disabled>
+                      <span class="export-item-name">Phone HTML</span>
+                      <span class="export-item-sub">Touch-friendly cutting checklist and interactive 3D</span>
+                    </button>
                     <button id="downloadPdfBtn" class="export-item" disabled>
                       <span class="export-item-name">Job PDF</span>
                       <span class="export-item-sub">Full document — layouts, cuts, assembly</span>
